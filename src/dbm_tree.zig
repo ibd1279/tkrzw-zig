@@ -1337,6 +1337,9 @@ const TreeDBMImpl = struct {
             if (it.leaf_id == leaf.id) it.leaf_id = sibling_id;
         }
 
+        // Save leaf.id before removeLeafNode — that call frees the leaf via
+        // node.deinit(), so any subsequent access to leaf.id is use-after-free.
+        const removed_leaf_id = leaf.id;
         var st = self.removeLeafNode(leaf);
         // Do not decrement num_leaf_nodes — it is a monotonic counter used for
         // ID allocation, matching C++ behaviour (num_leaf_nodes_++ in constructor).
@@ -1348,9 +1351,9 @@ const TreeDBMImpl = struct {
             const parent_id = hist[level];
             const parent = self.loadInnerNode(parent_id, false) catch break;
             if (merge_with_prev) {
-                self.joinPrevLinkInInnerNode(parent, leaf.id);
+                self.joinPrevLinkInInnerNode(parent, removed_leaf_id);
             } else {
-                self.joinNextLinkInInnerNode(parent, leaf.id, sibling_id);
+                self.joinNextLinkInInnerNode(parent, removed_leaf_id, sibling_id);
             }
             self.releaseInnerNode(parent_id);
             if (parent.links.items.len >= @as(usize, @intCast(@divTrunc(self.max_branches, 2)))) break;
@@ -2816,7 +2819,7 @@ pub const TreeDBM = struct {
         };
         defer src_db.deinit();
         {
-            const st = src_db.open(src_path, false, .{}, io);
+            const st = src_db.open(src_path, false, .{ .no_lock = true }, io); // restore source; may be broken/unlocked
             if (!st.isOk()) return st;
         }
 

@@ -889,6 +889,7 @@ const TinyDBMImpl = struct {
         // temporary export file can actually be created.
         const export_options = OpenOptions{
             .truncate = true,
+            .no_lock = true,
             .sync_hard = self.open_options.sync_hard,
         };
 

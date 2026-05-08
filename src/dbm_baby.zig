@@ -1805,6 +1805,7 @@ const BabyDBMImpl = struct {
         // Export options: preserve sync_hard, but ensure truncate is set.
         const export_options = OpenOptions{
             .truncate = true,
+            .no_lock = true,
             .sync_hard = self.open_options.sync_hard,
         };
 

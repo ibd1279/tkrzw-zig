@@ -6,8 +6,9 @@ pub const StatusCode = lib_common.Code;
 /// Bit-flag options for File.open, matching the C++ OpenOptions bit positions.
 ///   bit 0: truncate   — truncate file to zero length on open
 ///   bit 1: no_create  — do not create if missing (return NOT_FOUND_ERROR)
-///   bit 2: no_wait    — do not block waiting for a lock
-///   bit 3: no_lock    — skip file locking entirely
+///   bit 2: no_wait    — non-blocking lock attempt; returns INFEASIBLE_ERROR on contention
+///   bit 3: no_lock    — skip OS file locking entirely; caller is responsible for
+///                       preventing concurrent access
 ///   bit 4: sync_hard  — use O_SYNC / O_DSYNC on open
 pub const OpenOptions = packed struct(i32) {
     truncate: bool = false,
@@ -38,6 +39,11 @@ pub const File = struct {
         deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     };
 
+    /// Opens the file at `path`. By default acquires an OS advisory lock
+    /// (LOCK_EX for writable opens, LOCK_SH for read-only) via flock(2).
+    /// Pass `options.no_lock = true` to skip locking (caller must ensure safety).
+    /// Pass `options.no_wait = true` for a non-blocking attempt; returns
+    /// INFEASIBLE_ERROR immediately if the lock is held by another process.
     pub fn open(self: File, path: []const u8, writable: bool, options: OpenOptions) Status {
         return self.vtable.open(self.ctx, path, writable, options);
     }
@@ -185,6 +191,36 @@ pub const StdFile = struct {
         if (file_size < 0) {
             _ = std.c.close(fd);
             return Status.init(.SYSTEM_ERROR);
+        }
+
+        // Acquire an OS-level advisory lock unless the caller opted out.
+        // Writable opens use LOCK_EX (exclusive); read-only opens use LOCK_SH (shared).
+        // no_wait=true adds LOCK_NB so the syscall fails immediately on contention.
+        // Blocking flock (no_wait=false) can be interrupted by a signal (EINTR); retry
+        // in that case. LOCK_NB never returns EINTR, so the retry is a no-op for no_wait.
+        // Note: flock is advisory-only — processes that do not call flock can still
+        // access the file. All tkrzw-zig callers must open through this vtable to
+        // participate in the locking protocol.
+        if (!options.no_lock) {
+            const lock_op: c_int = if (writable) std.posix.LOCK.EX else std.posix.LOCK.SH;
+            const nb_flag: c_int = if (options.no_wait) std.posix.LOCK.NB else 0;
+            const flock_err = blk: {
+                while (true) {
+                    const rc = std.c.flock(fd, lock_op | nb_flag);
+                    if (rc == 0) break :blk @as(std.c.E, .SUCCESS);
+                    // Capture errno BEFORE any other syscall can overwrite it.
+                    const err = std.c.errno(rc);
+                    if (err == .INTR and !options.no_wait) continue; // retry on signal
+                    break :blk err;
+                }
+            };
+            if (flock_err != .SUCCESS) {
+                _ = std.c.close(fd);
+                return if (options.no_wait and flock_err == .AGAIN)
+                    Status.init(.INFEASIBLE_ERROR)
+                else
+                    Status.init(.SYSTEM_ERROR);
+            }
         }
 
         const path_copy = self.allocator.dupe(u8, path) catch {
@@ -608,4 +644,106 @@ test "renameFile and removeFile" {
         buf[dst.len] = 0;
         try std.testing.expectEqual(@as(c_int, -1), std.c.access(buf[0..dst.len :0].ptr, std.c.F_OK));
     }
+}
+
+test "StdFile no_lock skips flock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf);
+    const tmp_path = path_buf[0..path_len];
+
+    const file_name = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock_test.bin", .{tmp_path});
+    defer std.testing.allocator.free(file_name);
+
+    const sf1 = try StdFile.create(std.testing.allocator);
+    var f1 = sf1.asFile();
+    defer f1.deinit(std.testing.allocator);
+
+    const sf2 = try StdFile.create(std.testing.allocator);
+    var f2 = sf2.asFile();
+    defer f2.deinit(std.testing.allocator);
+
+    // f1 acquires LOCK_EX via normal locking.
+    var st = f1.open(file_name, true, .{});
+    try std.testing.expect(st.isOk());
+
+    // f2 uses no_lock=true — must succeed DESPITE f1 holding LOCK_EX.
+    // If no_lock were ignored, this would block (deadlock), proving the flag works.
+    st = f2.open(file_name, true, .{ .no_lock = true });
+    try std.testing.expect(st.isOk());
+
+    _ = f1.close();
+    _ = f2.close();
+}
+
+test "StdFile no_wait returns INFEASIBLE_ERROR on contention" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf);
+    const tmp_path = path_buf[0..path_len];
+
+    const file_name = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock_contention.bin", .{tmp_path});
+    defer std.testing.allocator.free(file_name);
+
+    const sf1 = try StdFile.create(std.testing.allocator);
+    var f1 = sf1.asFile();
+    defer f1.deinit(std.testing.allocator);
+
+    const sf2 = try StdFile.create(std.testing.allocator);
+    var f2 = sf2.asFile();
+    defer f2.deinit(std.testing.allocator);
+
+    // sf1 acquires LOCK_EX and holds it.
+    var st = f1.open(file_name, true, .{});
+    try std.testing.expect(st.isOk());
+
+    // sf2 attempts LOCK_EX | LOCK_NB on the same file — must fail immediately.
+    st = f2.open(file_name, true, .{ .no_wait = true });
+    try std.testing.expectEqual(StatusCode.INFEASIBLE_ERROR, st.code);
+
+    _ = f1.close();
+}
+
+test "StdFile shared locks coexist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf);
+    const tmp_path = path_buf[0..path_len];
+
+    const file_name = try std.fmt.allocPrint(std.testing.allocator, "{s}/lock_shared.bin", .{tmp_path});
+    defer std.testing.allocator.free(file_name);
+
+    // Create the file first so read-only opens succeed.
+    {
+        const sf_init = try StdFile.create(std.testing.allocator);
+        var f_init = sf_init.asFile();
+        const st = f_init.open(file_name, true, .{ .no_lock = true });
+        try std.testing.expect(st.isOk());
+        _ = f_init.close();
+        f_init.deinit(std.testing.allocator);
+    }
+
+    const sf1 = try StdFile.create(std.testing.allocator);
+    var f1 = sf1.asFile();
+    defer f1.deinit(std.testing.allocator);
+
+    const sf2 = try StdFile.create(std.testing.allocator);
+    var f2 = sf2.asFile();
+    defer f2.deinit(std.testing.allocator);
+
+    // Both open read-only — LOCK_SH is compatible with another LOCK_SH.
+    var st = f1.open(file_name, false, .{});
+    try std.testing.expect(st.isOk());
+
+    st = f2.open(file_name, false, .{});
+    try std.testing.expect(st.isOk());
+
+    _ = f1.close();
+    _ = f2.close();
 }

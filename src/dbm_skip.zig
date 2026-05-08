@@ -1005,7 +1005,7 @@ const RecordSorter = struct {
         const tmp_file = std_file_ptr.asFile();
         errdefer _ = tmp_file.close();
 
-        const open_status = tmp_file.open(tmp_path_owned, true, .{ .truncate = true });
+        const open_status = tmp_file.open(tmp_path_owned, true, .{ .truncate = true, .no_lock = true }); // process-private temp file
         if (!open_status.isOk()) {
             _ = tmp_file.close();
             self.allocator.destroy(std_file_ptr);
@@ -1823,7 +1823,7 @@ fn prepareStorageImpl(impl: *SkipDBMImpl) Status {
         };
 
         const sorted_file = std_file_ptr.asFile();
-        const open_status = sorted_file.open(impl.sorted_path.items, true, .{ .truncate = true });
+        const open_status = sorted_file.open(impl.sorted_path.items, true, .{ .truncate = true, .no_lock = true }); // process-private auxiliary sort file
         if (!open_status.isOk()) {
             _ = sorted_file.close();
             impl.allocator.destroy(std_file_ptr);
@@ -1891,8 +1891,9 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
         // Close the empty main file before reopening (it now points to the renamed sorted_file).
         _ = impl.file.close();
 
-        // Reopen main file
-        const reopen_status = impl.file.open(impl.path.items, true, .{});
+        // Reopen main file. Use no_lock because sorted_file still holds LOCK_EX on this
+        // inode (it was renamed here but not yet closed); relocking would deadlock.
+        const reopen_status = impl.file.open(impl.path.items, true, .{ .no_lock = true });
         if (!reopen_status.isOk()) {
             return reopen_status;
         }
@@ -1942,7 +1943,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
     var merged_file = merged_file_ptr.asFile();
     defer merged_file.deinit(impl.allocator);
 
-    const merged_open_status = merged_file.open(merged_path, true, .{ .truncate = true });
+    const merged_open_status = merged_file.open(merged_path, true, .{ .truncate = true, .no_lock = true }); // process-private merge staging file
     if (!merged_open_status.isOk()) {
         return merged_open_status;
     }
@@ -2097,8 +2098,9 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
         _ = file_mod.removeFile(sorted_path_items);
     }
 
-    // Reopen main file
-    const reopen_status = impl.file.open(impl.path.items, true, .{});
+    // Reopen main file. Use no_lock: the merge temp file still holds LOCK_EX on
+    // the renamed inode (not yet closed); relocking would deadlock.
+    const reopen_status = impl.file.open(impl.path.items, true, .{ .no_lock = true });
     if (!reopen_status.isOk()) {
         return reopen_status;
     }
@@ -2127,7 +2129,7 @@ fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: st
     var old_file = old_file_ptr.asFile();
     defer old_file.deinit(allocator);
 
-    const old_open_status = old_file.open(old_path, false, .{});
+    const old_open_status = old_file.open(old_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
     if (!old_open_status.isOk()) {
         return old_open_status;
     }
@@ -2139,7 +2141,7 @@ fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: st
     var new_file = new_file_ptr.asFile();
     defer new_file.deinit(allocator);
 
-    const new_open_status = new_file.open(new_path, true, .{ .truncate = true });
+    const new_open_status = new_file.open(new_path, true, .{ .truncate = true, .no_lock = true }); // fresh restore output file
     if (!new_open_status.isOk()) {
         _ = new_file.close();
         return new_open_status;
@@ -3505,7 +3507,7 @@ pub const SkipDBM = struct {
         };
         var src_file = src_file_ptr.asFile();
 
-        const open_status = src_file.open(src_path, false, .{});
+        const open_status = src_file.open(src_path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
         if (!open_status.isOk()) {
             return open_status;
         }

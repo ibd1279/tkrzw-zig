@@ -2742,7 +2742,7 @@ pub const HashDBM = struct {
         var file = sf.asFile();
         defer file.deinit(self.allocator);
         {
-            const st = file.open(path, false, .{});
+            const st = file.open(path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
             if (!st.isOk()) return st;
         }
         defer _ = file.close();
@@ -2917,7 +2917,7 @@ pub const HashDBM = struct {
         var file = sf.asFile();
         defer file.deinit(self.allocator);
         {
-            const st = file.open(path, false, .{});
+            const st = file.open(path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
             if (!st.isOk()) return st;
         }
         defer _ = file.close();
@@ -2941,7 +2941,7 @@ pub const HashDBM = struct {
         var old_file = old_sf.asFile();
         defer old_file.deinit(allocator);
         {
-            const st = old_file.open(old_path, false, .{});
+            const st = old_file.open(old_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
             if (!st.isOk()) return st;
         }
         defer _ = old_file.close();

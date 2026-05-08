@@ -1547,6 +1547,7 @@ const CacheDBMImpl = struct {
 
         const export_options = OpenOptions{
             .truncate = true,
+            .no_lock = true,
             .sync_hard = self.open_options.sync_hard,
         };
 
