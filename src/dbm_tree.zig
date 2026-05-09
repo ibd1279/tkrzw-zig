@@ -1774,10 +1774,11 @@ fn iterSetPositionFirst(it: *TreeDBMIteratorImpl) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     var node_id = impl.first_id;
     while (node_id != 0) {
-        const leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         if (leaf.records.items.len > 0) {
-            try it.setPosition(node_id, leaf.records.items[0].key);
+            try it.setPosition(cur_id, leaf.records.items[0].key);
             return Status.init(.SUCCESS);
         }
         node_id = leaf.next_id;
@@ -1790,11 +1791,12 @@ fn iterSetPositionLast(it: *TreeDBMIteratorImpl) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     var node_id = impl.last_id;
     while (node_id != 0) {
-        const leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         if (leaf.records.items.len > 0) {
             const last_rec = leaf.records.items[leaf.records.items.len - 1];
-            try it.setPosition(node_id, last_rec.key);
+            try it.setPosition(cur_id, last_rec.key);
             return Status.init(.SUCCESS);
         }
         node_id = leaf.prev_id;
@@ -1808,8 +1810,9 @@ fn iterNext(it: *TreeDBMIteratorImpl) !Status {
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
     var node_id = it.leaf_id;
     while (node_id != 0) {
-        const leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
         // If we found the current key, advance past it.
         const start = if (idx < leaf.records.items.len and
@@ -1818,7 +1821,7 @@ fn iterNext(it: *TreeDBMIteratorImpl) !Status {
         else
             idx;
         if (start < leaf.records.items.len) {
-            try it.setPosition(node_id, leaf.records.items[start].key);
+            try it.setPosition(cur_id, leaf.records.items[start].key);
             return Status.init(.SUCCESS);
         }
         node_id = leaf.next_id;
@@ -1832,11 +1835,12 @@ fn iterPrevious(it: *TreeDBMIteratorImpl) !Status {
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
     var node_id = it.leaf_id;
     while (node_id != 0) {
-        const leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
         if (idx > 0) {
-            try it.setPosition(node_id, leaf.records.items[idx - 1].key);
+            try it.setPosition(cur_id, leaf.records.items[idx - 1].key);
             return Status.init(.SUCCESS);
         }
         node_id = leaf.prev_id;
@@ -1857,10 +1861,11 @@ fn iterJump(it: *TreeDBMIteratorImpl, key: []const u8) !Status {
     // Key is beyond this leaf — advance to the next leaf's first record.
     var node_id = leaf.next_id;
     while (node_id != 0) {
-        const next_leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const next_leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         if (next_leaf.records.items.len > 0) {
-            try it.setPosition(node_id, next_leaf.records.items[0].key);
+            try it.setPosition(cur_id, next_leaf.records.items[0].key);
             return Status.init(.SUCCESS);
         }
         node_id = next_leaf.next_id;
@@ -1896,11 +1901,12 @@ fn iterJumpLower(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !St
     // Search previous leaves.
     var node_id = leaf.prev_id;
     while (node_id != 0) {
-        const prev_leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const prev_leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         if (prev_leaf.records.items.len > 0) {
             const last_rec = prev_leaf.records.items[prev_leaf.records.items.len - 1];
-            try it.setPosition(node_id, last_rec.key);
+            try it.setPosition(cur_id, last_rec.key);
             return Status.init(.SUCCESS);
         }
         node_id = prev_leaf.prev_id;
@@ -1926,10 +1932,11 @@ fn iterJumpUpper(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !St
     }
     var node_id = leaf.next_id;
     while (node_id != 0) {
-        const next_leaf = impl.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(node_id);
+        const cur_id = node_id;
+        const next_leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode(cur_id);
         if (next_leaf.records.items.len > 0) {
-            try it.setPosition(node_id, next_leaf.records.items[0].key);
+            try it.setPosition(cur_id, next_leaf.records.items[0].key);
             return Status.init(.SUCCESS);
         }
         node_id = next_leaf.next_id;
