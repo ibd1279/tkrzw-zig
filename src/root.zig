@@ -22,6 +22,7 @@
 //!   File                   — vtable interface for file I/O (implement for custom backends)
 //!   StdFile                — concrete std.fs-backed File implementation
 //!   OpenOptions            — flags controlling file open behaviour
+//!   BloomFilter            — scalable, blocked, thread-safe probabilistic membership filter
 //!   pairLexicalKeyComparator — key comparator for pair-based indices
 
 const std = @import("std");
@@ -48,6 +49,7 @@ pub const dbm_tree = @import("dbm_tree.zig");
 pub const dbm_poly = @import("dbm_poly.zig");
 pub const index = @import("index.zig");
 pub const dbm_shard = @import("dbm_shard.zig");
+pub const bloom = @import("bloom.zig");
 
 // ---------------------------------------------------------------------------
 // Flat re-exports — primary public API surface.
@@ -65,6 +67,7 @@ pub const PolyEntry = dbm_poly.Entry;
 pub const BackendType = dbm_poly.BackendType;
 pub const OpenOptionsPoly = dbm_poly.OpenOptionsPoly;
 pub const MemIndex = index.MemIndex;
+pub const BloomFilter = bloom.BloomFilter;
 pub const ShardDBM = dbm_shard.ShardDBM;
 pub const ShardCursor = dbm_shard.ShardCursor;
 pub const ShardIterator = dbm_shard.ShardIterator;
@@ -105,4 +108,17 @@ pub const pairFloatBigEndianKeyComparator = lib_common.pairFloatBigEndianKeyComp
 // ---------------------------------------------------------------------------
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "BloomFilter accessible via root re-export" {
+    // Smoke test: verify BloomFilter is accessible through the flat re-export
+    // path (tkrzw.BloomFilter) and the sub-namespace path (tkrzw.bloom.BloomFilter).
+    var f = try BloomFilter.init(std.testing.allocator, .{});
+    defer f.deinit();
+    try f.add("tkrzw");
+    try std.testing.expect(f.mightContain("tkrzw"));
+    try std.testing.expect(!f.mightContain("not-inserted"));
+    // Also verify sub-namespace path compiles.
+    const SubNs: type = bloom.BloomFilter;
+    _ = SubNs;
 }

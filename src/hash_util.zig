@@ -1,5 +1,262 @@
 const std = @import("std");
 
+/// 128-bit hash result, returned by `hashMurmur3_128`.
+///
+/// `h1` is suitable for selecting a block (e.g. `h1 % num_blocks`) and `h2`
+/// can serve as the base of a Kirsch-Mitzenmacher derivation
+/// (`h2 +% i *% h1`) when multiple independent hash values are needed.
+pub const Hash128 = struct { h1: u64, h2: u64 };
+
+/// MurmurHash3_x64_128 (Austin Appleby), 128-bit variant for 64-bit platforms.
+///
+/// This is a non-cryptographic, deterministic hash. It is used for the
+/// blocked bloom filter; it is intentionally NOT used by any DBM module.
+/// The legacy MurmurHash2 (`hashMurmur` below) is retained unchanged because
+/// it is wired into the existing tkrzw on-disk file formats.
+///
+/// **Security note**: MurmurHash3 is not HashDoS-resistant. When called with
+/// a fixed seed (as `BloomFilter` does, seed=0), an adversary who controls
+/// the input keys can craft collisions that degrade filter accuracy. Do not
+/// use with adversarially controlled keys in security-sensitive contexts.
+///
+/// Reference: https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
+pub fn hashMurmur3_128(data: []const u8, seed: u64) Hash128 {
+    // Constants from Austin Appleby's smhasher reference implementation.
+    const c1: u64 = 0x87c37b91114253d5;
+    const c2: u64 = 0x4cf5ad432745937f;
+
+    var h1: u64 = seed;
+    var h2: u64 = seed;
+
+    var rp: usize = 0;
+    var remaining: usize = data.len;
+
+    // Body: process 16-byte blocks.
+    while (remaining >= 16) : ({
+        rp += 16;
+        remaining -= 16;
+    }) {
+        var k1: u64 = std.mem.readInt(u64, data[rp..][0..8], .little);
+        var k2: u64 = std.mem.readInt(u64, data[rp + 8 ..][0..8], .little);
+
+        k1 *%= c1;
+        k1 = std.math.rotl(u64, k1, 31);
+        k1 *%= c2;
+        h1 ^= k1;
+
+        h1 = std.math.rotl(u64, h1, 27);
+        h1 +%= h2;
+        h1 = h1 *% 5 +% 0x52dce729;
+
+        k2 *%= c2;
+        k2 = std.math.rotl(u64, k2, 33);
+        k2 *%= c1;
+        h2 ^= k2;
+
+        h2 = std.math.rotl(u64, h2, 31);
+        h2 +%= h1;
+        h2 = h2 *% 5 +% 0x38495ab5;
+    }
+
+    // Tail: 0..15 trailing bytes. Zig has no switch fall-through, so each
+    // case accumulates every applicable byte explicitly. Bytes at indices
+    // 0..7 contribute to k1; bytes at indices 8..15 contribute to k2.
+    var k1: u64 = 0;
+    var k2: u64 = 0;
+    switch (remaining) {
+        15 => {
+            k2 ^= @as(u64, data[rp + 14]) << 48;
+            k2 ^= @as(u64, data[rp + 13]) << 40;
+            k2 ^= @as(u64, data[rp + 12]) << 32;
+            k2 ^= @as(u64, data[rp + 11]) << 24;
+            k2 ^= @as(u64, data[rp + 10]) << 16;
+            k2 ^= @as(u64, data[rp + 9]) << 8;
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        14 => {
+            k2 ^= @as(u64, data[rp + 13]) << 40;
+            k2 ^= @as(u64, data[rp + 12]) << 32;
+            k2 ^= @as(u64, data[rp + 11]) << 24;
+            k2 ^= @as(u64, data[rp + 10]) << 16;
+            k2 ^= @as(u64, data[rp + 9]) << 8;
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        13 => {
+            k2 ^= @as(u64, data[rp + 12]) << 32;
+            k2 ^= @as(u64, data[rp + 11]) << 24;
+            k2 ^= @as(u64, data[rp + 10]) << 16;
+            k2 ^= @as(u64, data[rp + 9]) << 8;
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        12 => {
+            k2 ^= @as(u64, data[rp + 11]) << 24;
+            k2 ^= @as(u64, data[rp + 10]) << 16;
+            k2 ^= @as(u64, data[rp + 9]) << 8;
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        11 => {
+            k2 ^= @as(u64, data[rp + 10]) << 16;
+            k2 ^= @as(u64, data[rp + 9]) << 8;
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        10 => {
+            k2 ^= @as(u64, data[rp + 9]) << 8;
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        9 => {
+            k2 ^= @as(u64, data[rp + 8]);
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        8 => {
+            k1 ^= @as(u64, data[rp + 7]) << 56;
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        7 => {
+            k1 ^= @as(u64, data[rp + 6]) << 48;
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        6 => {
+            k1 ^= @as(u64, data[rp + 5]) << 40;
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        5 => {
+            k1 ^= @as(u64, data[rp + 4]) << 32;
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        4 => {
+            k1 ^= @as(u64, data[rp + 3]) << 24;
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        3 => {
+            k1 ^= @as(u64, data[rp + 2]) << 16;
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        2 => {
+            k1 ^= @as(u64, data[rp + 1]) << 8;
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        1 => {
+            k1 ^= @as(u64, data[rp + 0]);
+        },
+        else => {},
+    }
+
+    if (remaining > 8) {
+        k2 *%= c2;
+        k2 = std.math.rotl(u64, k2, 33);
+        k2 *%= c1;
+        h2 ^= k2;
+    }
+    if (remaining > 0) {
+        k1 *%= c1;
+        k1 = std.math.rotl(u64, k1, 31);
+        k1 *%= c2;
+        h1 ^= k1;
+    }
+
+    // Finalization.
+    h1 ^= @as(u64, data.len);
+    h2 ^= @as(u64, data.len);
+
+    h1 +%= h2;
+    h2 +%= h1;
+
+    h1 = fmix64(h1);
+    h2 = fmix64(h2);
+
+    h1 +%= h2;
+    h2 +%= h1;
+
+    return Hash128{ .h1 = h1, .h2 = h2 };
+}
+
+/// MurmurHash3 64-bit finalization mixer.
+fn fmix64(k_in: u64) u64 {
+    var k = k_in;
+    k ^= k >> 33;
+    k *%= 0xff51afd7ed558ccd;
+    k ^= k >> 33;
+    k *%= 0xc4ceb9fe1a85ec53;
+    k ^= k >> 33;
+    return k;
+}
+
 /// MurmurHash2 64-bit, matching tkrzw::HashMurmur.
 ///
 /// Uses wrapping arithmetic throughout to replicate C++ unsigned overflow.
@@ -263,4 +520,120 @@ test "isPrimeNumber correctness" {
     try std.testing.expect(!isPrimeNumber(4));
     try std.testing.expect(isPrimeNumber(101));
     try std.testing.expect(!isPrimeNumber(100));
+}
+
+// Verified against smhasher MurmurHash3_x64_128 (Austin Appleby).
+test "hashMurmur3_128: reference vector empty seed=0" {
+    const r = hashMurmur3_128("", 0);
+    try std.testing.expectEqual(@as(u64, 0x0000000000000000), r.h1);
+    try std.testing.expectEqual(@as(u64, 0x0000000000000000), r.h2);
+}
+
+test "hashMurmur3_128: reference vector hello seed=0" {
+    // 5-byte input exercises the pure-tail (no full block) path.
+    const r = hashMurmur3_128("hello", 0);
+    try std.testing.expectEqual(@as(u64, 0xcbd8a7b341bd9b02), r.h1);
+    try std.testing.expectEqual(@as(u64, 0x5b1e906a48ae1d19), r.h2);
+}
+
+test "hashMurmur3_128: reference vector 15 bytes seed=0" {
+    // Maximum-length tail (15 bytes, all k2+k1 tail branches active).
+    const r = hashMurmur3_128("aaaaaaaaaaaaaaa", 0);
+    try std.testing.expectEqual(@as(u64, 0x7d07a8dbfd2e7fbc), r.h1);
+    try std.testing.expectEqual(@as(u64, 0x8fa8044aa85ff959), r.h2);
+}
+
+test "hashMurmur3_128: reference vector 16 bytes seed=0" {
+    // Exactly one 16-byte block, no tail bytes.
+    const r = hashMurmur3_128("aaaaaaaaaaaaaaaa", 0);
+    try std.testing.expectEqual(@as(u64, 0xf2c1180d62aaa6ce), r.h1);
+    try std.testing.expectEqual(@as(u64, 0x6af6f3032bb23942), r.h2);
+}
+
+test "hashMurmur3_128: reference vector 32 bytes seed=0" {
+    // Two full 16-byte blocks, no tail bytes.
+    const r = hashMurmur3_128("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0);
+    try std.testing.expectEqual(@as(u64, 0xe5f99e2780696aed), r.h1);
+    try std.testing.expectEqual(@as(u64, 0x77ced13066ddfb5b), r.h2);
+}
+
+test "hashMurmur3_128: all tail lengths 1..15 produce distinct hashes" {
+    var results: [15]Hash128 = undefined;
+    for (1..16) |len| {
+        var buf: [15]u8 = undefined;
+        @memset(buf[0..len], 'a');
+        const r = hashMurmur3_128(buf[0..len], 0);
+        // Each result must be deterministic.
+        const r2 = hashMurmur3_128(buf[0..len], 0);
+        try std.testing.expectEqual(r.h1, r2.h1);
+        try std.testing.expectEqual(r.h2, r2.h2);
+        results[len - 1] = r;
+    }
+    // All 15 results must be pairwise distinct.
+    for (0..15) |i| {
+        for (i + 1..15) |j| {
+            try std.testing.expect(
+                results[i].h1 != results[j].h1 or results[i].h2 != results[j].h2,
+            );
+        }
+    }
+}
+
+test "hashMurmur3_128: byte order sensitivity" {
+    // Guards against accidental native-endian reads instead of little-endian.
+    const a = hashMurmur3_128(&[_]u8{ 0x01, 0x02 }, 0);
+    const b = hashMurmur3_128(&[_]u8{ 0x02, 0x01 }, 0);
+    try std.testing.expect(a.h1 != b.h1);
+}
+
+test "hashMurmur3_128: deterministic" {
+    const r1 = hashMurmur3_128("deterministic", 42);
+    const r2 = hashMurmur3_128("deterministic", 42);
+    try std.testing.expectEqual(r1.h1, r2.h1);
+    try std.testing.expectEqual(r1.h2, r2.h2);
+}
+
+test "hashMurmur3_128: seed sensitivity" {
+    const r0 = hashMurmur3_128("test", 0);
+    const r1 = hashMurmur3_128("test", 1);
+    try std.testing.expect(r0.h1 != r1.h1);
+}
+
+test "hashMurmur3_128: distinct keys produce distinct hashes" {
+    const rh = hashMurmur3_128("hello", 0);
+    const rw = hashMurmur3_128("world", 0);
+    const re = hashMurmur3_128("", 0);
+    try std.testing.expect(rh.h1 != rw.h1 or rh.h2 != rw.h2);
+    try std.testing.expect(rh.h1 != re.h1 or rh.h2 != re.h2);
+    try std.testing.expect(rw.h1 != re.h1 or rw.h2 != re.h2);
+}
+
+test "hashMurmur3_128: tail boundary length 8 vs 9" {
+    // Exercises the if (remaining > 8) guard that mixes k2.
+    // remaining==8: k2 must NOT be mixed; remaining==9: k2 MUST be mixed.
+    // Vectors verified against the C reference (MurmurHash3.cpp, seed=0).
+    const r8 = hashMurmur3_128("abcdefgh", 0);
+    const r9 = hashMurmur3_128("abcdefghi", 0);
+    try std.testing.expectEqual(@as(u64, 0xcc8a0ab037ef8c02), r8.h1);
+    try std.testing.expectEqual(@as(u64, 0x48890d60eb6940a1), r8.h2);
+    try std.testing.expectEqual(@as(u64, 0x0547c0cff13c7964), r9.h1);
+    try std.testing.expectEqual(@as(u64, 0x79b53df5b741e033), r9.h2);
+    // Also confirm the two must differ (guards against collapsed k2-mix logic).
+    try std.testing.expect(r8.h1 != r9.h1 or r8.h2 != r9.h2);
+    // Determinism at the boundary.
+    try std.testing.expectEqual(r8.h1, hashMurmur3_128("abcdefgh", 0).h1);
+    try std.testing.expectEqual(r9.h1, hashMurmur3_128("abcdefghi", 0).h1);
+}
+
+test "hashMurmur3_128: avalanche" {
+    const key: []const u8 = &[_]u8{ 'h', 'e', 'l', 'l', 'o' };
+    const modified: []const u8 = &[_]u8{ 'h' ^ 1, 'e', 'l', 'l', 'o' };
+    const ra = hashMurmur3_128(key, 0);
+    const rb = hashMurmur3_128(modified, 0);
+    const diff_bits: usize =
+        @as(usize, @popCount(ra.h1 ^ rb.h1)) +
+        @as(usize, @popCount(ra.h2 ^ rb.h2));
+    // Require >=48/128 bits to differ (37.5%) — generous but catches a
+    // severely broken or missing finalization step.
+    try std.testing.expect(diff_bits >= 48);
 }
