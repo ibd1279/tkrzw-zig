@@ -31,7 +31,7 @@ pub const FlatRecord = struct {
 
     /// Reads a flat record from the file at the given offset.
     /// Matches C++ FlatRecord::Read.
-    pub fn read(self: *FlatRecord, offset: i64) Status {
+    pub fn read(self: *FlatRecord, io: std.Io, offset: i64) Status {
         self.offset = offset;
 
         const file_size = self.file.getSizeSimple();
@@ -52,7 +52,7 @@ pub const FlatRecord = struct {
 
         // Read the initial bytes into the stack buffer.
         {
-            const st = self.file.read(offset, self.buf[0..record_size]);
+            const st = self.file.read(io, offset, self.buf[0..record_size]);
             if (!st.isOk()) return st;
         }
 
@@ -87,7 +87,7 @@ pub const FlatRecord = struct {
                 return Status.init(.SYSTEM_ERROR);
             self.body_buf = new_buf;
 
-            const st = self.file.read(offset + @as(i64, @intCast(header_size)), new_buf);
+            const st = self.file.read(io, offset + @as(i64, @intCast(header_size)), new_buf);
             if (!st.isOk()) {
                 self.allocator.free(new_buf);
                 self.body_buf = null;
@@ -101,7 +101,7 @@ pub const FlatRecord = struct {
 
     /// Appends a flat record to the file.
     /// Matches C++ FlatRecord::Write.
-    pub fn write(self: *FlatRecord, data: []const u8, rec_type: RecordType) Status {
+    pub fn write(self: *FlatRecord, io: std.Io, data: []const u8, rec_type: RecordType) Status {
         const magic: u8 = switch (rec_type) {
             .normal => RECORD_MAGIC_NORMAL,
             .metadata => RECORD_MAGIC_METADATA,
@@ -116,7 +116,7 @@ pub const FlatRecord = struct {
             stack_buf[0] = magic;
             const written = varint.writeVarNum(stack_buf[1..], @intCast(data.len));
             @memcpy(stack_buf[1 + written .. 1 + written + data.len], data);
-            return self.file.append(stack_buf[0..self.whole_size], &self.offset);
+            return self.file.append(io, stack_buf[0..self.whole_size], &self.offset);
         } else {
             // Use a heap buffer for large records.
             const heap_buf = self.allocator.alloc(u8, self.whole_size) catch
@@ -126,7 +126,7 @@ pub const FlatRecord = struct {
             heap_buf[0] = magic;
             const written = varint.writeVarNum(heap_buf[1..], @intCast(data.len));
             @memcpy(heap_buf[1 + written .. 1 + written + data.len], data);
-            return self.file.append(heap_buf, &self.offset);
+            return self.file.append(io, heap_buf, &self.offset);
         }
     }
 
@@ -188,7 +188,7 @@ pub const FlatRecordReader = struct {
     ///
     /// On success, *str points into self.buf and is valid until the next call.
     /// Matches C++ FlatRecordReader::Read (3-stage approach).
-    pub fn read(self: *FlatRecordReader, str: *[]const u8, rec_type: ?*RecordType) Status {
+    pub fn read(self: *FlatRecordReader, io: std.Io, str: *[]const u8, rec_type: ?*RecordType) Status {
         // ------------------------------------------------------------------
         // Stage 1: fast path — enough bytes buffered for a full header + data.
         // ------------------------------------------------------------------
@@ -238,7 +238,7 @@ pub const FlatRecordReader = struct {
         self.index = 0;
 
         {
-            const st = self.file.read(self.offset, self.buf[0..self.data_size]);
+            const st = self.file.read(io, self.offset, self.buf[0..self.data_size]);
             if (!st.isOk()) return st;
         }
 
@@ -284,7 +284,7 @@ pub const FlatRecordReader = struct {
         // Re-read the entire record into the enlarged buffer.
         const full_read = header_size2 + vsz2;
         {
-            const st = self.file.read(self.offset, self.buf[0..full_read]);
+            const st = self.file.read(io, self.offset, self.buf[0..full_read]);
             if (!st.isOk()) return st;
         }
         self.data_size = full_read;
@@ -332,7 +332,7 @@ test "FlatRecord write + read round-trip (normal)" {
     var f = sf.asFile();
     defer f.deinit(std.testing.allocator);
 
-    var st = f.open(file_name, true, .{});
+    var st = f.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     var rec = FlatRecord{
@@ -342,13 +342,13 @@ test "FlatRecord write + read round-trip (normal)" {
     defer rec.deinit();
 
     const payload = "hello flat record";
-    st = rec.write(payload, .normal);
+    st = rec.write(std.testing.io, payload, .normal);
     try std.testing.expect(st.isOk());
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 
     // Re-open read-only for reading.
-    st = f.open(file_name, false, .{});
+    st = f.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
     var rec2 = FlatRecord{
@@ -357,12 +357,12 @@ test "FlatRecord write + read round-trip (normal)" {
     };
     defer rec2.deinit();
 
-    st = rec2.read(0);
+    st = rec2.read(std.testing.io, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(RecordType.normal, rec2.getRecordType());
     try std.testing.expectEqualStrings(payload, rec2.getData());
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 }
 
 test "FlatRecordReader reads metadata + normal records in order" {
@@ -379,7 +379,7 @@ test "FlatRecordReader reads metadata + normal records in order" {
     var f = sf.asFile();
     defer f.deinit(std.testing.allocator);
 
-    var st = f.open(file_name, true, .{});
+    var st = f.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     var wr = FlatRecord{
@@ -388,16 +388,16 @@ test "FlatRecordReader reads metadata + normal records in order" {
     };
     defer wr.deinit();
 
-    st = wr.write("meta_payload", .metadata);
+    st = wr.write(std.testing.io, "meta_payload", .metadata);
     try std.testing.expect(st.isOk());
 
-    st = wr.write("normal_payload", .normal);
+    st = wr.write(std.testing.io, "normal_payload", .normal);
     try std.testing.expect(st.isOk());
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 
     // Re-open and read sequentially.
-    st = f.open(file_name, false, .{});
+    st = f.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
     var reader = try FlatRecordReader.init(f, std.testing.allocator, DEFAULT_READER_BUFFER_SIZE);
@@ -406,17 +406,17 @@ test "FlatRecordReader reads metadata + normal records in order" {
     var str: []const u8 = undefined;
     var rt: RecordType = undefined;
 
-    st = reader.read(&str, &rt);
+    st = reader.read(std.testing.io, &str, &rt);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(RecordType.metadata, rt);
     try std.testing.expectEqualStrings("meta_payload", str);
 
-    st = reader.read(&str, &rt);
+    st = reader.read(std.testing.io, &str, &rt);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(RecordType.normal, rt);
     try std.testing.expectEqualStrings("normal_payload", str);
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 }
 
 test "FlatRecordReader returns NOT_FOUND_ERROR at EOF" {
@@ -433,7 +433,7 @@ test "FlatRecordReader returns NOT_FOUND_ERROR at EOF" {
     var f = sf.asFile();
     defer f.deinit(std.testing.allocator);
 
-    var st = f.open(file_name, true, .{});
+    var st = f.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     var wr = FlatRecord{
@@ -442,12 +442,12 @@ test "FlatRecordReader returns NOT_FOUND_ERROR at EOF" {
     };
     defer wr.deinit();
 
-    st = wr.write("only", .normal);
+    st = wr.write(std.testing.io, "only", .normal);
     try std.testing.expect(st.isOk());
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 
-    st = f.open(file_name, false, .{});
+    st = f.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
     var reader = try FlatRecordReader.init(f, std.testing.allocator, DEFAULT_READER_BUFFER_SIZE);
@@ -456,15 +456,15 @@ test "FlatRecordReader returns NOT_FOUND_ERROR at EOF" {
     var str: []const u8 = undefined;
 
     // First record — should succeed.
-    st = reader.read(&str, null);
+    st = reader.read(std.testing.io, &str, null);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualStrings("only", str);
 
     // Second read — should be NOT_FOUND_ERROR.
-    st = reader.read(&str, null);
+    st = reader.read(std.testing.io, &str, null);
     try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, st.code);
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 }
 
 test "FlatRecord.read uses body_buf for records larger than READ_BUFFER_SIZE" {
@@ -481,7 +481,7 @@ test "FlatRecord.read uses body_buf for records larger than READ_BUFFER_SIZE" {
     var f = sf.asFile();
     defer f.deinit(std.testing.allocator);
 
-    var st = f.open(file_name, true, .{});
+    var st = f.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     // Build a payload that exceeds READ_BUFFER_SIZE (48 bytes).
@@ -493,12 +493,12 @@ test "FlatRecord.read uses body_buf for records larger than READ_BUFFER_SIZE" {
     };
     defer wr.deinit();
 
-    st = wr.write(large_payload, .normal);
+    st = wr.write(std.testing.io, large_payload, .normal);
     try std.testing.expect(st.isOk());
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 
-    st = f.open(file_name, false, .{});
+    st = f.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
     var rd = FlatRecord{
@@ -507,11 +507,11 @@ test "FlatRecord.read uses body_buf for records larger than READ_BUFFER_SIZE" {
     };
     defer rd.deinit();
 
-    st = rd.read(0);
+    st = rd.read(std.testing.io, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualStrings(large_payload, rd.getData());
     // body_buf must be non-null since the payload did not fit in the stack buf.
     try std.testing.expect(rd.body_buf != null);
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 }

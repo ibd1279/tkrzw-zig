@@ -31,7 +31,6 @@ pub const OpenOptions = file_mod.OpenOptions;
 pub const FlatRecord = file_util.FlatRecord;
 pub const FlatRecordReader = file_util.FlatRecordReader;
 pub const RecordType = file_util.RecordType;
-pub const SpinSharedMutex = thread_util.SpinSharedMutex;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,7 +66,7 @@ const BabyLeafNode = struct {
     prev: ?*BabyLeafNode,
     next: ?*BabyLeafNode,
     records: std.ArrayListUnmanaged(BabyRecord) = .empty,
-    mutex: SpinSharedMutex = .{},
+    mutex: std.Io.RwLock = .init,
 };
 
 /// A B+ tree inner node. Contains an heir pointer (leftmost child) and sorted links.
@@ -367,7 +366,7 @@ const BabyDBMImpl = struct {
     last_node: *BabyLeafNode,
     reorg_nodes: std.ArrayListUnmanaged(ReorgEntry),
     iterators: std.ArrayListUnmanaged(*BabyDBMIteratorImpl),
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock = .init,
     key_comparator: KeyComparator,
     update_logger: ?*UpdateLogger,
     file: File,
@@ -404,7 +403,7 @@ const BabyDBMImpl = struct {
             .last_node = root_leaf,
             .reorg_nodes = .empty,
             .iterators = .empty,
-            .mutex = .{},
+            .mutex = .init,
             .key_comparator = key_comparator,
             .update_logger = null,
             .file = file,
@@ -461,11 +460,9 @@ const BabyDBMImpl = struct {
     }
 
     /// Clean up all resources and destroy the impl.
-    fn deinit(self: *BabyDBMImpl) void {
+    fn deinit(self: *BabyDBMImpl, io: std.Io) void {
         if (self.open) {
-            // Use std.Io.failing for emergency-close on deinit: the caller should
-            // have closed the DB explicitly before calling deinit.
-            _ = self.closeImpl(std.Io.failing);
+            _ = self.closeImpl(io);
         }
 
         // Orphan any live iterators.
@@ -1157,6 +1154,7 @@ const BabyDBMImpl = struct {
     /// Process a key-value operation on the tree using a generic processor.
     fn processImpl(
         self: *BabyDBMImpl,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         key: []const u8,
@@ -1166,29 +1164,29 @@ const BabyDBMImpl = struct {
         // The exclusive lock prevents concurrent readers from observing torn tree structure
         // while reorganizeTree mutates root/first_node/last_node/leaf chain pointers.
         if (writable and self.reorg_nodes.items.len > 0) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             try self.reorganizeTree();
         }
 
         // Acquire shared global lock (allows concurrent readers/writers on different leaves).
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         // Find the leaf containing this key.
         const leaf = self.searchTree(key);
 
         // Acquire leaf lock (exclusive if writable, shared if read-only).
         if (writable) {
-            leaf.mutex.lock();
+            leaf.mutex.lockUncancelable(io);
         } else {
-            leaf.mutex.lockShared();
+            leaf.mutex.lockSharedUncancelable(io);
         }
         defer {
             if (writable) {
-                leaf.mutex.unlock();
+                leaf.mutex.unlock(io);
             } else {
-                leaf.mutex.unlockShared();
+                leaf.mutex.unlockShared(io);
             }
         }
 
@@ -1199,13 +1197,14 @@ const BabyDBMImpl = struct {
     /// Get value for a key (read-only).
     pub fn get(
         self: *BabyDBMImpl,
+        allocator: std.mem.Allocator,
+        io: std.Io,
         key: []const u8,
         value: ?*std.ArrayList(u8),
-        allocator: std.mem.Allocator,
     ) Status {
         var status = Status.init(.SUCCESS);
         var getter = ProcessorGet{ .status = &status, .value = value, .allocator = allocator };
-        self.processImpl(ProcessorGet, &getter, key, false) catch
+        self.processImpl(io, ProcessorGet, &getter, key, false) catch
             return Status.init(.SYSTEM_ERROR);
         return status;
     }
@@ -1213,11 +1212,12 @@ const BabyDBMImpl = struct {
     /// Set value for a key (write operation).
     pub fn set(
         self: *BabyDBMImpl,
+        allocator: std.mem.Allocator,
+        io: std.Io,
         key: []const u8,
         value: []const u8,
         overwrite: bool,
         old_value: ?*std.ArrayList(u8),
-        allocator: std.mem.Allocator,
     ) Status {
         var status = Status.init(.SUCCESS);
         var setter = ProcessorSet{
@@ -1227,16 +1227,17 @@ const BabyDBMImpl = struct {
             .old_value = old_value,
             .allocator = allocator,
         };
-        self.processImpl(ProcessorSet, &setter, key, true) catch
+        self.processImpl(io, ProcessorSet, &setter, key, true) catch
             return Status.init(.SYSTEM_ERROR);
         return status;
     }
 
     /// Remove a key (write operation).
-    pub fn remove(self: *BabyDBMImpl, key: []const u8) Status {
+    pub fn remove(self: *BabyDBMImpl, io: std.Io, key: []const u8) Status {
+
         var status = Status.init(.SUCCESS);
         var remover = ProcessorRemove{ .status = &status };
-        self.processImpl(ProcessorRemove, &remover, key, true) catch
+        self.processImpl(io, ProcessorRemove, &remover, key, true) catch
             return Status.init(.SYSTEM_ERROR);
         return status;
     }
@@ -1245,25 +1246,26 @@ const BabyDBMImpl = struct {
     /// If the key exists: replaces the record with old_value ++ delim ++ value.
     /// If the key does not exist: inserts a new record with value.
     /// Port of C++ BabyDBMImpl::Append / AppendImpl.
-    pub fn append(self: *BabyDBMImpl, key: []const u8, value: []const u8, delim: []const u8) Status {
+    pub fn append(self: *BabyDBMImpl, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
+
         // Drain reorg queue under exclusive global lock before taking the shared lock.
         if (self.reorg_nodes.items.len > 0) {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(io);
             {
-                defer self.mutex.unlock();
+                defer self.mutex.unlock(io);
                 self.reorganizeTree() catch return Status.init(.SYSTEM_ERROR);
             }
         }
 
         // Shared global lock for tree traversal.
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         const leaf = self.searchTree(key);
 
         // Exclusive leaf lock for the write.
-        leaf.mutex.lock();
-        defer leaf.mutex.unlock();
+        leaf.mutex.lockUncancelable(io);
+        defer leaf.mutex.unlock(io);
 
         self.appendImpl(leaf, key, value, delim) catch return Status.init(.SYSTEM_ERROR);
         return Status.init(.SUCCESS);
@@ -1335,30 +1337,31 @@ const BabyDBMImpl = struct {
     /// Loops forward through leaves to skip any empty leading leaves (R-6).
     pub fn processFirst(
         self: *BabyDBMImpl,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         writable: bool,
     ) Status {
         // C++ always holds shared_lock on the outer mutex for processFirst.
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         // Loop forward through leaves until a non-empty one is found (C++ cc:487-506).
         var leaf_opt: ?*BabyLeafNode = self.first_node;
         while (leaf_opt) |leaf| {
             if (writable) {
-                leaf.mutex.lock();
+                leaf.mutex.lockUncancelable(io);
             } else {
-                leaf.mutex.lockShared();
+                leaf.mutex.lockSharedUncancelable(io);
             }
 
             if (leaf.records.items.len > 0) {
                 // Found a non-empty leaf — process and return.
                 defer {
                     if (writable) {
-                        leaf.mutex.unlock();
+                        leaf.mutex.unlock(io);
                     } else {
-                        leaf.mutex.unlockShared();
+                        leaf.mutex.unlockShared(io);
                     }
                 }
                 const first_key = leaf.records.items[0].key;
@@ -1371,9 +1374,9 @@ const BabyDBMImpl = struct {
 
             // Empty leaf — unlock and advance.
             if (writable) {
-                leaf.mutex.unlock();
+                leaf.mutex.unlock(io);
             } else {
-                leaf.mutex.unlockShared();
+                leaf.mutex.unlockShared(io);
             }
             leaf_opt = leaf.next;
         }
@@ -1385,6 +1388,7 @@ const BabyDBMImpl = struct {
     /// Locks leaves in sorted order to prevent deadlock.
     pub fn processMulti(
         self: *BabyDBMImpl,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
@@ -1396,9 +1400,9 @@ const BabyDBMImpl = struct {
 
         // Drain reorg queue under exclusive global lock before taking the shared lock (R-20).
         if (self.reorg_nodes.items.len > 0) {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(io);
             {
-                defer self.mutex.unlock();
+                defer self.mutex.unlock(io);
                 self.reorganizeTree() catch return Status.init(.SYSTEM_ERROR);
             }
         }
@@ -1407,8 +1411,8 @@ const BabyDBMImpl = struct {
         var leaf_map: std.AutoHashMapUnmanaged(*BabyLeafNode, void) = .{};
         defer leaf_map.deinit(self.allocator);
 
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         for (keys) |key| {
             const leaf = self.searchTree(key);
@@ -1420,7 +1424,7 @@ const BabyDBMImpl = struct {
         defer unique_leaves.deinit(self.allocator);
 
         var iter = leaf_map.keyIterator();
-        while (iter.next()) |leaf_ptr| {
+        while (iter.next(io)) |leaf_ptr| {
             unique_leaves.append(self.allocator, leaf_ptr.*) catch return Status.init(.SYSTEM_ERROR);
         }
 
@@ -1438,11 +1442,11 @@ const BabyDBMImpl = struct {
         // Lock all leaves in sorted order.
         if (writable) {
             for (unique_leaves.items) |leaf| {
-                leaf.mutex.lock();
+                leaf.mutex.lockUncancelable(io);
             }
         } else {
             for (unique_leaves.items) |leaf| {
-                leaf.mutex.lockShared();
+                leaf.mutex.lockSharedUncancelable(io);
             }
         }
         defer {
@@ -1452,9 +1456,9 @@ const BabyDBMImpl = struct {
                 i -= 1;
                 const leaf = unique_leaves.items[i];
                 if (writable) {
-                    leaf.mutex.unlock();
+                    leaf.mutex.unlock(io);
                 } else {
-                    leaf.mutex.unlockShared();
+                    leaf.mutex.unlockShared(io);
                 }
             }
         }
@@ -1471,13 +1475,14 @@ const BabyDBMImpl = struct {
     /// Process all records in the tree.
     pub fn processEach(
         self: *BabyDBMImpl,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         writable: bool,
     ) Status {
         // C++ always holds shared_lock on the outer mutex; per-leaf lock handles mutation safety.
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         // Pre-loop sentinel — matches C++ `proc->ProcessEmpty(NOOP)` before the leaf loop.
         _ = proc.processEmpty("");
@@ -1485,9 +1490,9 @@ const BabyDBMImpl = struct {
         var leaf = self.first_node;
         while (true) {
             if (writable) {
-                leaf.mutex.lock();
+                leaf.mutex.lockUncancelable(io);
             } else {
-                leaf.mutex.lockShared();
+                leaf.mutex.lockSharedUncancelable(io);
             }
 
             // Collect keys from this leaf (because processImplOnLeaf modifies records).
@@ -1501,12 +1506,12 @@ const BabyDBMImpl = struct {
 
             for (leaf.records.items) |rec| {
                 const key_dupe = self.allocator.dupe(u8, rec.key) catch {
-                    if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
+                    if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
                     return Status.init(.SYSTEM_ERROR);
                 };
                 keys.append(self.allocator, key_dupe) catch {
                     self.allocator.free(key_dupe);
-                    if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
+                    if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
                     return Status.init(.SYSTEM_ERROR);
                 };
             }
@@ -1515,7 +1520,7 @@ const BabyDBMImpl = struct {
             for (keys.items) |key| {
                 if (writable) {
                     _ = self.processImplOnLeaf(P, proc, leaf, key, true) catch {
-                        if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
+                        if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
                         return Status.init(.SYSTEM_ERROR);
                     };
                 } else {
@@ -1533,9 +1538,9 @@ const BabyDBMImpl = struct {
             // Capture next pointer, then unlock current leaf before advancing.
             const next_opt = leaf.next;
             if (writable) {
-                leaf.mutex.unlock();
+                leaf.mutex.unlock(io);
             } else {
-                leaf.mutex.unlockShared();
+                leaf.mutex.unlockShared(io);
             }
 
             if (next_opt) |next_leaf| {
@@ -1553,15 +1558,13 @@ const BabyDBMImpl = struct {
 
     /// Return the number of records in the database.
     pub fn count(self: *BabyDBMImpl) i64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.num_records.load(.monotonic);
     }
 
     /// Clear all records and reset the tree to a single empty leaf.
-    pub fn clear(self: *BabyDBMImpl) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn clear(self: *BabyDBMImpl, io: std.Io) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.update_logger) |ul| {
             _ = ul.writeClear();
@@ -1598,9 +1601,9 @@ const BabyDBMImpl = struct {
     }
 
     /// Synchronize changes to disk.
-    pub fn synchronize(self: *BabyDBMImpl, hard: bool, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn synchronize(self: *BabyDBMImpl, io: std.Io, hard: bool) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         // C++ Synchronize has no early return but skips all work when !open_ || !writable_,
         // also returning SUCCESS. Zig early return is equivalent.
@@ -1615,15 +1618,23 @@ const BabyDBMImpl = struct {
 
         var status = self.exportRecords(io);
         // Sync the underlying file after exporting (R-12, C++ cc:591).
-        status.mergeFrom(self.file.synchronize(hard));
+        status.mergeFrom(self.file.synchronize(io, hard));
         return status;
     }
 
     /// Inspect the database and return metadata as key-value pairs.
-    pub fn inspect(self: *BabyDBMImpl, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn inspect(self: *BabyDBMImpl, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        // Acquire exclusive lock post-open (concurrent callers). Pre-open
+        // (in-memory use without open()) is single-threaded — no lock needed.
+        if (self.open) {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            return self.inspectLocked(allocator);
+        }
+        return self.inspectLocked(allocator);
+    }
 
+    fn inspectLocked(self: *BabyDBMImpl, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
         var pairs: std.ArrayList([2][]u8) = .empty;
 
         const class_key = try allocator.dupe(u8, "class");
@@ -1654,36 +1665,26 @@ const BabyDBMImpl = struct {
 
     /// Check if the database is open.
     pub fn isOpen(self: *BabyDBMImpl) bool {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.open;
     }
 
     /// Check if the database is writable.
     pub fn isWritable(self: *BabyDBMImpl) bool {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.open and self.writable;
     }
 
     /// Get the file path (if open).
     pub fn getFilePath(self: *BabyDBMImpl) []const u8 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.path.items;
     }
 
     /// Get the timestamp (if open). Returns as f64 seconds for C++ API compat.
     pub fn getTimestamp(self: *BabyDBMImpl) f64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return @as(f64, @floatFromInt(self.timestamp.nanoseconds)) / 1_000_000_000.0;
     }
 
     /// Get the file size (placeholder).
     pub fn getFileSize(self: *BabyDBMImpl) i64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         if (!self.open) return -1;
         return self.file.getSizeSimple();
     }
@@ -1701,15 +1702,14 @@ const BabyDBMImpl = struct {
 
     /// Set the update logger.
     pub fn setUpdateLogger(self: *BabyDBMImpl, logger: ?*UpdateLogger) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Note: not safe under concurrent setUpdateLogger calls; matches
+        // TinyDBM's behavior. Callers are expected to set the logger before
+        // exposing the DBM to other threads.
         self.update_logger = logger;
     }
 
     /// Get the current update logger.
     pub fn getUpdateLogger(self: *BabyDBMImpl) ?*UpdateLogger {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.update_logger;
     }
 
@@ -1718,7 +1718,7 @@ const BabyDBMImpl = struct {
     // -----------------------------------------------------------------------
 
     /// Import records from a file using FlatRecordReader.
-    fn importRecords(self: *BabyDBMImpl) !Status {
+    fn importRecords(self: *BabyDBMImpl, io: std.Io) !Status {
         var reader = FlatRecordReader.init(
             self.file,
             self.allocator,
@@ -1734,7 +1734,7 @@ const BabyDBMImpl = struct {
             iteration += 1;
             var str: []const u8 = undefined;
             var rec_type: RecordType = undefined;
-            const st = reader.read(&str, &rec_type);
+            const st = reader.read(io, &str, &rec_type);
             if (!st.isOk()) {
                 if (st.code == .NOT_FOUND_ERROR) {
                     break;
@@ -1770,7 +1770,7 @@ const BabyDBMImpl = struct {
             // Read paired value.
             var val_str: []const u8 = undefined;
             var val_type: RecordType = undefined;
-            const st2 = reader.read(&val_str, &val_type);
+            const st2 = reader.read(io, &val_str, &val_type);
             if (!st2.isOk()) {
                 if (st2.code == .NOT_FOUND_ERROR) {
                     return Status.initMsg(.BROKEN_DATA_ERROR, "odd number of records");
@@ -1781,7 +1781,7 @@ const BabyDBMImpl = struct {
                 return Status.initMsg(.BROKEN_DATA_ERROR, "invalid metadata position");
             }
 
-            try self.processImplForImport(key_store.items, val_str);
+            try self.processImplForImport(io, key_store.items, val_str);
         }
         return Status.init(.SUCCESS);
     }
@@ -1790,7 +1790,7 @@ const BabyDBMImpl = struct {
     fn exportRecords(self: *BabyDBMImpl, io: std.Io) Status {
         var status = Status.init(.SUCCESS);
 
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         if (!status.isOk()) return status;
 
         // Build export path.
@@ -1809,11 +1809,11 @@ const BabyDBMImpl = struct {
             .sync_hard = self.open_options.sync_hard,
         };
 
-        const st_open = self.file.open(export_path, true, export_options);
+        const st_open = self.file.open(io, export_path, true, export_options);
         if (!st_open.isOk()) {
             var reopen_opts = self.open_options;
             reopen_opts.truncate = false;
-            _ = self.file.open(self.path.items, true, reopen_opts);
+            _ = self.file.open(io, self.path.items, true, reopen_opts);
             return st_open;
         }
 
@@ -1821,7 +1821,7 @@ const BabyDBMImpl = struct {
         var export_file_open = true;
         defer {
             if (export_file_open) {
-                _ = self.file.close();
+                _ = self.file.close(io);
             }
         }
 
@@ -1855,28 +1855,28 @@ const BabyDBMImpl = struct {
                 return Status.init(.SYSTEM_ERROR);
             defer self.allocator.free(serialized);
 
-            status.mergeFrom(flat_rec.write(serialized, .metadata));
+            status.mergeFrom(flat_rec.write(io, serialized, .metadata));
         }
 
         // Walk leaf chain and write all records.
         var leaf: ?*BabyLeafNode = self.first_node;
         outer: while (leaf) |current_leaf| {
             for (current_leaf.records.items) |rec| {
-                status.mergeFrom(flat_rec.write(rec.key, .normal));
-                status.mergeFrom(flat_rec.write(rec.value, .normal));
+                status.mergeFrom(flat_rec.write(io, rec.key, .normal));
+                status.mergeFrom(flat_rec.write(io, rec.value, .normal));
                 if (!status.isOk()) break :outer;
             }
             leaf = current_leaf.next;
         }
 
         export_file_open = false;
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         status.mergeFrom(file_mod.renameFile(export_path, self.path.items));
         _ = file_mod.removeFile(export_path);
 
         var reopen_opts = self.open_options;
         reopen_opts.truncate = false;
-        status.mergeFrom(self.file.open(self.path.items, true, reopen_opts));
+        status.mergeFrom(self.file.open(io, self.path.items, true, reopen_opts));
         return status;
     }
 
@@ -1885,9 +1885,9 @@ const BabyDBMImpl = struct {
     // -----------------------------------------------------------------------
 
     /// Open a database file for reading/writing.
-    fn openImpl(self: *BabyDBMImpl, path: []const u8, writable: bool, options: OpenOptions, io: std.Io) !Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn openImpl(self: *BabyDBMImpl, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) !Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "already open");
@@ -1899,7 +1899,7 @@ const BabyDBMImpl = struct {
             return Status.init(.SYSTEM_ERROR);
 
         // Open file.
-        const st_open = self.file.open(path, writable, options);
+        const st_open = self.file.open(io, path, writable, options);
         if (!st_open.isOk()) {
             self.path.clearRetainingCapacity();
             return st_open;
@@ -1912,9 +1912,9 @@ const BabyDBMImpl = struct {
         }
 
         // Import existing records.
-        const st_import = try self.importRecords();
+        const st_import = try self.importRecords(io);
         if (!st_import.isOk()) {
-            _ = self.file.close();
+            _ = self.file.close(io);
             self.path.clearRetainingCapacity();
             self.open = false;
             return st_import;
@@ -1941,13 +1941,13 @@ const BabyDBMImpl = struct {
     /// a mutex already held exclusively by the same thread).
     ///
     /// This is only safe to call from importRecords() during openImpl().
-    fn processImplForImport(self: *BabyDBMImpl, key: []const u8, value: []const u8) !void {
+    fn processImplForImport(self: *BabyDBMImpl, io: std.Io, key: []const u8, value: []const u8) !void {
         // Find the leaf containing this key.
         const leaf = self.searchTree(key);
 
         // Acquire leaf lock (we already hold self.mutex exclusively).
-        leaf.mutex.lock();
-        defer leaf.mutex.unlock();
+        leaf.mutex.lockUncancelable(io);
+        defer leaf.mutex.unlock(io);
 
         // Create a simple setter processor.
         var import_status = Status.init(.SUCCESS);
@@ -1976,8 +1976,8 @@ const BabyDBMImpl = struct {
 
     /// Close the database file.
     fn closeImpl(self: *BabyDBMImpl, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
@@ -1989,7 +1989,7 @@ const BabyDBMImpl = struct {
         if (self.writable) {
             status.mergeFrom(self.exportRecords(io));
         } else {
-            status.mergeFrom(self.file.close());
+            status.mergeFrom(self.file.close(io));
         }
 
         // Clear tree and reset state.
@@ -2043,7 +2043,7 @@ const BabyDBMIteratorImpl = struct {
 // ---------------------------------------------------------------------------
 
 /// Initialize a new iterator for the given DBM.
-fn iterInit(dbm: *BabyDBMImpl, allocator: std.mem.Allocator) !*BabyDBMIteratorImpl {
+fn iterInit(dbm: *BabyDBMImpl, io: std.Io, allocator: std.mem.Allocator) !*BabyDBMIteratorImpl {
     const self = try allocator.create(BabyDBMIteratorImpl);
     errdefer allocator.destroy(self);
 
@@ -2057,18 +2057,21 @@ fn iterInit(dbm: *BabyDBMImpl, allocator: std.mem.Allocator) !*BabyDBMIteratorIm
     };
 
     // Register this iterator with the DBM.
-    dbm.mutex.lock();
-    defer dbm.mutex.unlock();
+    // Pre-open (in-memory): single-threaded, no lock needed.
+    const locked = dbm.open;
+    if (locked) dbm.mutex.lockUncancelable(io);
+    defer if (locked) dbm.mutex.unlock(io);
     try dbm.iterators.append(allocator, self);
 
     return self;
 }
 
 /// Deinitialize an iterator, removing it from the DBM's iterator list.
-fn iterDeinit(self: *BabyDBMIteratorImpl) void {
+fn iterDeinit(self: *BabyDBMIteratorImpl, io: std.Io) void {
     if (self.dbm) |dbm| {
-        dbm.mutex.lock();
-        defer dbm.mutex.unlock();
+        const locked = dbm.open;
+        if (locked) dbm.mutex.lockUncancelable(io);
+        defer if (locked) dbm.mutex.unlock(io);
 
         // Find and remove this iterator from the list.
         for (dbm.iterators.items, 0..) |iter, idx| {
@@ -2124,18 +2127,20 @@ fn getCurrentKey(self: *const BabyDBMIteratorImpl) ?[]const u8 {
 }
 
 /// Position iterator at the first record in the tree.
-fn iterFirst(self: *BabyDBMIteratorImpl) Status {
+fn iterFirst(self: *BabyDBMIteratorImpl, io: std.Io) Status {
     if (self.dbm == null) return Status.init(.NOT_FOUND_ERROR);
 
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
+    if (locked) dbm.mutex.lockSharedUncancelable(io);
+    defer if (locked) dbm.mutex.unlockShared(io);
 
     clearPosition(self);
 
-    var leaf: ?*BabyLeafNode = self.dbm.?.first_node;
+    var leaf: ?*BabyLeafNode = dbm.first_node;
     while (leaf != null) {
-        leaf.?.mutex.lockShared();
-        defer leaf.?.mutex.unlockShared();
+        if (locked) leaf.?.mutex.lockSharedUncancelable(io);
+        defer if (locked) leaf.?.mutex.unlockShared(io);
 
         if (leaf.?.records.items.len > 0) {
             setPositionWithKey(self, leaf.?, leaf.?.records.items[0].key) catch {
@@ -2151,18 +2156,20 @@ fn iterFirst(self: *BabyDBMIteratorImpl) Status {
 }
 
 /// Position iterator at the last record in the tree.
-fn iterLast(self: *BabyDBMIteratorImpl) Status {
+fn iterLast(self: *BabyDBMIteratorImpl, io: std.Io) Status {
     if (self.dbm == null) return Status.init(.NOT_FOUND_ERROR);
 
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
+    if (locked) dbm.mutex.lockSharedUncancelable(io);
+    defer if (locked) dbm.mutex.unlockShared(io);
 
     clearPosition(self);
 
-    var leaf: ?*BabyLeafNode = self.dbm.?.last_node;
+    var leaf: ?*BabyLeafNode = dbm.last_node;
     while (leaf != null) {
-        leaf.?.mutex.lockShared();
-        defer leaf.?.mutex.unlockShared();
+        if (locked) leaf.?.mutex.lockSharedUncancelable(io);
+        defer if (locked) leaf.?.mutex.unlockShared(io);
 
         if (leaf.?.records.items.len > 0) {
             setPositionWithKey(self, leaf.?, leaf.?.records.items[leaf.?.records.items.len - 1].key) catch {
@@ -2178,21 +2185,23 @@ fn iterLast(self: *BabyDBMIteratorImpl) Status {
 }
 
 /// Position iterator at the given key (or first key >= given key).
-fn iterJump(self: *BabyDBMIteratorImpl, key: []const u8) Status {
+fn iterJump(self: *BabyDBMIteratorImpl, io: std.Io, key: []const u8) Status {
     if (self.dbm == null) return Status.init(.NOT_FOUND_ERROR);
 
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
+    if (locked) dbm.mutex.lockSharedUncancelable(io);
+    defer if (locked) dbm.mutex.unlockShared(io);
 
     clearPosition(self);
 
     // Search tree to find the leaf that would contain the key.
-    const leaf = self.dbm.?.searchTree(key);
-    leaf.mutex.lockShared();
-    defer leaf.mutex.unlockShared();
+    const leaf = dbm.searchTree(key);
+    if (locked) leaf.mutex.lockSharedUncancelable(io);
+    defer if (locked) leaf.mutex.unlockShared(io);
 
     // Binary search for the key in the leaf.
-    const idx = self.dbm.?.lowerBoundInLeaf(leaf.records.items, key);
+    const idx = dbm.lowerBoundInLeaf(leaf.records.items, key);
 
     // Check if we found an exact match.
     if (idx < leaf.records.items.len and
@@ -2215,8 +2224,8 @@ fn iterJump(self: *BabyDBMIteratorImpl, key: []const u8) Status {
     // Try to move to next leaf and find the first record there.
     var next_leaf = leaf.next;
     while (next_leaf != null) {
-        next_leaf.?.mutex.lockShared();
-        defer next_leaf.?.mutex.unlockShared();
+        if (locked) next_leaf.?.mutex.lockSharedUncancelable(io);
+        defer if (locked) next_leaf.?.mutex.unlockShared(io);
 
         if (next_leaf.?.records.items.len > 0) {
             setPositionWithKey(self, next_leaf.?, next_leaf.?.records.items[0].key) catch {
@@ -2233,15 +2242,15 @@ fn iterJump(self: *BabyDBMIteratorImpl, key: []const u8) Status {
 
 /// Position iterator at the largest key < key (or <= key if inclusive).
 /// Returns SUCCESS even when no matching record exists (cleared position), matching C++ (R-17).
-fn iterJumpLower(self: *BabyDBMIteratorImpl, key: []const u8, inclusive: bool) Status {
+fn iterJumpLower(self: *BabyDBMIteratorImpl, io: std.Io, key: []const u8, inclusive: bool) Status {
     // Jump to the key position (first key >= search key).
-    var status = iterJump(self, key);
+    var status = iterJump(self, io, key);
 
     // If jump found nothing (empty DB or all keys < search key), try positioning at last.
     if (status.code == .NOT_FOUND_ERROR) {
         // iterLast returns NOT_FOUND_ERROR only when DB is empty.
         // Either way, return SUCCESS (R-17, C++ cc:1183-1186).
-        _ = iterLast(self);
+        _ = iterLast(self, io);
         return Status.init(.SUCCESS);
     }
 
@@ -2259,7 +2268,7 @@ fn iterJumpLower(self: *BabyDBMIteratorImpl, key: []const u8, inclusive: bool) S
             }
         }
 
-        status = iterPrevious(self);
+        status = iterPrevious(self, io);
         if (status.code != .SUCCESS) {
             return status;
         }
@@ -2271,9 +2280,9 @@ fn iterJumpLower(self: *BabyDBMIteratorImpl, key: []const u8, inclusive: bool) S
 
 /// Position iterator at the smallest key > key (or >= key if inclusive).
 /// Returns SUCCESS even when no matching record exists (cleared position), matching C++ (R-18).
-fn iterJumpUpper(self: *BabyDBMIteratorImpl, key: []const u8, inclusive: bool) Status {
+fn iterJumpUpper(self: *BabyDBMIteratorImpl, io: std.Io, key: []const u8, inclusive: bool) Status {
     // Jump to the key position (first key >= search key).
-    var status = iterJump(self, key);
+    var status = iterJump(self, io, key);
 
     if (status.code != .SUCCESS) {
         // NOT_FOUND_ERROR means no record >= key exists; return SUCCESS with cleared position.
@@ -2292,7 +2301,7 @@ fn iterJumpUpper(self: *BabyDBMIteratorImpl, key: []const u8, inclusive: bool) S
             }
         }
 
-        status = iterNext(self);
+        status = iterNext(self, io);
         if (status.code != .SUCCESS) {
             return status;
         }
@@ -2306,18 +2315,20 @@ fn iterJumpUpper(self: *BabyDBMIteratorImpl, key: []const u8, inclusive: bool) S
 /// Mirrors C++ NextImpl (cc:1312-1334): uses upper_bound to find the first record strictly
 /// after current_key. If key was deleted, upper_bound still finds the correct successor.
 /// Returns SUCCESS in all cases (cleared position when no successor exists).
-fn iterNext(self: *BabyDBMIteratorImpl) Status {
+fn iterNext(self: *BabyDBMIteratorImpl, io: std.Io) Status {
     if (self.dbm == null or self.key_size == 0) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
     const current_key = getCurrentKey(self).?;
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    if (locked) dbm.mutex.lockSharedUncancelable(io);
+    defer if (locked) dbm.mutex.unlockShared(io);
 
     // If leaf_node is null, search for it using the current key.
     if (self.leaf_node == null) {
-        self.leaf_node = self.dbm.?.searchTree(current_key);
+        self.leaf_node = dbm.searchTree(current_key);
     }
 
     var leaf = self.leaf_node.?;
@@ -2326,10 +2337,10 @@ fn iterNext(self: *BabyDBMIteratorImpl) Status {
     // lowerBoundInLeaf returns the first idx where records[idx].key >= current_key.
     // If records[idx].key == current_key (exact match), advance idx by 1 to get upper_bound.
     {
-        leaf.mutex.lockShared();
-        defer leaf.mutex.unlockShared();
+        if (locked) leaf.mutex.lockSharedUncancelable(io);
+        defer if (locked) leaf.mutex.unlockShared(io);
 
-        var idx = self.dbm.?.lowerBoundInLeaf(leaf.records.items, current_key);
+        var idx = dbm.lowerBoundInLeaf(leaf.records.items, current_key);
         // Advance past exact match (implements upper_bound).
         if (idx < leaf.records.items.len and
             std.mem.eql(u8, leaf.records.items[idx].key, current_key))
@@ -2349,8 +2360,8 @@ fn iterNext(self: *BabyDBMIteratorImpl) Status {
     var next_leaf = leaf.next;
     while (next_leaf != null) {
         var current_next = next_leaf.?;
-        current_next.mutex.lockShared();
-        defer current_next.mutex.unlockShared();
+        if (locked) current_next.mutex.lockSharedUncancelable(io);
+        defer if (locked) current_next.mutex.unlockShared(io);
 
         if (current_next.records.items.len > 0) {
             setPositionWithKey(self, current_next, current_next.records.items[0].key) catch {
@@ -2372,18 +2383,20 @@ fn iterNext(self: *BabyDBMIteratorImpl) Status {
 /// current_key, then steps one back. If key was deleted, lower_bound returns the first record
 /// > current_key, and records[idx-1] is the correct predecessor regardless.
 /// Returns SUCCESS in all cases (cleared position when no predecessor exists).
-fn iterPrevious(self: *BabyDBMIteratorImpl) Status {
+fn iterPrevious(self: *BabyDBMIteratorImpl, io: std.Io) Status {
     if (self.dbm == null or self.key_size == 0) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
     const current_key = getCurrentKey(self).?;
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    if (locked) dbm.mutex.lockSharedUncancelable(io);
+    defer if (locked) dbm.mutex.unlockShared(io);
 
     // If leaf_node is null, search for it using the current key.
     if (self.leaf_node == null) {
-        self.leaf_node = self.dbm.?.searchTree(current_key);
+        self.leaf_node = dbm.searchTree(current_key);
     }
 
     var leaf = self.leaf_node.?;
@@ -2391,10 +2404,10 @@ fn iterPrevious(self: *BabyDBMIteratorImpl) Status {
     // lower_bound: first idx where records[idx].key >= current_key.
     // records[idx-1] is the predecessor whether or not current_key exists.
     {
-        leaf.mutex.lockShared();
-        defer leaf.mutex.unlockShared();
+        if (locked) leaf.mutex.lockSharedUncancelable(io);
+        defer if (locked) leaf.mutex.unlockShared(io);
 
-        const idx = self.dbm.?.lowerBoundInLeaf(leaf.records.items, current_key);
+        const idx = dbm.lowerBoundInLeaf(leaf.records.items, current_key);
 
         if (idx > 0) {
             setPositionWithKey(self, leaf, leaf.records.items[idx - 1].key) catch {
@@ -2408,8 +2421,8 @@ fn iterPrevious(self: *BabyDBMIteratorImpl) Status {
     var prev_leaf = leaf.prev;
     while (prev_leaf != null) {
         var current_prev = prev_leaf.?;
-        current_prev.mutex.lockShared();
-        defer current_prev.mutex.unlockShared();
+        if (locked) current_prev.mutex.lockSharedUncancelable(io);
+        defer if (locked) current_prev.mutex.unlockShared(io);
 
         if (current_prev.records.items.len > 0) {
             setPositionWithKey(self, current_prev, current_prev.records.items[current_prev.records.items.len - 1].key) catch {
@@ -2429,19 +2442,22 @@ fn iterPrevious(self: *BabyDBMIteratorImpl) Status {
 /// Get the current key and value, allocating copies if requested.
 fn iterGet(
     self: *BabyDBMIteratorImpl,
+    allocator: std.mem.Allocator,
+    io: std.Io,
     key_out: ?*std.ArrayList(u8),
     value_out: ?*std.ArrayList(u8),
-    allocator: std.mem.Allocator,
 ) Status {
     if (self.leaf_node == null or self.key_size == 0) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
     const current_key = getCurrentKey(self).?;
     var leaf = self.leaf_node.?;
 
-    leaf.mutex.lockShared();
-    defer leaf.mutex.unlockShared();
+    if (locked) leaf.mutex.lockSharedUncancelable(io);
+    defer if (locked) leaf.mutex.unlockShared(io);
 
     // Binary search for the current key in the leaf.
     const idx = self.dbm.?.lowerBoundInLeaf(leaf.records.items, current_key);
@@ -2473,6 +2489,7 @@ fn iterGet(
 /// Process the current record with a generic processor.
 fn iterProcess(
     self: *BabyDBMIteratorImpl,
+    io: std.Io,
     comptime P: type,
     proc: *P,
     writable: bool,
@@ -2481,28 +2498,30 @@ fn iterProcess(
         return Status.init(.NOT_FOUND_ERROR);
     }
 
+    const dbm = self.dbm.?;
+    const locked = dbm.open;
     const current_key = getCurrentKey(self).?;
 
     // If writable and reorg queue is not empty, drain it first.
-    if (writable and self.dbm != null) {
-        self.dbm.?.mutex.lock();
-        defer self.dbm.?.mutex.unlock();
+    if (writable) {
+        if (locked) dbm.mutex.lockUncancelable(io);
+        defer if (locked) dbm.mutex.unlock(io);
 
-        if (self.dbm.?.reorg_nodes.items.len > 0) {
+        if (dbm.reorg_nodes.items.len > 0) {
             // Drain the reorg queue under exclusive lock.
-            _ = self.dbm.?.reorganizeTree() catch {};
+            _ = dbm.reorganizeTree() catch {};
         }
     }
 
     // Now acquire shared lock for the actual process.
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    if (locked) dbm.mutex.lockSharedUncancelable(io);
+    defer if (locked) dbm.mutex.unlockShared(io);
 
     var leaf = self.leaf_node.?;
 
     if (writable) {
-        leaf.mutex.lock();
-        defer leaf.mutex.unlock();
+        if (locked) leaf.mutex.lockUncancelable(io);
+        defer if (locked) leaf.mutex.unlock(io);
 
         // Search for the current key.
         const idx = self.dbm.?.lowerBoundInLeaf(leaf.records.items, current_key);
@@ -2517,11 +2536,11 @@ fn iterProcess(
 
         return Status.init(.SUCCESS);
     } else {
-        leaf.mutex.lockShared();
-        defer leaf.mutex.unlockShared();
+        if (locked) leaf.mutex.lockSharedUncancelable(io);
+        defer if (locked) leaf.mutex.unlockShared(io);
 
         // Search for the current key.
-        const idx = self.dbm.?.lowerBoundInLeaf(leaf.records.items, current_key);
+        const idx = dbm.lowerBoundInLeaf(leaf.records.items, current_key);
         if (idx >= leaf.records.items.len or !std.mem.eql(u8, leaf.records.items[idx].key, current_key)) {
             return Status.init(.NOT_FOUND_ERROR);
         }
@@ -2563,7 +2582,7 @@ test "BabyDBMImpl init and deinit" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Verify initial state.
     try std.testing.expectEqual(@as(i32, 1), impl.tree_level);
@@ -2582,7 +2601,7 @@ test "lowerBoundInLeaf: simple binary search in leaf" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     var records: std.ArrayList(BabyRecord) = .empty;
     defer {
@@ -2609,7 +2628,7 @@ test "searchTree: single leaf returns root" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Root is a leaf; searchTree should return it.
     const found_leaf = impl.searchTree("anything");
@@ -2620,20 +2639,20 @@ test "processImplOnLeaf: set and get single record" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     const key = "testkey";
     const value = "testvalue";
 
     // Set the key.
-    const set_status = impl.set(key, value, true, null, alloc);
+    const set_status = impl.set(alloc, std.testing.io, key, value, true, null);
     try std.testing.expectEqual(Code.SUCCESS, set_status.code);
     try std.testing.expectEqual(@as(i64, 1), impl.num_records.load(.monotonic));
 
     // Get the key.
     var retrieved: std.ArrayList(u8) = .empty;
     defer retrieved.deinit(alloc);
-    const get_status = impl.get(key, &retrieved, alloc);
+    const get_status = impl.get(alloc, std.testing.io, key, &retrieved);
     try std.testing.expectEqual(Code.SUCCESS, get_status.code);
     try std.testing.expectEqualStrings(value, retrieved.items);
 }
@@ -2642,11 +2661,11 @@ test "processImplOnLeaf: get non-existent key returns NOT_FOUND_ERROR" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     var retrieved: std.ArrayList(u8) = .empty;
     defer retrieved.deinit(alloc);
-    const status = impl.get("nonexistent", &retrieved, alloc);
+    const status = impl.get(alloc, std.testing.io, "nonexistent", &retrieved);
     try std.testing.expectEqual(Code.NOT_FOUND_ERROR, status.code);
 }
 
@@ -2654,24 +2673,24 @@ test "processImplOnLeaf: set with overwrite=false on existing key returns DUPLIC
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     const key = "testkey";
     const value1 = "value1";
     const value2 = "value2";
 
     // Set the first value.
-    const status1 = impl.set(key, value1, true, null, alloc);
+    const status1 = impl.set(alloc, std.testing.io, key, value1, true, null);
     try std.testing.expectEqual(Code.SUCCESS, status1.code);
 
     // Try to set again with overwrite=false.
-    const status2 = impl.set(key, value2, false, null, alloc);
+    const status2 = impl.set(alloc, std.testing.io, key, value2, false, null);
     try std.testing.expectEqual(Code.DUPLICATION_ERROR, status2.code);
 
     // Verify the value is unchanged.
     var retrieved: std.ArrayList(u8) = .empty;
     defer retrieved.deinit(alloc);
-    const get_status = impl.get(key, &retrieved, alloc);
+    const get_status = impl.get(alloc, std.testing.io, key, &retrieved);
     try std.testing.expectEqual(Code.SUCCESS, get_status.code);
     try std.testing.expectEqualStrings(value1, retrieved.items);
 }
@@ -2680,25 +2699,25 @@ test "processImplOnLeaf: remove key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     const key = "testkey";
     const value = "testvalue";
 
     // Set the key.
-    const status1 = impl.set(key, value, true, null, alloc);
+    const status1 = impl.set(alloc, std.testing.io, key, value, true, null);
     try std.testing.expectEqual(Code.SUCCESS, status1.code);
     try std.testing.expectEqual(@as(i64, 1), impl.num_records.load(.monotonic));
 
     // Remove the key.
-    const remove_status = impl.remove(key);
+    const remove_status = impl.remove(std.testing.io, key);
     try std.testing.expectEqual(Code.SUCCESS, remove_status.code);
     try std.testing.expectEqual(@as(i64, 0), impl.num_records.load(.monotonic));
 
     // Verify it's gone.
     var retrieved: std.ArrayList(u8) = .empty;
     defer retrieved.deinit(alloc);
-    const get_status = impl.get(key, &retrieved, alloc);
+    const get_status = impl.get(alloc, std.testing.io, key, &retrieved);
     try std.testing.expectEqual(Code.NOT_FOUND_ERROR, get_status.code);
 }
 
@@ -2706,9 +2725,9 @@ test "processImplOnLeaf: remove on non-existent key returns NOT_FOUND_ERROR" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
-    const status = impl.remove("nonexistent");
+    const status = impl.remove(std.testing.io, "nonexistent");
     try std.testing.expectEqual(Code.NOT_FOUND_ERROR, status.code);
 }
 
@@ -2716,7 +2735,7 @@ test "processImplOnLeaf: set/get round-trip with 10 records" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     var buf: [32]u8 = undefined;
 
@@ -2724,7 +2743,7 @@ test "processImplOnLeaf: set/get round-trip with 10 records" {
     for (0..10) |i| {
         const key = try std.fmt.bufPrint(&buf, "key{d}", .{i});
         const value = try std.fmt.bufPrint(buf[16..], "value{d}", .{i});
-        const status = impl.set(key, value, true, null, alloc);
+        const status = impl.set(alloc, std.testing.io, key, value, true, null);
         try std.testing.expectEqual(Code.SUCCESS, status.code);
     }
     try std.testing.expectEqual(@as(i64, 10), impl.num_records.load(.monotonic));
@@ -2734,7 +2753,7 @@ test "processImplOnLeaf: set/get round-trip with 10 records" {
         const key = try std.fmt.bufPrint(&buf, "key{d}", .{i});
         var retrieved: std.ArrayList(u8) = .empty;
         defer retrieved.deinit(alloc);
-        const status = impl.get(key, &retrieved, alloc);
+        const status = impl.get(alloc, std.testing.io, key, &retrieved);
         try std.testing.expectEqual(Code.SUCCESS, status.code);
         const expected_value = try std.fmt.bufPrint(buf[16..], "value{d}", .{i});
         try std.testing.expectEqualStrings(expected_value, retrieved.items);
@@ -2746,21 +2765,21 @@ test "iterFirst: position at first key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys: key1, key2, key3
-    const status1 = impl.set("key1", "value1", true, null, alloc);
+    const status1 = impl.set(alloc, std.testing.io, "key1", "value1", true, null);
     try std.testing.expectEqual(Code.SUCCESS, status1.code);
-    const status2 = impl.set("key2", "value2", true, null, alloc);
+    const status2 = impl.set(alloc, std.testing.io, "key2", "value2", true, null);
     try std.testing.expectEqual(Code.SUCCESS, status2.code);
-    const status3 = impl.set("key3", "value3", true, null, alloc);
+    const status3 = impl.set(alloc, std.testing.io, "key3", "value3", true, null);
     try std.testing.expectEqual(Code.SUCCESS, status3.code);
 
     // Create and position iterator at first.
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
-    const iter_status = iterFirst(iter);
+    const iter_status = iterFirst(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, iter_status.code);
     try std.testing.expect(iter.leaf_node != null);
     try std.testing.expectEqual(@as(usize, 4), iter.key_size); // "key1" has 4 chars
@@ -2771,18 +2790,18 @@ test "iterLast: position at last key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys: key1, key2, key3
-    _ = impl.set("key1", "value1", true, null, alloc);
-    _ = impl.set("key2", "value2", true, null, alloc);
-    _ = impl.set("key3", "value3", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "key1", "value1", true, null);
+    _ = impl.set(alloc, std.testing.io, "key2", "value2", true, null);
+    _ = impl.set(alloc, std.testing.io, "key3", "value3", true, null);
 
     // Create and position iterator at last.
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
-    const status = iterLast(iter);
+    const status = iterLast(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expect(iter.leaf_node != null);
     try std.testing.expectEqualStrings("key3", getCurrentKey(iter).?);
@@ -2792,16 +2811,16 @@ test "iterNext: forward iteration collects keys in order" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys in arbitrary order: key3, key1, key2
-    _ = impl.set("key3", "value3", true, null, alloc);
-    _ = impl.set("key1", "value1", true, null, alloc);
-    _ = impl.set("key2", "value2", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "key3", "value3", true, null);
+    _ = impl.set(alloc, std.testing.io, "key1", "value1", true, null);
+    _ = impl.set(alloc, std.testing.io, "key2", "value2", true, null);
 
     // Create iterator and collect keys via forward iteration.
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     var keys: std.ArrayList([]u8) = .empty;
     defer {
@@ -2809,7 +2828,7 @@ test "iterNext: forward iteration collects keys in order" {
         keys.deinit(alloc);
     }
 
-    var status = iterFirst(iter);
+    var status = iterFirst(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     while (getCurrentKey(iter) != null) {
@@ -2817,7 +2836,7 @@ test "iterNext: forward iteration collects keys in order" {
         const key_copy = try alloc.dupe(u8, current_key);
         try keys.append(alloc, key_copy);
 
-        status = iterNext(iter);
+        status = iterNext(iter, std.testing.io);
         if (status.code == .NOT_FOUND_ERROR) break;
         try std.testing.expectEqual(Code.SUCCESS, status.code);
     }
@@ -2833,15 +2852,15 @@ test "iterPrevious: backward iteration from last" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys.
-    _ = impl.set("key1", "value1", true, null, alloc);
-    _ = impl.set("key2", "value2", true, null, alloc);
-    _ = impl.set("key3", "value3", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "key1", "value1", true, null);
+    _ = impl.set(alloc, std.testing.io, "key2", "value2", true, null);
+    _ = impl.set(alloc, std.testing.io, "key3", "value3", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     var keys: std.ArrayList([]u8) = .empty;
     defer {
@@ -2849,7 +2868,7 @@ test "iterPrevious: backward iteration from last" {
         keys.deinit(alloc);
     }
 
-    var status = iterLast(iter);
+    var status = iterLast(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     while (getCurrentKey(iter) != null) {
@@ -2857,7 +2876,7 @@ test "iterPrevious: backward iteration from last" {
         const key_copy = try alloc.dupe(u8, current_key);
         try keys.append(alloc, key_copy);
 
-        status = iterPrevious(iter);
+        status = iterPrevious(iter, std.testing.io);
         if (status.code == .NOT_FOUND_ERROR) break;
         try std.testing.expectEqual(Code.SUCCESS, status.code);
     }
@@ -2873,23 +2892,23 @@ test "iterJump: position at key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys.
-    _ = impl.set("apple", "a", true, null, alloc);
-    _ = impl.set("cherry", "c", true, null, alloc);
-    _ = impl.set("orange", "o", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "apple", "a", true, null);
+    _ = impl.set(alloc, std.testing.io, "cherry", "c", true, null);
+    _ = impl.set(alloc, std.testing.io, "orange", "o", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     // Jump to "cherry".
-    var status = iterJump(iter, "cherry");
+    var status = iterJump(iter, std.testing.io, "cherry");
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("cherry", getCurrentKey(iter).?);
 
     // Jump to non-existent key "banana" -> should position at "cherry".
-    status = iterJump(iter, "banana");
+    status = iterJump(iter, std.testing.io, "banana");
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("cherry", getCurrentKey(iter).?);
 }
@@ -2898,28 +2917,28 @@ test "iterJumpLower: position at largest key < target" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys.
-    _ = impl.set("apple", "a", true, null, alloc);
-    _ = impl.set("cherry", "c", true, null, alloc);
-    _ = impl.set("orange", "o", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "apple", "a", true, null);
+    _ = impl.set(alloc, std.testing.io, "cherry", "c", true, null);
+    _ = impl.set(alloc, std.testing.io, "orange", "o", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     // JumpLower to "date" (non-existent) should position at "cherry".
-    var status = iterJumpLower(iter, "date", false);
+    var status = iterJumpLower(iter, std.testing.io, "date", false);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("cherry", getCurrentKey(iter).?);
 
     // JumpLower to "cherry" (inclusive=false) should position at "apple".
-    status = iterJumpLower(iter, "cherry", false);
+    status = iterJumpLower(iter, std.testing.io, "cherry", false);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("apple", getCurrentKey(iter).?);
 
     // JumpLower to "cherry" (inclusive=true) should position at "cherry".
-    status = iterJumpLower(iter, "cherry", true);
+    status = iterJumpLower(iter, std.testing.io, "cherry", true);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("cherry", getCurrentKey(iter).?);
 }
@@ -2928,28 +2947,28 @@ test "iterJumpUpper: position at smallest key > target" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert keys.
-    _ = impl.set("apple", "a", true, null, alloc);
-    _ = impl.set("cherry", "c", true, null, alloc);
-    _ = impl.set("orange", "o", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "apple", "a", true, null);
+    _ = impl.set(alloc, std.testing.io, "cherry", "c", true, null);
+    _ = impl.set(alloc, std.testing.io, "orange", "o", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     // JumpUpper to "banana" (non-existent) should position at "cherry".
-    var status = iterJumpUpper(iter, "banana", false);
+    var status = iterJumpUpper(iter, std.testing.io, "banana", false);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("cherry", getCurrentKey(iter).?);
 
     // JumpUpper to "cherry" (inclusive=false) should position at "orange".
-    status = iterJumpUpper(iter, "cherry", false);
+    status = iterJumpUpper(iter, std.testing.io, "cherry", false);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("orange", getCurrentKey(iter).?);
 
     // JumpUpper to "cherry" (inclusive=true) should position at "cherry".
-    status = iterJumpUpper(iter, "cherry", true);
+    status = iterJumpUpper(iter, std.testing.io, "cherry", true);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("cherry", getCurrentKey(iter).?);
 }
@@ -2958,13 +2977,13 @@ test "iterGet: retrieve key and value at current position" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert a record.
-    _ = impl.set("testkey", "testvalue", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "testkey", "testvalue", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     var key_out: std.ArrayList(u8) = .empty;
     defer key_out.deinit(alloc);
@@ -2972,10 +2991,10 @@ test "iterGet: retrieve key and value at current position" {
     defer value_out.deinit(alloc);
 
     // Position and retrieve.
-    var status = iterFirst(iter);
+    var status = iterFirst(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
-    status = iterGet(iter, &key_out, &value_out, alloc);
+    status = iterGet(iter, alloc, std.testing.io, &key_out, &value_out);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
     try std.testing.expectEqualStrings("testkey", key_out.items);
     try std.testing.expectEqualStrings("testvalue", value_out.items);
@@ -2985,16 +3004,16 @@ test "iterProcess: modify record via iterator" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert a record.
-    _ = impl.set("testkey", "oldvalue", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "testkey", "oldvalue", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     // Position at the record.
-    var status = iterFirst(iter);
+    var status = iterFirst(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     // Use ProcessorSet to modify.
@@ -3007,13 +3026,13 @@ test "iterProcess: modify record via iterator" {
         .allocator = alloc,
     };
 
-    status = iterProcess(iter, ProcessorSet, &proc, true);
+    status = iterProcess(iter, std.testing.io, ProcessorSet, &proc, true);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     // Verify the change persisted.
     var retrieved: std.ArrayList(u8) = .empty;
     defer retrieved.deinit(alloc);
-    const get_status = impl.get("testkey", &retrieved, alloc);
+    const get_status = impl.get(alloc, std.testing.io, "testkey", &retrieved);
     try std.testing.expectEqual(Code.SUCCESS, get_status.code);
     try std.testing.expectEqualStrings("newvalue", retrieved.items);
 }
@@ -3022,26 +3041,26 @@ test "iterGet: return NOT_FOUND_ERROR when key deleted" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     // Insert two records.
-    _ = impl.set("key1", "value1", true, null, alloc);
-    _ = impl.set("key2", "value2", true, null, alloc);
+    _ = impl.set(alloc, std.testing.io, "key1", "value1", true, null);
+    _ = impl.set(alloc, std.testing.io, "key2", "value2", true, null);
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     // Position at key1.
-    var status = iterFirst(iter);
+    var status = iterFirst(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     // Delete key1 from the tree.
-    _ = impl.remove("key1");
+    _ = impl.remove(std.testing.io, "key1");
 
     // Try to get the now-deleted key.
     var key_out: std.ArrayList(u8) = .empty;
     defer key_out.deinit(alloc);
-    status = iterGet(iter, &key_out, null, alloc);
+    status = iterGet(iter, alloc, std.testing.io, &key_out, null);
     try std.testing.expectEqual(Code.NOT_FOUND_ERROR, status.code);
 }
 
@@ -3049,7 +3068,7 @@ test "ordered iteration: 100 keys out of order, forward and backward" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     const impl = try BabyDBMImpl.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer impl.deinit();
+    defer impl.deinit(std.testing.io);
 
     var buf: [16]u8 = undefined;
 
@@ -3058,17 +3077,17 @@ test "ordered iteration: 100 keys out of order, forward and backward" {
         const idx = 99 - i;
         const key = try std.fmt.bufPrint(&buf, "k{d:0>3}", .{idx});
         const value = try std.fmt.bufPrint(buf[8..], "v{d:0>3}", .{idx});
-        _ = impl.set(key, value, true, null, alloc);
+        _ = impl.set(alloc, std.testing.io, key, value, true, null);
     }
 
-    const iter = try iterInit(impl, alloc);
-    defer iterDeinit(iter);
+    const iter = try iterInit(impl, std.testing.io, alloc);
+    defer iterDeinit(iter, std.testing.io);
 
     // Forward pass: collect all keys.
     var forward_keys: std.ArrayList(u32) = .empty;
     defer forward_keys.deinit(alloc);
 
-    var status = iterFirst(iter);
+    var status = iterFirst(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     while (getCurrentKey(iter) != null) {
@@ -3076,7 +3095,7 @@ test "ordered iteration: 100 keys out of order, forward and backward" {
         const num = try std.fmt.parseInt(u32, key_str[1..], 10);
         try forward_keys.append(alloc, num);
 
-        status = iterNext(iter);
+        status = iterNext(iter, std.testing.io);
         if (status.code == .NOT_FOUND_ERROR) break;
     }
 
@@ -3090,7 +3109,7 @@ test "ordered iteration: 100 keys out of order, forward and backward" {
     var backward_keys: std.ArrayList(u32) = .empty;
     defer backward_keys.deinit(alloc);
 
-    status = iterLast(iter);
+    status = iterLast(iter, std.testing.io);
     try std.testing.expectEqual(Code.SUCCESS, status.code);
 
     while (getCurrentKey(iter) != null) {
@@ -3098,7 +3117,7 @@ test "ordered iteration: 100 keys out of order, forward and backward" {
         const num = try std.fmt.parseInt(u32, key_str[1..], 10);
         try backward_keys.append(alloc, num);
 
-        status = iterPrevious(iter);
+        status = iterPrevious(iter, std.testing.io);
         if (status.code == .NOT_FOUND_ERROR) break;
     }
 
@@ -3121,51 +3140,54 @@ pub const BabyDBM = struct {
         impl: *BabyDBMIteratorImpl,
         allocator: std.mem.Allocator,
 
-        pub fn deinit(self: *Cursor) void {
-            iterDeinit(self.impl);
+        pub fn deinit(self: *Cursor, io: std.Io) void {
+            iterDeinit(self.impl, io);
         }
 
-        pub fn first(self: *Cursor) Status {
-            return iterFirst(self.impl);
+        pub fn first(self: *Cursor, io: std.Io) Status {
+            return iterFirst(self.impl, io);
         }
 
-        pub fn last(self: *Cursor) Status {
-            return iterLast(self.impl);
+        pub fn last(self: *Cursor, io: std.Io) Status {
+            return iterLast(self.impl, io);
         }
 
-        pub fn jump(self: *Cursor, key: []const u8) Status {
-            return iterJump(self.impl, key);
+        pub fn jump(self: *Cursor, io: std.Io, key: []const u8) Status {
+            return iterJump(self.impl, io, key);
         }
 
-        pub fn jumpLower(self: *Cursor, key: []const u8, inclusive: bool) Status {
-            return iterJumpLower(self.impl, key, inclusive);
+        pub fn jumpLower(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            return iterJumpLower(self.impl, io, key, inclusive);
         }
 
-        pub fn jumpUpper(self: *Cursor, key: []const u8, inclusive: bool) Status {
-            return iterJumpUpper(self.impl, key, inclusive);
+        pub fn jumpUpper(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            return iterJumpUpper(self.impl, io, key, inclusive);
         }
 
-        pub fn next(self: *Cursor) Status {
-            return iterNext(self.impl);
+        pub fn next(self: *Cursor, io: std.Io) Status {
+            return iterNext(self.impl, io);
         }
 
-        pub fn previous(self: *Cursor) Status {
-            return iterPrevious(self.impl);
+        pub fn previous(self: *Cursor, io: std.Io) Status {
+            return iterPrevious(self.impl, io);
         }
 
         pub fn get(
             self: *Cursor,
+            io: std.Io,
             key_out: ?*std.ArrayList(u8),
             value_out: ?*std.ArrayList(u8),
         ) Status {
-            return iterGet(self.impl, key_out, value_out, self.allocator);
+            return iterGet(self.impl, self.allocator, io, key_out, value_out);
         }
 
-        pub fn process(self: *Cursor, comptime P: type, proc: *P, writable: bool) Status {
-            return iterProcess(self.impl, P, proc, writable);
+        pub fn process(self: *Cursor, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
+
+            return iterProcess(self.impl, io, P, proc, writable);
         }
 
-        pub fn set(self: *Cursor, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn set(self: *Cursor, io: std.Io, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+
             const SetProc = struct {
                 value: []const u8,
                 old_key: ?*std.ArrayList(u8),
@@ -3186,12 +3208,13 @@ pub const BabyDBM = struct {
                 pub fn processEmpty(_: *@This(), _: []const u8) RecordAction { return .noop; }
             };
             var proc = SetProc{ .value = value, .old_key = old_key, .old_value = old_value, .allocator = self.allocator };
-            const st = self.process(SetProc, &proc, true);
+            const st = self.process(io, SetProc, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn remove(self: *Cursor, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn remove(self: *Cursor, io: std.Io, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+
             const RemoveProc = struct {
                 old_key: ?*std.ArrayList(u8),
                 old_value: ?*std.ArrayList(u8),
@@ -3211,15 +3234,16 @@ pub const BabyDBM = struct {
                 pub fn processEmpty(p: *@This(), _: []const u8) RecordAction { p.status = Status.init(.NOT_FOUND_ERROR); return .noop; }
             };
             var proc = RemoveProc{ .old_key = old_key, .old_value = old_value, .allocator = self.allocator };
-            const st = self.process(RemoveProc, &proc, true);
+            const st = self.process(io, RemoveProc, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn step(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            const st = self.get(key_out, value_out);
+        pub fn step(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+
+            const st = self.get(io, key_out, value_out);
             if (!st.isOk()) return st;
-            _ = self.next();
+            _ = self.next(io);
             return Status.init(.SUCCESS);
         }
     };
@@ -3245,7 +3269,7 @@ pub const BabyDBM = struct {
         /// The returned slices point into internal buffers and are invalidated
         /// on the next call to next() or deinit(). Copy them if you need the
         /// data to outlive this call.
-        pub fn next(self: *Iterator) !?Entry {
+        pub fn next(self: *Iterator, io: std.Io) !?Entry {
             if (self.done) return null;
 
             // Fill internal buffers from the current cursor position.
@@ -3271,7 +3295,7 @@ pub const BabyDBM = struct {
                 .val_buf = &self.value_buf,
                 .alloc = self.alloc,
             };
-            if (self.cursor.process(Proc, &proc, false).isOk() and !proc.oom) filled = true;
+            if (self.cursor.process(io, Proc, &proc, false).isOk() and !proc.oom) filled = true;
             if (proc.oom) return error.OutOfMemory;
 
             if (!filled) {
@@ -3281,7 +3305,7 @@ pub const BabyDBM = struct {
 
             // Advance cursor. If it reaches the end, mark done so the next
             // call returns null rather than re-reading the last record.
-            if (!self.cursor.next().isOk()) self.done = true;
+            if (!self.cursor.next(io).isOk()) self.done = true;
 
             return Entry{
                 .key = self.key_buf.items,
@@ -3290,18 +3314,18 @@ pub const BabyDBM = struct {
         }
 
         /// Release internal buffers and the underlying cursor.
-        pub fn deinit(self: *Iterator) void {
+        pub fn deinit(self: *Iterator, io: std.Io) void {
             self.key_buf.deinit(self.alloc);
             self.value_buf.deinit(self.alloc);
-            self.cursor.deinit();
+            self.cursor.deinit(io);
         }
     };
 
     /// Return a Zig-style iterator positioned at the first record.
     /// The caller must call deinit() when done.
-    pub fn iterate(self: *BabyDBM, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterate(self: *BabyDBM, alloc: std.mem.Allocator, io: std.Io) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -3309,15 +3333,16 @@ pub const BabyDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
     /// Return a Zig-style iterator positioned at the first record >= key.
     /// The caller must call deinit() when done.
-    pub fn iterateFrom(self: *BabyDBM, key: []const u8, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *BabyDBM, alloc: std.mem.Allocator, io: std.Io, key: []const u8) !Iterator {
+
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -3325,7 +3350,7 @@ pub const BabyDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump(io, key).isOk()) iter.done = true;
         return iter;
     }
 
@@ -3334,27 +3359,26 @@ pub const BabyDBM = struct {
         return BabyDBM{ .impl = impl, .allocator = allocator };
     }
 
-    pub fn deinit(self: *BabyDBM) void {
-        self.impl.deinit();
+    pub fn deinit(self: *BabyDBM, io: std.Io) void {
+        self.impl.deinit(io);
     }
 
-    pub fn makeCursor(self: *BabyDBM) !Cursor {
-        const iter_impl = try iterInit(self.impl, self.allocator);
+    pub fn makeCursor(self: *BabyDBM, io: std.Io) !Cursor {
+        const iter_impl = try iterInit(self.impl, io, self.allocator);
         return Cursor{
             .impl = iter_impl,
             .allocator = self.allocator,
         };
     }
 
-    /// Deprecated: use makeCursor instead.
-    pub const makeIterator = makeCursor;
 
     // -----------------------------------------------------------------------
     // File Operations
     // -----------------------------------------------------------------------
 
-    pub fn open(self: *BabyDBM, path: []const u8, writable: bool, options: OpenOptions, io: std.Io) !Status {
-        return try self.impl.openImpl(path, writable, options, io);
+    pub fn open(self: *BabyDBM, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) !Status {
+
+        return try self.impl.openImpl(io, path, writable, options);
     }
 
     pub fn close(self: *BabyDBM, io: std.Io) Status {
@@ -3367,37 +3391,42 @@ pub const BabyDBM = struct {
 
     pub fn get(
         self: *BabyDBM,
+        io: std.Io,
         key: []const u8,
         value: ?*std.ArrayList(u8),
     ) Status {
-        return self.impl.get(key, value, self.allocator);
+        return self.impl.get(self.allocator, io, key, value);
     }
 
-    pub fn getSimple(self: *BabyDBM, key: []const u8, default_value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn getSimple(self: *BabyDBM, allocator: std.mem.Allocator, io: std.Io, key: []const u8, default_value: []const u8) ![]const u8 {
+
         var buf: std.ArrayList(u8) = .empty;
         // buf is populated by self.get which uses self.allocator internally; deinit must match.
         defer buf.deinit(self.allocator);
-        const st = self.get(key, &buf);
+        const st = self.get(io, key, &buf);
         if (st.isOk()) return try allocator.dupe(u8, buf.items);
         return try allocator.dupe(u8, default_value);
     }
 
     pub fn set(
         self: *BabyDBM,
+        io: std.Io,
         key: []const u8,
         value: []const u8,
         overwrite: bool,
         old_value: ?*std.ArrayList(u8),
     ) Status {
-        return self.impl.set(key, value, overwrite, old_value, self.allocator);
+        return self.impl.set(self.allocator, io, key, value, overwrite, old_value);
     }
 
-    pub fn remove(self: *BabyDBM, key: []const u8) Status {
-        return self.impl.remove(key);
+    pub fn remove(self: *BabyDBM, io: std.Io, key: []const u8) Status {
+
+        return self.impl.remove(io, key);
     }
 
-    pub fn append(self: *BabyDBM, key: []const u8, value: []const u8, delim: []const u8) Status {
-        return self.impl.append(key, value, delim);
+    pub fn append(self: *BabyDBM, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
+
+        return self.impl.append(io, key, value, delim);
     }
 
     /// Fetch multiple keys in a single call.  For every key that exists its
@@ -3407,6 +3436,7 @@ pub const BabyDBM = struct {
     /// map.  Iterates all keys without early exit.
     pub fn getMulti(
         self: *BabyDBM,
+        io: std.Io,
         keys: []const []const u8,
         records: *std.StringHashMap([]u8),
     ) Status {
@@ -3416,7 +3446,7 @@ pub const BabyDBM = struct {
         defer val_buf.deinit(self.allocator);
         for (keys) |key| {
             val_buf.clearRetainingCapacity();
-            const st = self.get(key, &val_buf);
+            const st = self.get(io, key, &val_buf);
             if (st.isOk()) {
                 const duped_key = map_alloc.dupe(u8, key) catch return Status.init(.SYSTEM_ERROR);
                 const duped_val = map_alloc.dupe(u8, val_buf.items) catch {
@@ -3439,12 +3469,13 @@ pub const BabyDBM = struct {
     /// DUPLICATION_ERROR (which is soft — overwrite=false conflicts).
     pub fn setMulti(
         self: *BabyDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         overwrite: bool,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.set(r[0], r[1], overwrite, null);
+            const st = self.set(io, r[0], r[1], overwrite, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .DUPLICATION_ERROR) break;
         }
@@ -3454,11 +3485,12 @@ pub const BabyDBM = struct {
     /// Remove multiple keys.  Stops on any error other than NOT_FOUND_ERROR.
     pub fn removeMulti(
         self: *BabyDBM,
+        io: std.Io,
         keys: []const []const u8,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (keys) |key| {
-            const st = self.remove(key);
+            const st = self.remove(io, key);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .NOT_FOUND_ERROR) break;
         }
@@ -3468,12 +3500,13 @@ pub const BabyDBM = struct {
     /// Append to multiple keys using the given delimiter.  Stops on first error.
     pub fn appendMulti(
         self: *BabyDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         delim: []const u8,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.append(r[0], r[1], delim);
+            const st = self.append(io, r[0], r[1], delim);
             status.mergeFrom(st);
             if (!status.isOk()) break;
         }
@@ -3484,47 +3517,53 @@ pub const BabyDBM = struct {
     // Batch Operations
     // -----------------------------------------------------------------------
 
-    pub fn process(self: *BabyDBM, comptime P: type, key: []const u8, proc: *P, writable: bool) Status {
-        self.impl.processImpl(P, proc, key, writable) catch return Status.init(.SYSTEM_ERROR);
+    pub fn process(self: *BabyDBM, io: std.Io, comptime P: type, key: []const u8, proc: *P, writable: bool) Status {
+
+        self.impl.processImpl(io, P, proc, key, writable) catch return Status.init(.SYSTEM_ERROR);
         return Status.init(.SUCCESS);
     }
 
-    pub fn processFirst(self: *BabyDBM, comptime P: type, proc: *P, writable: bool) Status {
-        return self.impl.processFirst(P, proc, writable);
+    pub fn processFirst(self: *BabyDBM, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
+
+        return self.impl.processFirst(io, P, proc, writable);
     }
 
-    pub fn processEach(self: *BabyDBM, comptime P: type, proc: *P, writable: bool) Status {
-        return self.impl.processEach(P, proc, writable);
+    pub fn processEach(self: *BabyDBM, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
+
+        return self.impl.processEach(io, P, proc, writable);
     }
 
     pub fn processMulti(
         self: *BabyDBM,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
         writable: bool,
     ) Status {
-        return self.impl.processMulti(P, keys, procs, writable);
+        return self.impl.processMulti(io, P, keys, procs, writable);
     }
 
     fn countInternal(self: *BabyDBM) i64 {
         return self.impl.count();
     }
 
-    pub fn clear(self: *BabyDBM) Status {
-        return self.impl.clear();
+    pub fn clear(self: *BabyDBM, io: std.Io) Status {
+        return self.impl.clear(io);
     }
 
-    pub fn rebuild(self: *BabyDBM) Status {
+    pub fn rebuild(self: *BabyDBM, io: std.Io) Status {
+        _ = io; // BabyDBM is self-balancing; impl rebuild is a no-op with no file I/O
         return self.impl.rebuild();
     }
 
-    pub fn synchronize(self: *BabyDBM, hard: bool, io: std.Io) Status {
-        return self.impl.synchronize(hard, io);
+    pub fn synchronize(self: *BabyDBM, io: std.Io, hard: bool) Status {
+
+        return self.impl.synchronize(io, hard);
     }
 
-    pub fn inspect(self: *BabyDBM, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        return self.impl.inspect(allocator);
+    pub fn inspect(self: *BabyDBM, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        return self.impl.inspect(allocator, io);
     }
 
     // -----------------------------------------------------------------------
@@ -3618,6 +3657,7 @@ pub const BabyDBM = struct {
     /// Atomically compare and conditionally exchange the value for a key.
     pub fn compareExchange(
         self: *BabyDBM,
+        io: std.Io,
         key: []const u8,
         expected: dbm_mod.CompareExpected,
         desired: dbm_mod.CompareDesired,
@@ -3633,7 +3673,7 @@ pub const BabyDBM = struct {
             .found_out = found_out,
             .allocator = self.allocator,
         };
-        self.impl.processImpl(ProcessorCompareExchange, &proc, key, true) catch
+        self.impl.processImpl(io, ProcessorCompareExchange, &proc, key, true) catch
             return Status.init(.SYSTEM_ERROR);
         return status;
     }
@@ -3641,6 +3681,7 @@ pub const BabyDBM = struct {
     /// Atomically increment a stored i64 value by delta, returning the new value.
     pub fn increment(
         self: *BabyDBM,
+        io: std.Io,
         key: []const u8,
         delta: i64,
         current_out: ?*i64,
@@ -3654,20 +3695,22 @@ pub const BabyDBM = struct {
             .initial = initial,
             .allocator = self.allocator,
         };
-        self.impl.processImpl(ProcessorIncrement, &proc, key, true) catch
+        self.impl.processImpl(io, ProcessorIncrement, &proc, key, true) catch
             return Status.init(.SYSTEM_ERROR);
         return status;
     }
 
-    pub fn incrementSimple(self: *BabyDBM, key: []const u8, delta: i64, initial: i64) i64 {
+    pub fn incrementSimple(self: *BabyDBM, io: std.Io, key: []const u8, delta: i64, initial: i64) i64 {
+
         var result: i64 = initial;
-        _ = self.increment(key, delta, &result, initial);
+        _ = self.increment(io, key, delta, &result, initial);
         return result;
     }
 
     /// Remove and return the first record in the database (lexicographic order on BabyDBM).
     pub fn popFirst(
         self: *BabyDBM,
+        io: std.Io,
         key_out: ?*std.ArrayList(u8),
         value_out: ?*std.ArrayList(u8),
     ) Status {
@@ -3678,7 +3721,7 @@ pub const BabyDBM = struct {
             .value_out = value_out,
             .allocator = self.allocator,
         };
-        const st = self.processFirst(ProcessorPopFirst, &proc, true);
+        const st = self.processFirst(io, ProcessorPopFirst, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
@@ -3688,10 +3731,10 @@ pub const BabyDBM = struct {
     /// Key is returned in key_out if non-null.
     pub fn pushLast(
         self: *BabyDBM,
+        io: std.Io,
         value: []const u8,
         wtime: f64,
         key_out: ?*std.ArrayList(u8),
-        io: std.Io,
     ) Status {
         const base: u64 = time_util.pushLastKeyBase(wtime, io);
         var seq: u64 = 0;
@@ -3699,7 +3742,7 @@ pub const BabyDBM = struct {
             const ts: u64 = base +% seq;
             var key_buf: [8]u8 = undefined;
             const key = str_util.intToStrBigEndian(ts, 8, &key_buf);
-            const st = self.set(key, value, false, null);
+            const st = self.set(io, key, value, false, null);
             if (st.code != .DUPLICATION_ERROR) {
                 if (key_out) |ko| {
                     ko.clearRetainingCapacity();
@@ -3753,10 +3796,11 @@ pub const BabyDBM = struct {
 
     /// Copies the backing file to dest_path, optionally syncing first.
     /// Returns NOT_IMPLEMENTED_ERROR when no backing file is open.
-    pub fn copyFileData(self: *BabyDBM, dest_path: []const u8, sync_hard: bool, io: std.Io) Status {
+    pub fn copyFileData(self: *BabyDBM, io: std.Io, dest_path: []const u8, sync_hard: bool) Status {
+
         if (!self.isOpen()) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (sync_hard) {
-            const st = self.synchronize(true, io);
+            const st = self.synchronize(io, true);
             if (!st.isOk()) return st;
         }
         const src_path = self.getFilePathInternal();
@@ -3767,30 +3811,32 @@ pub const BabyDBM = struct {
     }
 
     /// Renames a key. Reads old value, sets under new_key, removes old_key unless copying=true.
-    pub fn rekey(self: *BabyDBM, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+    pub fn rekey(self: *BabyDBM, io: std.Io, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+
         if (!self.isOpen() or !self.isWritable())
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(self.allocator);
 
-        const st_get = self.get(old_key, &value_list);
+        const st_get = self.get(io, old_key, &value_list);
         if (!st_get.isOk()) return st_get;
 
-        const st_set = self.set(new_key, value_list.items, overwrite, null);
+        const st_set = self.set(io, new_key, value_list.items, overwrite, null);
         if (!st_set.isOk()) return st_set;
 
         if (!copying) {
-            _ = self.remove(old_key);
+            _ = self.remove(io, old_key);
         }
         return Status.init(.SUCCESS);
     }
 
     /// Exports all records from this DBM to dest (any DBM with a set() method).
-    pub fn export_(self: *BabyDBM, dest: anytype) Status {
-        var iter = self.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        var st = iter.first();
+    pub fn export_(self: *BabyDBM, io: std.Io, dest: anytype) Status {
+
+        var iter = self.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        var st = iter.first(io);
         if (st.code == .NOT_FOUND_ERROR) return Status.init(.SUCCESS);
         if (!st.isOk()) return st;
         while (true) {
@@ -3798,11 +3844,11 @@ pub const BabyDBM = struct {
             defer key_list.deinit(self.allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get(io, &key_list, &val_list);
             if (!st_get.isOk()) break;
-            const st_set = dest.set(key_list.items, val_list.items, true, null);
+            const st_set = dest.set(io, key_list.items, val_list.items, true, null);
             if (!st_set.isOk()) return st_set;
-            st = iter.next();
+            st = iter.next(io);
             if (!st.isOk()) break;
         }
         return Status.init(.SUCCESS);
@@ -3811,13 +3857,14 @@ pub const BabyDBM = struct {
     /// Atomically checks multiple expected conditions then applies multiple desired changes.
     pub fn compareExchangeMulti(
         self: *BabyDBM,
+        io: std.Io,
         expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
         desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const get_st = self.get(cond.key, &val_list);
+            const get_st = self.get(io, cond.key, &val_list);
             switch (cond.value) {
                 .absent => {
                     if (get_st.isOk()) return Status.init(.DUPLICATION_ERROR);
@@ -3834,11 +3881,11 @@ pub const BabyDBM = struct {
         for (desired) |change| {
             switch (change.value) {
                 .remove => {
-                    const st = self.remove(change.key);
+                    const st = self.remove(io, change.key);
                     if (!st.isOk() and st.code != .NOT_FOUND_ERROR) return st;
                 },
                 .set => |new_val| {
-                    const st = self.set(change.key, new_val, true, null);
+                    const st = self.set(io, change.key, new_val, true, null);
                     if (!st.isOk()) return st;
                 },
                 .noop => {},
@@ -3852,19 +3899,19 @@ test "BabyDBM.compareExchange: match and exchange" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "foo", true, null);
+    _ = db.set(std.testing.io, "key1", "foo", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key1", .{ .exact = "foo" }, .{ .set = "bar" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key1", .{ .exact = "foo" }, .{ .set = "bar" }, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "foo", actual.items);
 
     actual.clearRetainingCapacity();
-    const get_st_1 = db.get("key1", &actual);
+    const get_st_1 = db.get(std.testing.io, "key1", &actual);
     try std.testing.expect(get_st_1.isOk());
     try std.testing.expectEqualSlices(u8, "bar", actual.items);
 }
@@ -3873,13 +3920,13 @@ test "BabyDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key2", "old", true, null);
+    _ = db.set(std.testing.io, "key2", "old", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key2", .{ .exact = "wrong" }, .{ .set = "new" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key2", .{ .exact = "wrong" }, .{ .set = "new" }, &actual, &found);
     try std.testing.expect(st.code == .INFEASIBLE_ERROR);
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "old", actual.items);
@@ -3889,17 +3936,17 @@ test "BabyDBM.compareExchange: absent creates record" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("newkey", .absent, .{ .set = "value" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "newkey", .absent, .{ .set = "value" }, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(!found);
 
     actual.clearRetainingCapacity();
-    const get_st = db.get("newkey", &actual);
+    const get_st = db.get(std.testing.io, "newkey", &actual);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualSlices(u8, "value", actual.items);
 }
@@ -3908,17 +3955,17 @@ test "BabyDBM.compareExchange: absent noop on missing key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("missing", .absent, .noop, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "missing", .absent, .noop, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(!found);
 
     actual.clearRetainingCapacity();
-    const get_st = db.get("missing", &actual);
+    const get_st = db.get(std.testing.io, "missing", &actual);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
@@ -3926,19 +3973,19 @@ test "BabyDBM.compareExchange: any probe reads without writing" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "original", true, null);
+    _ = db.set(std.testing.io, "key", "original", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .any, .noop, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .any, .noop, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "original", actual.items);
 
     actual.clearRetainingCapacity();
-    const get_st_2 = db.get("key", &actual);
+    const get_st_2 = db.get(std.testing.io, "key", &actual);
     try std.testing.expect(get_st_2.isOk());
     try std.testing.expectEqualSlices(u8, "original", actual.items);
 }
@@ -3947,17 +3994,17 @@ test "BabyDBM.compareExchange: desired remove deletes record" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "foo", true, null);
+    _ = db.set(std.testing.io, "key", "foo", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .{ .exact = "foo" }, .remove, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .{ .exact = "foo" }, .remove, &actual, &found);
     try std.testing.expect(st.isOk());
 
     actual.clearRetainingCapacity();
-    const get_st = db.get("key", &actual);
+    const get_st = db.get(std.testing.io, "key", &actual);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
@@ -3965,13 +4012,13 @@ test "BabyDBM.compareExchange: absent fails when key exists" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "exists", true, null);
+    _ = db.set(std.testing.io, "key", "exists", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .absent, .{ .set = "new" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .absent, .{ .set = "new" }, &actual, &found);
     try std.testing.expect(st.code == .INFEASIBLE_ERROR);
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "exists", actual.items);
@@ -3981,16 +4028,16 @@ test "BabyDBM.increment: fresh key uses initial+delta" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var current: i64 = undefined;
-    const st = db.increment("counter", 3, &current, 10);
+    const st = db.increment(std.testing.io, "counter", 3, &current, 10);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 13), current);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st_3 = db.get("counter", &val);
+    const get_st_3 = db.get(std.testing.io, "counter", &val);
     try std.testing.expect(get_st_3.isOk());
     try std.testing.expectEqual(@as(usize, 8), val.items.len);
     const stored = @as(i64, @bitCast(str_util.strToIntBigEndian(val.items)));
@@ -4001,14 +4048,14 @@ test "BabyDBM.increment: existing key adds delta" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var buf: [8]u8 = undefined;
     const initial_bytes = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 10))), 8, &buf);
-    _ = db.set("num", initial_bytes, true, null);
+    _ = db.set(std.testing.io, "num", initial_bytes, true, null);
 
     var current: i64 = undefined;
-    const st = db.increment("num", 5, &current, 0);
+    const st = db.increment(std.testing.io, "num", 5, &current, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 15), current);
 }
@@ -4017,20 +4064,20 @@ test "BabyDBM.increment: INT64MIN probe reads without writing" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var buf: [8]u8 = undefined;
     const initial_bytes = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 7))), 8, &buf);
-    _ = db.set("num", initial_bytes, true, null);
+    _ = db.set(std.testing.io, "num", initial_bytes, true, null);
 
     var current: i64 = undefined;
-    const st = db.increment("num", lib_common.INT64MIN, &current, 0);
+    const st = db.increment(std.testing.io, "num", lib_common.INT64MIN, &current, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 7), current);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    _ = db.get("num", &val);
+    _ = db.get(std.testing.io, "num", &val);
     const stored = @as(i64, @bitCast(str_util.strToIntBigEndian(val.items)));
     try std.testing.expectEqual(@as(i64, 7), stored);
 }
@@ -4039,16 +4086,16 @@ test "BabyDBM.increment: INT64MIN probe on missing key returns initial" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var current: i64 = undefined;
-    const st = db.increment("missing", lib_common.INT64MIN, &current, 42);
+    const st = db.increment(std.testing.io, "missing", lib_common.INT64MIN, &current, 42);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 42), current);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st = db.get("missing", &val);
+    const get_st = db.get(std.testing.io, "missing", &val);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
@@ -4056,11 +4103,11 @@ test "BabyDBM.popFirst: returns and removes first record" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
-    _ = db.set("key2", "value2", true, null);
-    _ = db.set("key3", "value3", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key2", "value2", true, null);
+    _ = db.set(std.testing.io, "key3", "value3", true, null);
     try std.testing.expectEqual(@as(i64, 3), db.countSimple());
 
     var key: std.ArrayList(u8) = .empty;
@@ -4068,7 +4115,7 @@ test "BabyDBM.popFirst: returns and removes first record" {
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = db.popFirst(&key, &value);
+    const st = db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.isOk());
     try std.testing.expect(key.items.len > 0);
     try std.testing.expect(value.items.len > 0);
@@ -4081,14 +4128,14 @@ test "BabyDBM.popFirst: empty returns NOT_FOUND_ERROR" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = db.popFirst(&key, &value);
+    const st = db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.code == .NOT_FOUND_ERROR);
 }
 
@@ -4096,18 +4143,18 @@ test "BabyDBM.popFirst: returns lexicographic first" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("zebra", "z", true, null);
-    _ = db.set("apple", "a", true, null);
-    _ = db.set("cherry", "c", true, null);
+    _ = db.set(std.testing.io, "zebra", "z", true, null);
+    _ = db.set(std.testing.io, "apple", "a", true, null);
+    _ = db.set(std.testing.io, "cherry", "c", true, null);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = db.popFirst(&key, &value);
+    const st = db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualSlices(u8, "apple", key.items);
 }
@@ -4116,17 +4163,17 @@ test "BabyDBM.pushLast: creates record with key_out" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
-    const st = db.pushLast("hello", 1.0, &key, std.testing.io);
+    const st = db.pushLast(std.testing.io, "hello", 1.0, &key);
     try std.testing.expect(st.isOk());
     try std.testing.expect(key.items.len > 0);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st = db.get(key.items, &val);
+    const get_st = db.get(std.testing.io, key.items, &val);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualSlices(u8, "hello", val.items);
 }
@@ -4135,15 +4182,15 @@ test "BabyDBM.pushLast: two pushes at same wtime produce sequential keys" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key1: std.ArrayList(u8) = .empty;
     defer key1.deinit(alloc);
     var key2: std.ArrayList(u8) = .empty;
     defer key2.deinit(alloc);
 
-    _ = db.pushLast("a", 1.0, &key1, std.testing.io);
-    _ = db.pushLast("b", 1.0, &key2, std.testing.io);
+    _ = db.pushLast(std.testing.io, "a", 1.0, &key1);
+    _ = db.pushLast(std.testing.io, "b", 1.0, &key2);
 
     try std.testing.expectEqual(@as(usize, 8), key1.items.len);
     try std.testing.expectEqual(@as(usize, 8), key2.items.len);
@@ -4157,19 +4204,19 @@ test "BabyDBM.pushLast: pop-after-push round-trips value" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const original = "round-trip-value";
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
-    _ = db.pushLast(original, 2.0, &key, std.testing.io);
+    _ = db.pushLast(std.testing.io, original, 2.0, &key);
 
     var popped_key: std.ArrayList(u8) = .empty;
     defer popped_key.deinit(alloc);
     var popped_val: std.ArrayList(u8) = .empty;
     defer popped_val.deinit(alloc);
 
-    const st = db.popFirst(&popped_key, &popped_val);
+    const st = db.popFirst(std.testing.io, &popped_key, &popped_val);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualSlices(u8, original, popped_val.items);
 }
@@ -4178,15 +4225,15 @@ test "BabyDBM.get: null value buffer returns SUCCESS on found key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("exists", "hello", true, null);
+    _ = db.set(std.testing.io, "exists", "hello", true, null);
 
     // null value = existence check only
-    const present = db.get("exists", null);
+    const present = db.get(std.testing.io, "exists", null);
     try std.testing.expect(present.isOk());
 
-    const absent = db.get("missing", null);
+    const absent = db.get(std.testing.io, "missing", null);
     try std.testing.expect(absent.code == .NOT_FOUND_ERROR);
 }
 
@@ -4194,56 +4241,56 @@ test "BabyDBM.Cursor: first/next/get ordered traversal" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // Insert keys out of order; iterator must return them in lexicographic order.
-    _ = db.set("banana", "2", true, null);
-    _ = db.set("apple", "1", true, null);
-    _ = db.set("cherry", "3", true, null);
+    _ = db.set(std.testing.io, "banana", "2", true, null);
+    _ = db.set(std.testing.io, "apple", "1", true, null);
+    _ = db.set(std.testing.io, "cherry", "3", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
 
-    try std.testing.expect(iter.first().isOk());
+    try std.testing.expect(iter.first(std.testing.io).isOk());
 
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "apple", key.items);
     try std.testing.expectEqualSlices(u8, "1", val.items);
 
-    try std.testing.expect(iter.next().isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.next(std.testing.io).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "banana", key.items);
     try std.testing.expectEqualSlices(u8, "2", val.items);
 
-    try std.testing.expect(iter.next().isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.next(std.testing.io).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "cherry", key.items);
     try std.testing.expectEqualSlices(u8, "3", val.items);
 
     // next() past the last record returns SUCCESS with cleared position (C++ R-16).
-    try std.testing.expect(iter.next().isOk());
+    try std.testing.expect(iter.next(std.testing.io).isOk());
     // Position is cleared: get() must now return NOT_FOUND_ERROR.
-    try std.testing.expect(iter.get(&key, &val).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).code == .NOT_FOUND_ERROR);
 }
 
 test "BabyDBM.Cursor: jump to a specific key" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("aaa", "v1", true, null);
-    _ = db.set("bbb", "v2", true, null);
-    _ = db.set("ccc", "v3", true, null);
-    _ = db.set("ddd", "v4", true, null);
+    _ = db.set(std.testing.io, "aaa", "v1", true, null);
+    _ = db.set(std.testing.io, "bbb", "v2", true, null);
+    _ = db.set(std.testing.io, "ccc", "v3", true, null);
+    _ = db.set(std.testing.io, "ddd", "v4", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
@@ -4251,32 +4298,32 @@ test "BabyDBM.Cursor: jump to a specific key" {
     defer val.deinit(alloc);
 
     // Exact key match.
-    try std.testing.expect(iter.jump("ccc").isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.jump(std.testing.io, "ccc").isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "ccc", key.items);
     try std.testing.expectEqualSlices(u8, "v3", val.items);
 
     // Jump to a key between "bbb" and "ccc" — must land on "ccc".
-    try std.testing.expect(iter.jump("bc").isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.jump(std.testing.io, "bc").isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "ccc", key.items);
 
     // Jump past the last key — must return NOT_FOUND_ERROR.
-    try std.testing.expect(iter.jump("zzz").code == .NOT_FOUND_ERROR);
+    try std.testing.expect(iter.jump(std.testing.io, "zzz").code == .NOT_FOUND_ERROR);
 }
 
 test "BabyDBM.Cursor: last/previous" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("one", "1", true, null);
-    _ = db.set("two", "2", true, null);
-    _ = db.set("three", "3", true, null);
+    _ = db.set(std.testing.io, "one", "1", true, null);
+    _ = db.set(std.testing.io, "two", "2", true, null);
+    _ = db.set(std.testing.io, "three", "3", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
@@ -4284,36 +4331,36 @@ test "BabyDBM.Cursor: last/previous" {
     defer val.deinit(alloc);
 
     // Lexicographic order: "one" < "three" < "two".
-    try std.testing.expect(iter.last().isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.last(std.testing.io).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "two", key.items);
 
-    try std.testing.expect(iter.previous().isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.previous(std.testing.io).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "three", key.items);
 
-    try std.testing.expect(iter.previous().isOk());
-    try std.testing.expect(iter.get(&key, &val).isOk());
+    try std.testing.expect(iter.previous(std.testing.io).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).isOk());
     try std.testing.expectEqualSlices(u8, "one", key.items);
 
     // previous() past the first record returns SUCCESS with cleared position (C++ R-16).
-    try std.testing.expect(iter.previous().isOk());
+    try std.testing.expect(iter.previous(std.testing.io).isOk());
     // Position is cleared: get() must now return NOT_FOUND_ERROR.
-    try std.testing.expect(iter.get(&key, &val).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(iter.get(std.testing.io, &key, &val).code == .NOT_FOUND_ERROR);
 }
 
 test "BabyDBM.Cursor: set and remove" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("k1", "old_v1", true, null);
-    _ = db.set("k2", "old_v2", true, null);
-    _ = db.set("k3", "old_v3", true, null);
+    _ = db.set(std.testing.io, "k1", "old_v1", true, null);
+    _ = db.set(std.testing.io, "k2", "old_v2", true, null);
+    _ = db.set(std.testing.io, "k3", "old_v3", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var old_key: std.ArrayList(u8) = .empty;
     defer old_key.deinit(alloc);
@@ -4321,8 +4368,8 @@ test "BabyDBM.Cursor: set and remove" {
     defer old_val.deinit(alloc);
 
     // Jump to "k1" and overwrite its value.
-    try std.testing.expect(iter.jump("k1").isOk());
-    const st_set = iter.set("new_v1", &old_key, &old_val);
+    try std.testing.expect(iter.jump(std.testing.io, "k1").isOk());
+    const st_set = iter.set(std.testing.io, "new_v1", &old_key, &old_val);
     try std.testing.expect(st_set.isOk());
     try std.testing.expectEqualSlices(u8, "k1", old_key.items);
     try std.testing.expectEqualSlices(u8, "old_v1", old_val.items);
@@ -4330,79 +4377,79 @@ test "BabyDBM.Cursor: set and remove" {
     // Verify the new value is stored.
     var check: std.ArrayList(u8) = .empty;
     defer check.deinit(alloc);
-    try std.testing.expect(db.get("k1", &check).isOk());
+    try std.testing.expect(db.get(std.testing.io, "k1", &check).isOk());
     try std.testing.expectEqualSlices(u8, "new_v1", check.items);
 
     // Jump to "k2" and remove it.
-    try std.testing.expect(iter.jump("k2").isOk());
-    const st_remove = iter.remove(&old_key, &old_val);
+    try std.testing.expect(iter.jump(std.testing.io, "k2").isOk());
+    const st_remove = iter.remove(std.testing.io, &old_key, &old_val);
     try std.testing.expect(st_remove.isOk());
     try std.testing.expectEqualSlices(u8, "k2", old_key.items);
     try std.testing.expectEqualSlices(u8, "old_v2", old_val.items);
 
     // Verify "k2" is gone.
-    try std.testing.expect(db.get("k2", null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.get(std.testing.io, "k2", null).code == .NOT_FOUND_ERROR);
 }
 
 test "BabyDBM.Cursor: jumpLower and jumpUpper" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("aaa", "1", true, null);
-    _ = db.set("bbb", "2", true, null);
-    _ = db.set("ccc", "3", true, null);
-    _ = db.set("ddd", "4", true, null);
+    _ = db.set(std.testing.io, "aaa", "1", true, null);
+    _ = db.set(std.testing.io, "bbb", "2", true, null);
+    _ = db.set(std.testing.io, "ccc", "3", true, null);
+    _ = db.set(std.testing.io, "ddd", "4", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
 
     // jumpLower exclusive: largest key strictly less than "ccc" is "bbb".
-    try std.testing.expect(iter.jumpLower("ccc", false).isOk());
-    try std.testing.expect(iter.get(&key, null).isOk());
+    try std.testing.expect(iter.jumpLower(std.testing.io, "ccc", false).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, null).isOk());
     try std.testing.expectEqualSlices(u8, "bbb", key.items);
 
     // jumpLower inclusive: largest key <= "ccc" is "ccc" itself.
-    try std.testing.expect(iter.jumpLower("ccc", true).isOk());
-    try std.testing.expect(iter.get(&key, null).isOk());
+    try std.testing.expect(iter.jumpLower(std.testing.io, "ccc", true).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, null).isOk());
     try std.testing.expectEqualSlices(u8, "ccc", key.items);
 
     // jumpUpper exclusive: smallest key strictly greater than "bbb" is "ccc".
-    try std.testing.expect(iter.jumpUpper("bbb", false).isOk());
-    try std.testing.expect(iter.get(&key, null).isOk());
+    try std.testing.expect(iter.jumpUpper(std.testing.io, "bbb", false).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, null).isOk());
     try std.testing.expectEqualSlices(u8, "ccc", key.items);
 
     // jumpUpper inclusive: smallest key >= "bbb" is "bbb" itself.
-    try std.testing.expect(iter.jumpUpper("bbb", true).isOk());
-    try std.testing.expect(iter.get(&key, null).isOk());
+    try std.testing.expect(iter.jumpUpper(std.testing.io, "bbb", true).isOk());
+    try std.testing.expect(iter.get(std.testing.io, &key, null).isOk());
     try std.testing.expectEqualSlices(u8, "bbb", key.items);
 
     // jumpLower before the first key: C++ returns SUCCESS with a cleared (invalid) position.
-    try std.testing.expect(iter.jumpLower("aaa", false).isOk());
+    try std.testing.expect(iter.jumpLower(std.testing.io, "aaa", false).isOk());
     // Position is cleared, so get() must return NOT_FOUND_ERROR.
-    try std.testing.expect(iter.get(&key, null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(iter.get(std.testing.io, &key, null).code == .NOT_FOUND_ERROR);
 
     // jumpUpper after the last key: C++ returns SUCCESS with a cleared (invalid) position.
-    try std.testing.expect(iter.jumpUpper("ddd", false).isOk());
+    try std.testing.expect(iter.jumpUpper(std.testing.io, "ddd", false).isOk());
     // Position is cleared, so get() must return NOT_FOUND_ERROR.
-    try std.testing.expect(iter.get(&key, null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(iter.get(std.testing.io, &key, null).code == .NOT_FOUND_ERROR);
 }
 
 test "BabyDBM.*Multi: bulk set/get/remove/append" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // setMulti: insert 3 keys
     const pairs = [_][2][]const u8{
         .{ "key1", "val1" }, .{ "key2", "val2" }, .{ "key3", "val3" },
     };
-    try std.testing.expect(db.setMulti(&pairs, true).isOk());
+    try std.testing.expect(db.setMulti(std.testing.io, &pairs, true).isOk());
     try std.testing.expectEqual(@as(i64, 3), db.countSimple());
 
     // getMulti: 2 existing + 1 missing -> NOT_FOUND_ERROR, map has 2 entries
@@ -4415,21 +4462,21 @@ test "BabyDBM.*Multi: bulk set/get/remove/append" {
         }
         records.deinit();
     }
-    const get_st = db.getMulti(&.{ "key1", "key2", "missing" }, &records);
+    const get_st = db.getMulti(std.testing.io, &.{ "key1", "key2", "missing" }, &records);
     try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, get_st.code);
     try std.testing.expectEqual(@as(usize, 2), records.count());
     try std.testing.expectEqualStrings("val1", records.get("key1").?);
     try std.testing.expectEqualStrings("val2", records.get("key2").?);
 
     // removeMulti: remove 2 keys
-    const rm_st = db.removeMulti(&.{ "key1", "key2" });
+    const rm_st = db.removeMulti(std.testing.io, &.{ "key1", "key2" });
     try std.testing.expect(rm_st.isOk());
     try std.testing.expectEqual(@as(i64, 1), db.countSimple());
 
     // appendMulti: append to remaining key
     const app_pairs = [_][2][]const u8{.{ "key3", "_appended" }};
-    try std.testing.expect(db.appendMulti(&app_pairs, "").isOk());
-    const got = try db.getSimple("key3", "", alloc);
+    try std.testing.expect(db.appendMulti(std.testing.io, &app_pairs, "").isOk());
+    const got = try db.getSimple(alloc, std.testing.io, "key3", "");
     defer alloc.free(got);
     try std.testing.expectEqualStrings("val3_appended", got);
 }
@@ -4438,18 +4485,18 @@ test "BabyDBM.Iterator: Zig-style iterate() from beginning" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // Insert keys out of order.
-    _ = db.set("banana", "2", true, null);
-    _ = db.set("apple", "1", true, null);
-    _ = db.set("cherry", "3", true, null);
+    _ = db.set(std.testing.io, "banana", "2", true, null);
+    _ = db.set(std.testing.io, "apple", "1", true, null);
+    _ = db.set(std.testing.io, "cherry", "3", true, null);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         count += 1;
         if (count == 1) {
             try std.testing.expectEqualSlices(u8, "apple", entry.key);
@@ -4465,20 +4512,20 @@ test "BabyDBM.Iterator: Zig-style iterate() from beginning" {
     try std.testing.expectEqual(@as(usize, 3), count);
 }
 
-test "BabyDBM.Iterator: Zig-style iterateFrom() with lifetime contract" {
+test "BabyDBM.Iterator: Zig-style iterateFrom(std.testing.io) with lifetime contract" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("aaa", "v1", true, null);
-    _ = db.set("bbb", "v2", true, null);
-    _ = db.set("ccc", "v3", true, null);
+    _ = db.set(std.testing.io, "aaa", "v1", true, null);
+    _ = db.set(std.testing.io, "bbb", "v2", true, null);
+    _ = db.set(std.testing.io, "ccc", "v3", true, null);
 
-    var iter = try db.iterateFrom("bbb", alloc);
-    defer iter.deinit();
+    var iter = try db.iterateFrom(alloc, std.testing.io, "bbb");
+    defer iter.deinit(std.testing.io);
 
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try std.testing.expect(first != null);
     try std.testing.expectEqualSlices(u8, "bbb", first.?.key);
     try std.testing.expectEqualSlices(u8, "v2", first.?.value);
@@ -4488,7 +4535,7 @@ test "BabyDBM.Iterator: Zig-style iterateFrom() with lifetime contract" {
     defer alloc.free(key_copy);
 
     // Second next() — first.?.key is now invalid, key_copy is safe.
-    const second = try iter.next();
+    const second = try iter.next(std.testing.io);
     try std.testing.expect(second != null);
     try std.testing.expectEqualSlices(u8, "ccc", second.?.key);
 
@@ -4496,11 +4543,11 @@ test "BabyDBM.Iterator: Zig-style iterateFrom() with lifetime contract" {
     try std.testing.expectEqualSlices(u8, "bbb", key_copy);
 
     // Exhaust the iterator.
-    const third = try iter.next();
+    const third = try iter.next(std.testing.io);
     try std.testing.expect(third == null);
 
     // Another call still returns null.
-    const fourth = try iter.next();
+    const fourth = try iter.next(std.testing.io);
     try std.testing.expect(fourth == null);
 }
 
@@ -4508,17 +4555,17 @@ test "BabyDBM.Iterator: basic iteration" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
-    _ = db.set("c", "3", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
+    _ = db.set(std.testing.io, "c", "3", true, null);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
     
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         _ = entry.key;
         _ = entry.value;
         count += 1;
@@ -4530,16 +4577,16 @@ test "BabyDBM.Iterator: iterateFrom and lifetime contract" {
     const alloc = std.testing.allocator;
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try BabyDBM.init(std_file.asFile(), lexicalKeyComparator, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
-    _ = db.set("c", "3", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
+    _ = db.set(std.testing.io, "c", "3", true, null);
 
-    var iter = try db.iterateFrom("b", alloc);
-    defer iter.deinit();
+    var iter = try db.iterateFrom(alloc, std.testing.io, "b");
+    defer iter.deinit(std.testing.io);
     
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try std.testing.expect(first != null);
     try std.testing.expect(std.mem.startsWith(u8, first.?.key, "b"));
     
@@ -4548,7 +4595,7 @@ test "BabyDBM.Iterator: iterateFrom and lifetime contract" {
     defer alloc.free(key_copy);
     
     // Second next() — first.?.key is now invalid.
-    _ = try iter.next();
+    _ = try iter.next(std.testing.io);
     // key_copy is still valid here.
     try std.testing.expect(key_copy.len > 0);
 }

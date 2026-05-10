@@ -179,7 +179,7 @@ pub const PolyDBM = struct {
                     if (options.num_buckets > 0) options.num_buckets else dbm_hash_mod.DEFAULT_NUM_BUCKETS,
                     allocator,
                 );
-                _ = db.open(path, options.writable, options.file_options, io);
+                _ = db.open(io, path, options.writable, options.file_options);
                 break :blk Backend{ .hash = db };
             },
             BackendType.tree => blk: {
@@ -188,7 +188,7 @@ pub const PolyDBM = struct {
                     std_file.asFile(),
                     allocator,
                 );
-                _ = db.open(path, options.writable, options.file_options, io);
+                _ = db.open(io, path, options.writable, options.file_options);
                 break :blk Backend{ .tree = db };
             },
             BackendType.skip => blk: {
@@ -198,7 +198,7 @@ pub const PolyDBM = struct {
                     allocator,
                     .{},
                 );
-                _ = db.open(path, options.writable, options.file_options, io);
+                _ = db.open(io, path, options.writable, options.file_options);
                 break :blk Backend{ .skip = db };
             },
             BackendType.tiny => blk: {
@@ -208,7 +208,7 @@ pub const PolyDBM = struct {
                     if (options.num_buckets > 0) options.num_buckets else dbm_tiny_mod.DEFAULT_NUM_BUCKETS,
                     allocator,
                 );
-                _ = db.open(path, options.writable, options.file_options, io);
+                _ = db.open(io, path, options.writable, options.file_options);
                 break :blk Backend{ .tiny = db };
             },
             BackendType.baby => blk: {
@@ -219,7 +219,7 @@ pub const PolyDBM = struct {
                     comparator,
                     allocator,
                 );
-                _ = try db.open(path, options.writable, options.file_options, io);
+                _ = try db.open(io, path, options.writable, options.file_options);
                 break :blk Backend{ .baby = db };
             },
             BackendType.cache => blk: {
@@ -254,14 +254,14 @@ pub const PolyDBM = struct {
 
     /// Deinitializes the PolyDBM, freeing all resources.
     /// Call close() before deinit() if the database was opened.
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: Io) void {
         switch (self.backend) {
-            BackendType.hash => |*db| db.deinit(),
-            BackendType.tree => |*db| db.deinit(),
-            BackendType.skip => |*db| db.deinit(),
-            BackendType.tiny => |*db| db.deinit(),
-            BackendType.baby => |*db| db.deinit(),
-            BackendType.cache => |*db| db.deinit(),
+            BackendType.hash => |*db| db.deinit(io),
+            BackendType.tree => |*db| db.deinit(io),
+            BackendType.skip => |*db| db.deinit(io),
+            BackendType.tiny => |*db| db.deinit(io),
+            BackendType.baby => |*db| db.deinit(io),
+            BackendType.cache => |*db| db.deinit(io),
         }
     }
 
@@ -270,7 +270,7 @@ pub const PolyDBM = struct {
     /// \param key The key to look up
     /// \param allocator Allocator for the result value
     /// \return The value (caller must free) or error
-    pub fn get(self: *Self, key: []const u8, allocator: std.mem.Allocator) PolyError![]const u8 {
+    pub fn get(self: *Self, allocator: std.mem.Allocator, io: Io, key: []const u8) PolyError![]const u8 {
         // We use get() with an ArrayList on all backends so we can distinguish
         // NOT_FOUND from SUCCESS. getSimple() swallows the miss by returning a
         // default value, which would make NotFound undetectable.
@@ -281,12 +281,12 @@ pub const PolyDBM = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         const status = switch (self.backend) {
-            BackendType.hash => |*db| db.get(key, &buf),
-            BackendType.tree => |*db| db.get(key, &buf),
-            BackendType.skip => |*db| db.get(key, &buf),
-            BackendType.cache => |*db| db.get(key, &buf),
-            BackendType.tiny => |*db| db.get(key, &buf),
-            BackendType.baby => |*db| db.get(key, &buf),
+            BackendType.hash => |*db| db.get(io, key, &buf),
+            BackendType.tree => |*db| db.get(io, key, &buf),
+            BackendType.skip => |*db| db.get(io, key, &buf),
+            BackendType.cache => |*db| db.get(io, key, &buf),
+            BackendType.tiny => |*db| db.get(io, key, &buf),
+            BackendType.baby => |*db| db.get(io, key, &buf),
         };
         if (!status.isOk()) return codeToError(status.code);
         return try allocator.dupe(u8, buf.items);
@@ -300,18 +300,19 @@ pub const PolyDBM = struct {
     /// \return Status indicating success or failure
     pub fn set(
         self: *Self,
+        io: Io,
         key: []const u8,
         value: []const u8,
         overwrite: bool,
     ) Status {
         return switch (self.backend) {
-            // All DBMs: set(key, value, overwrite, old_value)
-            BackendType.hash => |*db| db.set(key, value, overwrite, null),
-            BackendType.tree => |*db| db.set(key, value, overwrite, null),
-            BackendType.skip => |*db| db.set(key, value, overwrite, null),
-            BackendType.cache => |*db| db.set(key, value, overwrite, null),
-            BackendType.tiny => |*db| db.set(key, value, overwrite, null),
-            BackendType.baby => |*db| db.set(key, value, overwrite, null),
+            // All DBMs: set(io, key, value, overwrite, old_value)
+            BackendType.hash => |*db| db.set(io, key, value, overwrite, null),
+            BackendType.tree => |*db| db.set(io, key, value, overwrite, null),
+            BackendType.skip => |*db| db.set(io, key, value, overwrite, null),
+            BackendType.cache => |*db| db.set(io, key, value, overwrite, null),
+            BackendType.tiny => |*db| db.set(io, key, value, overwrite, null),
+            BackendType.baby => |*db| db.set(io, key, value, overwrite, null),
         };
     }
 
@@ -319,14 +320,15 @@ pub const PolyDBM = struct {
     ///
     /// \param key The key to remove
     /// \return Status indicating success or failure
-    pub fn remove(self: *Self, key: []const u8) Status {
+    pub fn remove(self: *Self, io: Io, key: []const u8) Status {
+
         return switch (self.backend) {
-            BackendType.hash => |*db| db.remove(key),
-            BackendType.tree => |*db| db.remove(key),
-            BackendType.skip => |*db| db.remove(key, null),
-            BackendType.tiny => |*db| db.remove(key),
-            BackendType.baby => |*db| db.remove(key),
-            BackendType.cache => |*db| db.remove(key),
+            BackendType.hash => |*db| db.remove(io, key),
+            BackendType.tree => |*db| db.remove(io, key),
+            BackendType.skip => |*db| db.remove(io, key, null),
+            BackendType.tiny => |*db| db.remove(io, key),
+            BackendType.baby => |*db| db.remove(io, key),
+            BackendType.cache => |*db| db.remove(io, key),
         };
     }
 
@@ -338,17 +340,18 @@ pub const PolyDBM = struct {
     /// \return Status indicating success or failure
     pub fn append(
         self: *Self,
+        io: Io,
         key: []const u8,
         value: []const u8,
         delim: []const u8,
     ) Status {
         return switch (self.backend) {
-            BackendType.hash => |*db| db.append(key, value, delim),
-            BackendType.tree => |*db| db.append(key, value, delim),
-            BackendType.skip => |*db| db.append(key, value, delim),
-            BackendType.tiny => |*db| db.append(key, value, delim, self.allocator),
-            BackendType.baby => |*db| db.append(key, value, delim, self.allocator),
-            BackendType.cache => |*db| db.append(key, value, delim, self.allocator),
+            BackendType.hash => |*db| db.append(io, key, value, delim),
+            BackendType.tree => |*db| db.append(io, key, value, delim),
+            BackendType.skip => |*db| db.append(io, key, value, delim),
+            BackendType.tiny => |*db| db.append(io, key, value, delim),
+            BackendType.baby => |*db| db.append(io, key, value, delim),
+            BackendType.cache => |*db| db.append(io, key, value, delim),
         };
     }
 
@@ -359,16 +362,17 @@ pub const PolyDBM = struct {
     /// \return Status indicating success (all found) or partial failure
     pub fn getMulti(
         self: *Self,
+        io: Io,
         keys: []const []const u8,
         records: *std.StringHashMap([]u8),
     ) Status {
         return switch (self.backend) {
-            BackendType.hash => |*db| db.getMulti(keys, records),
-            BackendType.tree => |*db| db.getMulti(keys, records),
-            BackendType.skip => |*db| db.getMulti(keys, records),
-            BackendType.tiny => |*db| db.getMulti(keys, records),
-            BackendType.baby => |*db| db.getMulti(keys, records),
-            BackendType.cache => |*db| db.getMulti(keys, records),
+            BackendType.hash => |*db| db.getMulti(io, keys, records),
+            BackendType.tree => |*db| db.getMulti(io, keys, records),
+            BackendType.skip => |*db| db.getMulti(io, keys, records),
+            BackendType.tiny => |*db| db.getMulti(io, keys, records),
+            BackendType.baby => |*db| db.getMulti(io, keys, records),
+            BackendType.cache => |*db| db.getMulti(io, keys, records),
         };
     }
 
@@ -379,16 +383,17 @@ pub const PolyDBM = struct {
     /// \return Status indicating success or failure
     pub fn setMulti(
         self: *Self,
+        io: Io,
         records: []const [2][]const u8,
         overwrite: bool,
     ) Status {
         return switch (self.backend) {
-            BackendType.hash => |*db| db.setMulti(records, overwrite),
-            BackendType.tree => |*db| db.setMulti(records, overwrite),
-            BackendType.skip => |*db| db.setMulti(records, overwrite),
-            BackendType.tiny => |*db| db.setMulti(records, overwrite),
-            BackendType.baby => |*db| db.setMulti(records, overwrite),
-            BackendType.cache => |*db| db.setMulti(records, overwrite),
+            BackendType.hash => |*db| db.setMulti(io, records, overwrite),
+            BackendType.tree => |*db| db.setMulti(io, records, overwrite),
+            BackendType.skip => |*db| db.setMulti(io, records, overwrite),
+            BackendType.tiny => |*db| db.setMulti(io, records, overwrite),
+            BackendType.baby => |*db| db.setMulti(io, records, overwrite),
+            BackendType.cache => |*db| db.setMulti(io, records, overwrite),
         };
     }
 
@@ -396,21 +401,22 @@ pub const PolyDBM = struct {
     ///
     /// \param keys Array of keys to remove
     /// \return Status indicating success or failure
-    pub fn removeMulti(self: *Self, keys: []const []const u8) Status {
+    pub fn removeMulti(self: *Self, io: Io, keys: []const []const u8) Status {
+
         return switch (self.backend) {
-            BackendType.hash => |*db| db.removeMulti(keys),
-            BackendType.tree => |*db| db.removeMulti(keys),
-            BackendType.skip => |*db| db.removeMulti(keys),
-            BackendType.tiny => |*db| db.removeMulti(keys),
-            BackendType.baby => |*db| db.removeMulti(keys),
-            BackendType.cache => |*db| db.removeMulti(keys),
+            BackendType.hash => |*db| db.removeMulti(io, keys),
+            BackendType.tree => |*db| db.removeMulti(io, keys),
+            BackendType.skip => |*db| db.removeMulti(io, keys),
+            BackendType.tiny => |*db| db.removeMulti(io, keys),
+            BackendType.baby => |*db| db.removeMulti(io, keys),
+            BackendType.cache => |*db| db.removeMulti(io, keys),
         };
     }
 
     /// Gets the number of records in the database.
     ///
     /// \return The record count
-    pub fn count(self: *Self) i64 {
+    pub fn count(self: *Self, io: Io) i64 {
         var out: i64 = 0;
         _ = switch (self.backend) {
             BackendType.hash => |*db| db.count(&out),
@@ -418,7 +424,7 @@ pub const PolyDBM = struct {
             BackendType.skip => |*db| db.count(&out),
             BackendType.tiny => |*db| db.count(&out),
             BackendType.baby => |*db| db.count(&out),
-            BackendType.cache => |*db| db.count(&out),
+            BackendType.cache => |*db| db.count(io, &out),
         };
         return out;
     }
@@ -429,12 +435,12 @@ pub const PolyDBM = struct {
     /// \return Status indicating success or failure
     pub fn clear(self: *Self, io: Io) Status {
         return switch (self.backend) {
-            BackendType.hash => |*db| db.clear(),
-            BackendType.tree => |*db| db.clear(),
+            BackendType.hash => |*db| db.clear(io),
+            BackendType.tree => |*db| db.clear(io),
             BackendType.skip => |*db| db.clear(io),
-            BackendType.tiny => |*db| db.clear(),
-            BackendType.baby => |*db| db.clear(),
-            BackendType.cache => |*db| db.clear(),
+            BackendType.tiny => |*db| db.clear(io),
+            BackendType.baby => |*db| db.clear(io),
+            BackendType.cache => |*db| db.clear(io),
         };
     }
 
@@ -443,14 +449,15 @@ pub const PolyDBM = struct {
     /// \param hard If true, do physical sync (fsync). If false, logical sync only.
     /// \param io Io instance for async operations
     /// \return Status indicating success or failure
-    pub fn synchronize(self: *Self, hard: bool, io: Io) Status {
+    pub fn synchronize(self: *Self, io: Io, hard: bool) Status {
+
         return switch (self.backend) {
-            BackendType.hash => |*db| db.synchronize(hard, io),
-            BackendType.tree => |*db| db.synchronize(hard, io),
-            BackendType.skip => |*db| db.synchronize(hard, io),
-            BackendType.tiny => |*db| db.synchronize(hard, io),
-            BackendType.baby => |*db| db.synchronize(hard, io),
-            BackendType.cache => |*db| db.synchronize(hard, io),
+            BackendType.hash => |*db| db.synchronize(io, hard),
+            BackendType.tree => |*db| db.synchronize(io, hard),
+            BackendType.skip => |*db| db.synchronize(io, hard),
+            BackendType.tiny => |*db| db.synchronize(io, hard),
+            BackendType.baby => |*db| db.synchronize(io, hard),
+            BackendType.cache => |*db| db.synchronize(io, hard),
         };
     }
 
@@ -463,9 +470,9 @@ pub const PolyDBM = struct {
             BackendType.hash => |*db| db.rebuild(io),
             BackendType.tree => |*db| db.rebuild(io),
             BackendType.skip => |*db| db.rebuild(io),
-            BackendType.tiny => |*db| db.rebuild(),
-            BackendType.baby => |*db| db.rebuild(),
-            BackendType.cache => |*db| db.rebuild(),
+            BackendType.tiny => |*db| db.rebuild(io),
+            BackendType.baby => |*db| db.rebuild(io),
+            BackendType.cache => |*db| db.rebuild(io),
         };
     }
 
@@ -475,14 +482,209 @@ pub const PolyDBM = struct {
     /// \param proc The processor instance
     /// \param writable Whether the processor can modify records
     /// \return Status indicating success or failure
-    pub fn processEach(self: *Self, comptime P: type, proc: *P, writable: bool) !Status {
+    pub fn processEach(self: *Self, io: Io, comptime P: type, proc: *P, writable: bool) !Status {
         return switch (self.backend) {
-            BackendType.hash => |*db| db.processEach(proc, writable),
-            BackendType.tree => |*db| db.processEach(proc, writable),
-            BackendType.skip => |*db| db.processEach(P, proc, writable),
-            BackendType.tiny => |*db| db.processEach(P, proc, writable),
-            BackendType.baby => |*db| db.processEach(P, proc, writable),
-            BackendType.cache => |*db| db.processEach(proc, writable),
+            BackendType.hash => |*db| db.processEach(io, proc, writable),
+            BackendType.tree => |*db| db.processEach(io, proc, writable),
+            BackendType.skip => |*db| db.processEach(io, P, proc, writable),
+            BackendType.tiny => |*db| db.processEach(io, P, proc, writable),
+            BackendType.baby => |*db| db.processEach(io, P, proc, writable),
+            BackendType.cache => |*db| db.processEach(io, proc, writable),
+        };
+    }
+
+    /// Appends to multiple records.
+    pub fn appendMulti(
+        self: *Self,
+        io: Io,
+        records: []const [2][]const u8,
+        delim: []const u8,
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.appendMulti(io, records, delim),
+            BackendType.tree => |*db| db.appendMulti(io, records, delim),
+            BackendType.skip => |*db| db.appendMulti(io, records, delim),
+            BackendType.tiny => |*db| db.appendMulti(io, records, delim),
+            BackendType.baby => |*db| db.appendMulti(io, records, delim),
+            BackendType.cache => |*db| db.appendMulti(io, records, delim),
+        };
+    }
+
+    /// Processes a single record by key with a custom processor.
+    /// SkipDBM does not support keyed process; returns NOT_IMPLEMENTED_ERROR there.
+    pub fn process(
+        self: *Self,
+        io: Io,
+        key: []const u8,
+        proc: anytype,
+        writable: bool,
+    ) !Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.process(io, key, proc, writable),
+            BackendType.tree => |*db| db.process(io, key, proc, writable),
+            BackendType.cache => |*db| db.process(io, key, proc, writable),
+            BackendType.tiny => |*db| try db.process(io, @TypeOf(proc.*), proc, key, writable),
+            BackendType.baby => |*db| db.process(io, @TypeOf(proc.*), key, proc, writable),
+            BackendType.skip => Status.init(.NOT_IMPLEMENTED_ERROR),
+        };
+    }
+
+    /// Processes the first record with a custom processor.
+    pub fn processFirst(
+        self: *Self,
+        io: Io,
+        proc: anytype,
+        writable: bool,
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.processFirst(io, proc, writable),
+            BackendType.tree => |*db| db.processFirst(io, proc, writable),
+            BackendType.cache => |*db| db.processFirst(io, proc, writable),
+            BackendType.tiny => |*db| db.processFirst(io, @TypeOf(proc.*), proc, writable),
+            BackendType.baby => |*db| db.processFirst(io, @TypeOf(proc.*), proc, writable),
+            BackendType.skip => |*db| db.processFirst(io, @TypeOf(proc.*), proc, writable),
+        };
+    }
+
+    /// Processes multiple keys atomically with the same processor type.
+    pub fn processMulti(
+        self: *Self,
+        io: Io,
+        keys: []const []const u8,
+        procs: anytype,
+        writable: bool,
+    ) Status {
+        const P = @TypeOf(procs[0].*);
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.processMulti(io, P, keys, procs, writable),
+            BackendType.tree => |*db| db.processMulti(io, P, keys, procs, writable),
+            BackendType.skip => |*db| db.processMulti(io, P, keys, procs, writable),
+            BackendType.tiny => |*db| db.processMulti(io, P, keys, procs, writable),
+            BackendType.baby => |*db| db.processMulti(io, P, keys, procs, writable),
+            BackendType.cache => |*db| db.processMulti(io, P, keys, procs, writable),
+        };
+    }
+
+    /// Atomic compare-and-exchange on a single key.
+    pub fn compareExchange(
+        self: *Self,
+        io: Io,
+        key: []const u8,
+        expected: dbm_mod.CompareExpected,
+        desired: dbm_mod.CompareDesired,
+        actual_out: ?*std.ArrayList(u8),
+        found_out: ?*bool,
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.compareExchange(io, key, expected, desired, actual_out, found_out),
+            BackendType.tree => |*db| db.compareExchange(io, key, expected, desired, actual_out, found_out),
+            BackendType.skip => |*db| db.compareExchange(io, key, expected, desired, actual_out, found_out),
+            BackendType.tiny => |*db| db.compareExchange(io, key, expected, desired, actual_out, found_out),
+            BackendType.baby => |*db| db.compareExchange(io, key, expected, desired, actual_out, found_out),
+            BackendType.cache => |*db| db.compareExchange(io, key, expected, desired, actual_out, found_out),
+        };
+    }
+
+    /// Atomic compare-and-exchange across multiple keys.
+    pub fn compareExchangeMulti(
+        self: *Self,
+        io: Io,
+        expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
+        desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.compareExchangeMulti(io, expected, desired),
+            BackendType.tree => |*db| db.compareExchangeMulti(io, expected, desired),
+            BackendType.skip => |*db| db.compareExchangeMulti(io, expected, desired),
+            BackendType.tiny => |*db| db.compareExchangeMulti(io, expected, desired),
+            BackendType.baby => |*db| db.compareExchangeMulti(io, expected, desired),
+            BackendType.cache => |*db| db.compareExchangeMulti(io, expected, desired),
+        };
+    }
+
+    /// Atomically increment a stored i64 value by delta.
+    pub fn increment(
+        self: *Self,
+        io: Io,
+        key: []const u8,
+        delta: i64,
+        current_out: ?*i64,
+        initial: i64,
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.increment(io, key, delta, current_out, initial),
+            BackendType.tree => |*db| db.increment(io, key, delta, current_out, initial),
+            BackendType.skip => |*db| db.increment(io, key, delta, current_out, initial),
+            BackendType.tiny => |*db| db.increment(io, key, delta, current_out, initial),
+            BackendType.baby => |*db| db.increment(io, key, delta, current_out, initial),
+            BackendType.cache => |*db| db.increment(io, key, delta, current_out, initial),
+        };
+    }
+
+    /// Removes and returns the first record.
+    pub fn popFirst(
+        self: *Self,
+        io: Io,
+        key_out: ?*std.ArrayList(u8),
+        value_out: ?*std.ArrayList(u8),
+    ) !Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.popFirst(io, key_out, value_out),
+            BackendType.tree => |*db| db.popFirst(io, key_out, value_out),
+            BackendType.skip => |*db| db.popFirst(io, key_out, value_out),
+            BackendType.tiny => |*db| try db.popFirst(io, key_out, value_out),
+            BackendType.baby => |*db| db.popFirst(io, key_out, value_out),
+            BackendType.cache => |*db| db.popFirst(io, key_out, value_out),
+        };
+    }
+
+    /// Pushes a value at the lexicographic end with a timestamp-based key.
+    pub fn pushLast(
+        self: *Self,
+        io: Io,
+        value: []const u8,
+        wtime: f64,
+        key_out: ?*std.ArrayList(u8),
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.pushLast(io, value, wtime, key_out),
+            BackendType.tree => |*db| db.pushLast(io, value, wtime, key_out),
+            BackendType.skip => |*db| db.pushLast(io, value, wtime, key_out),
+            BackendType.tiny => |*db| db.pushLast(io, value, wtime, key_out),
+            BackendType.baby => |*db| db.pushLast(io, value, wtime, key_out),
+            BackendType.cache => |*db| db.pushLast(io, value, wtime, key_out),
+        };
+    }
+
+    /// Renames a key, optionally copying the value.
+    pub fn rekey(
+        self: *Self,
+        io: Io,
+        old_key: []const u8,
+        new_key: []const u8,
+        overwrite: bool,
+        copying: bool,
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.rekey(io, old_key, new_key, overwrite, copying),
+            BackendType.tree => |*db| db.rekey(io, old_key, new_key, overwrite, copying),
+            BackendType.skip => |*db| db.rekey(io, old_key, new_key, overwrite, copying),
+            BackendType.tiny => |*db| db.rekey(io, old_key, new_key, overwrite, copying),
+            BackendType.baby => |*db| db.rekey(io, old_key, new_key, overwrite, copying),
+            BackendType.cache => |*db| db.rekey(io, old_key, new_key, overwrite, copying),
+        };
+    }
+
+    /// Exports all records into another DBM-like destination.
+    pub fn export_(self: *Self, io: Io, dest: anytype) Status {
+
+        return switch (self.backend) {
+            BackendType.hash => |*db| db.export_(io, dest),
+            BackendType.tree => |*db| db.export_(io, dest),
+            BackendType.skip => |*db| db.export_(io, dest),
+            BackendType.tiny => |*db| db.export_(io, dest),
+            BackendType.baby => |*db| db.export_(io, dest),
+            BackendType.cache => |*db| db.export_(io, dest),
         };
     }
 
@@ -610,9 +812,9 @@ pub const PolyDBM = struct {
 
     /// Return a Zig-style iterator positioned at the first record.
     /// The caller must call deinit() when done.
-    pub fn iterate(self: *Self, alloc: std.mem.Allocator) !PolyIterator {
-        var cursor = try PolyCursor.init(self);
-        errdefer cursor.deinit();
+    pub fn iterate(self: *Self, alloc: std.mem.Allocator, io: Io) !PolyIterator {
+        var cursor = try PolyCursor.init(self, io);
+        errdefer cursor.deinit(io);
         var iter = PolyIterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -620,15 +822,16 @@ pub const PolyDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
     /// Return a Zig-style iterator positioned at the first record >= key.
     /// The caller must call deinit() when done.
-    pub fn iterateFrom(self: *Self, key: []const u8, alloc: std.mem.Allocator) !PolyIterator {
-        var cursor = try PolyCursor.init(self);
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *Self, alloc: std.mem.Allocator, io: Io, key: []const u8) !PolyIterator {
+
+        var cursor = try PolyCursor.init(self, io);
+        errdefer cursor.deinit(io);
         var iter = PolyIterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -636,7 +839,7 @@ pub const PolyDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump(io, key).isOk()) iter.done = true;
         return iter;
     }
 
@@ -674,14 +877,15 @@ pub const PolyDBM = struct {
     /// \param sync_hard If true, performs a hard sync after copying
     /// \param io Io instance for file operations
     /// \return Status indicating success or failure
-    pub fn copyFileData(self: *Self, dest_path: []const u8, sync_hard: bool, io: Io) Status {
+    pub fn copyFileData(self: *Self, io: Io, dest_path: []const u8, sync_hard: bool) Status {
+
         return switch (self.backend) {
-            BackendType.hash => |*db| db.copyFileData(dest_path, sync_hard, io),
-            BackendType.tree => |*db| db.copyFileData(dest_path, sync_hard, io),
-            BackendType.skip => |*db| db.copyFileData(dest_path, sync_hard, io),
-            BackendType.tiny => |*db| db.copyFileData(dest_path, sync_hard, io),
-            BackendType.baby => |*db| db.copyFileData(dest_path, sync_hard, io),
-            BackendType.cache => |*db| db.copyFileData(dest_path, sync_hard, io),
+            BackendType.hash => |*db| db.copyFileData(io, dest_path, sync_hard),
+            BackendType.tree => |*db| db.copyFileData(io, dest_path, sync_hard),
+            BackendType.skip => |*db| db.copyFileData(io, dest_path, sync_hard),
+            BackendType.tiny => |*db| db.copyFileData(io, dest_path, sync_hard),
+            BackendType.baby => |*db| db.copyFileData(io, dest_path, sync_hard),
+            BackendType.cache => |*db| db.copyFileData(io, dest_path, sync_hard),
         };
     }
 
@@ -696,18 +900,19 @@ pub const PolyDBM = struct {
     /// \param io Io instance for file operations
     /// \return Status indicating success or failure
     pub fn restoreDatabase(old_path: []const u8, new_path: []const u8, io: Io) Status {
+
         // Determine backend type from old path
         const backend = backendFromExtension(old_path) catch {
             return Status.init(.SYSTEM_ERROR);
         };
         
         return switch (backend) {
-            BackendType.hash => dbm_hash_mod.HashDBM.restoreDatabase(old_path, new_path, io),
-            BackendType.tree => dbm_tree_mod.TreeDBM.restoreDatabase(old_path, new_path, io),
-            BackendType.skip => dbm_skip_mod.SkipDBM.restoreDatabase(old_path, new_path, io),
-            BackendType.tiny => dbm_tiny_mod.TinyDBM.restoreDatabase(old_path, new_path, io),
-            BackendType.baby => dbm_baby_mod.BabyDBM.restoreDatabase(old_path, new_path, io),
-            BackendType.cache => dbm_cache_mod.CacheDBM.restoreDatabase(old_path, new_path, io),
+            BackendType.hash => dbm_hash_mod.HashDBM.restoreDatabase(io, old_path, new_path),
+            BackendType.tree => dbm_tree_mod.TreeDBM.restoreDatabase(io, old_path, new_path),
+            BackendType.skip => dbm_skip_mod.SkipDBM.restoreDatabase(io, old_path, new_path),
+            BackendType.tiny => dbm_tiny_mod.TinyDBM.restoreDatabase(io, old_path, new_path),
+            BackendType.baby => dbm_baby_mod.BabyDBM.restoreDatabase(io, old_path, new_path),
+            BackendType.cache => dbm_cache_mod.CacheDBM.restoreDatabase(io, old_path, new_path),
         };
     }
 
@@ -718,18 +923,19 @@ pub const PolyDBM = struct {
     /// \param io Io instance for file operations
     /// \return Status indicating success or failure
     pub fn renameDatabase(old_path: []const u8, new_path: []const u8, io: Io) Status {
+
         // Determine backend type from old path
         const backend = backendFromExtension(old_path) catch {
             return Status.init(.SYSTEM_ERROR);
         };
         
         return switch (backend) {
-            BackendType.hash => dbm_hash_mod.HashDBM.renameDatabase(old_path, new_path, io),
-            BackendType.tree => dbm_tree_mod.TreeDBM.renameDatabase(old_path, new_path, io),
-            BackendType.skip => dbm_skip_mod.SkipDBM.renameDatabase(old_path, new_path, io),
-            BackendType.tiny => dbm_tiny_mod.TinyDBM.renameDatabase(old_path, new_path, io),
-            BackendType.baby => dbm_baby_mod.BabyDBM.renameDatabase(old_path, new_path, io),
-            BackendType.cache => dbm_cache_mod.CacheDBM.renameDatabase(old_path, new_path, io),
+            BackendType.hash => dbm_hash_mod.HashDBM.renameDatabase(io, old_path, new_path),
+            BackendType.tree => dbm_tree_mod.TreeDBM.renameDatabase(io, old_path, new_path),
+            BackendType.skip => dbm_skip_mod.SkipDBM.renameDatabase(io, old_path, new_path),
+            BackendType.tiny => dbm_tiny_mod.TinyDBM.renameDatabase(io, old_path, new_path),
+            BackendType.baby => dbm_baby_mod.BabyDBM.renameDatabase(io, old_path, new_path),
+            BackendType.cache => dbm_cache_mod.CacheDBM.renameDatabase(io, old_path, new_path),
         };
     }
 };
@@ -755,86 +961,142 @@ pub const PolyCursor = struct {
     const Self = @This();
 
     /// Creates a cursor from a PolyDBM.
-    pub fn init(db: *PolyDBM) !Self {
+    pub fn init(db: *PolyDBM, io: Io) !Self {
         return switch (db.backend) {
             BackendType.hash => |*hash_db| Self{
-                .backend = .{ .hash = try hash_db.makeCursor() },
+                .backend = .{ .hash = try hash_db.makeCursor(io) },
             },
             BackendType.tree => |*tree_db| Self{
-                .backend = .{ .tree = try tree_db.makeCursor() },
+                .backend = .{ .tree = try tree_db.makeCursor(io) },
             },
             BackendType.skip => |*skip_db| Self{
-                .backend = .{ .skip = try skip_db.makeCursor() },
+                .backend = .{ .skip = try skip_db.makeCursor(io) },
             },
             BackendType.tiny => |*tiny_db| Self{
-                .backend = .{ .tiny = try tiny_db.makeCursor() },
+                .backend = .{ .tiny = try tiny_db.makeCursor(io) },
             },
             BackendType.baby => |*baby_db| Self{
-                .backend = .{ .baby = try baby_db.makeCursor() },
+                .backend = .{ .baby = try baby_db.makeCursor(io) },
             },
             BackendType.cache => |*cache_db| Self{
-                .backend = .{ .cache = try cache_db.makeCursor() },
+                .backend = .{ .cache = try cache_db.makeCursor(io) },
             },
         };
     }
 
     /// Deinitializes the cursor.
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: Io) void {
         switch (self.backend) {
-            BackendType.hash => |*iter| iter.deinit(),
-            BackendType.tree => |*iter| iter.deinit(),
-            BackendType.skip => |*iter| iter.deinit(),
-            BackendType.tiny => |*iter| iter.deinit(),
-            BackendType.baby => |*iter| iter.deinit(),
-            BackendType.cache => |*iter| iter.deinit(),
+            BackendType.hash => |*iter| iter.deinit(io),
+            BackendType.tree => |*iter| iter.deinit(io),
+            BackendType.skip => |*iter| iter.deinit(io),
+            BackendType.tiny => |*iter| iter.deinit(io),
+            BackendType.baby => |*iter| iter.deinit(io),
+            BackendType.cache => |*iter| iter.deinit(io),
         }
     }
 
     /// Moves to the first record.
-    pub fn first(self: *Self) Status {
+    pub fn first(self: *Self, io: Io) Status {
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.first(),
-            BackendType.tree => |*iter| iter.first(),
-            BackendType.skip => |*iter| iter.first(),
-            BackendType.tiny => |*iter| iter.first(),
-            BackendType.baby => |*iter| iter.first(),
-            BackendType.cache => |*iter| iter.first(),
+            BackendType.hash => |*iter| iter.first(io),
+            BackendType.tree => |*iter| iter.first(io),
+            BackendType.skip => |*iter| iter.first(io),
+            BackendType.tiny => |*iter| iter.first(io),
+            BackendType.baby => |*iter| iter.first(io),
+            BackendType.cache => |*iter| iter.first(io),
         };
     }
 
     /// Moves to the last record (ordered DBMs only).
-    pub fn last(self: *Self) Status {
+    pub fn last(self: *Self, io: Io) Status {
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.last(),
-            BackendType.tree => |*iter| iter.last(),
-            BackendType.skip => |*iter| iter.last(),
-            BackendType.tiny => |*iter| iter.last(),
-            BackendType.baby => |*iter| iter.last(),
-            BackendType.cache => |*iter| iter.last(),
+            BackendType.hash => |*iter| iter.last(io),
+            BackendType.tree => |*iter| iter.last(io),
+            BackendType.skip => |*iter| iter.last(io),
+            BackendType.tiny => |*iter| iter.last(io),
+            BackendType.baby => |*iter| iter.last(io),
+            BackendType.cache => |*iter| iter.last(io),
         };
     }
 
     /// Moves to the next record.
-    pub fn next(self: *Self) Status {
+    pub fn next(self: *Self, io: Io) Status {
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.next(),
-            BackendType.tree => |*iter| iter.next(),
-            BackendType.skip => |*iter| iter.next(),
-            BackendType.tiny => |*iter| iter.next(),
-            BackendType.baby => |*iter| iter.next(),
-            BackendType.cache => |*iter| iter.next(),
+            BackendType.hash => |*iter| iter.next(io),
+            BackendType.tree => |*iter| iter.next(io),
+            BackendType.skip => |*iter| iter.next(io),
+            BackendType.tiny => |*iter| iter.next(io),
+            BackendType.baby => |*iter| iter.next(io),
+            BackendType.cache => |*iter| iter.next(io),
+        };
+    }
+
+    /// Moves to the previous record (ordered DBMs only).
+    pub fn previous(self: *Self, io: Io) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*iter| iter.previous(io),
+            BackendType.tree => |*iter| iter.previous(io),
+            BackendType.skip => |*iter| iter.previous(io),
+            BackendType.tiny => |*iter| iter.previous(io),
+            BackendType.baby => |*iter| iter.previous(io),
+            BackendType.cache => |*iter| iter.previous(io),
         };
     }
 
     /// Moves to the first record >= key.
-    pub fn jump(self: *Self, key: []const u8) Status {
+    pub fn jump(self: *Self, io: Io, key: []const u8) Status {
+
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.jump(key),
-            BackendType.tree => |*iter| iter.jump(key),
-            BackendType.skip => |*iter| iter.jump(key),
-            BackendType.tiny => |*iter| iter.jump(key),
-            BackendType.baby => |*iter| iter.jump(key),
-            BackendType.cache => |*iter| iter.jump(key),
+            BackendType.hash => |*iter| iter.jump(io, key),
+            BackendType.tree => |*iter| iter.jump(io, key),
+            BackendType.skip => |*iter| iter.jump(io, key),
+            BackendType.tiny => |*iter| iter.jump(io, key),
+            BackendType.baby => |*iter| iter.jump(io, key),
+            BackendType.cache => |*iter| iter.jump(io, key),
+        };
+    }
+
+    /// Moves to the last record <= key (ordered DBMs only).
+    pub fn jumpLower(self: *Self, io: Io, key: []const u8, inclusive: bool) Status {
+
+        return switch (self.backend) {
+            BackendType.hash => |*iter| iter.jumpLower(io, key, inclusive),
+            BackendType.tree => |*iter| iter.jumpLower(io, key, inclusive),
+            BackendType.skip => |*iter| iter.jumpLower(io, key, inclusive),
+            BackendType.tiny => |*iter| iter.jumpLower(io, key, inclusive),
+            BackendType.baby => |*iter| iter.jumpLower(io, key, inclusive),
+            BackendType.cache => |*iter| iter.jumpLower(io, key, inclusive),
+        };
+    }
+
+    /// Moves to the first record >= key (ordered DBMs only).
+    pub fn jumpUpper(self: *Self, io: Io, key: []const u8, inclusive: bool) Status {
+
+        return switch (self.backend) {
+            BackendType.hash => |*iter| iter.jumpUpper(io, key, inclusive),
+            BackendType.tree => |*iter| iter.jumpUpper(io, key, inclusive),
+            BackendType.skip => |*iter| iter.jumpUpper(io, key, inclusive),
+            BackendType.tiny => |*iter| iter.jumpUpper(io, key, inclusive),
+            BackendType.baby => |*iter| iter.jumpUpper(io, key, inclusive),
+            BackendType.cache => |*iter| iter.jumpUpper(io, key, inclusive),
+        };
+    }
+
+    /// Read the current record into key_out/value_out then advance to the next record.
+    pub fn step(
+        self: *Self,
+        io: Io,
+        key_out: ?*std.ArrayList(u8),
+        value_out: ?*std.ArrayList(u8),
+    ) Status {
+        return switch (self.backend) {
+            BackendType.hash => |*iter| iter.step(io, key_out, value_out),
+            BackendType.tree => |*iter| iter.step(io, key_out, value_out),
+            BackendType.skip => |*iter| iter.step(io, key_out, value_out),
+            BackendType.tiny => |*iter| iter.step(io, key_out, value_out),
+            BackendType.baby => |*iter| iter.step(io, key_out, value_out),
+            BackendType.cache => |*iter| iter.step(io, key_out, value_out),
         };
     }
 
@@ -846,67 +1108,71 @@ pub const PolyCursor = struct {
     pub fn get(
         self: *Self,
         allocator: std.mem.Allocator,
+        io: Io,
         key_out: ?*std.ArrayList(u8),
         value_out: ?*std.ArrayList(u8),
     ) Status {
         _ = allocator;
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.get(key_out, value_out),
-            BackendType.tree => |*iter| iter.get(key_out, value_out),
-            BackendType.skip => |*iter| iter.get(key_out, value_out),
-            BackendType.tiny => |*iter| iter.get(key_out, value_out),
-            BackendType.baby => |*iter| iter.get(key_out, value_out),
-            BackendType.cache => |*iter| iter.get(key_out, value_out),
+            BackendType.hash => |*iter| iter.get(io, key_out, value_out),
+            BackendType.tree => |*iter| iter.get(io, key_out, value_out),
+            BackendType.skip => |*iter| iter.get(io, key_out, value_out),
+            BackendType.tiny => |*iter| iter.get(io, key_out, value_out),
+            BackendType.baby => |*iter| iter.get(io, key_out, value_out),
+            BackendType.cache => |*iter| iter.get(io, key_out, value_out),
         };
     }
 
     /// Sets the current record's value.
     pub fn set(
         self: *Self,
+        io: Io,
         value: []const u8,
         old_key: ?*std.ArrayList(u8),
         old_value: ?*std.ArrayList(u8),
     ) Status {
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.set(value, old_key, old_value),
-            BackendType.tree => |*iter| iter.set(value, old_key, old_value),
-            BackendType.skip => |*iter| iter.set(value, old_key, old_value),
-            BackendType.tiny => |*iter| iter.set(value, old_key, old_value),
-            BackendType.baby => |*iter| iter.set(value, old_key, old_value),
-            BackendType.cache => |*iter| iter.set(value, old_key, old_value),
+            BackendType.hash => |*iter| iter.set(io, value, old_key, old_value),
+            BackendType.tree => |*iter| iter.set(io, value, old_key, old_value),
+            BackendType.skip => |*iter| iter.set(io, value, old_key, old_value),
+            BackendType.tiny => |*iter| iter.set(io, value, old_key, old_value),
+            BackendType.baby => |*iter| iter.set(io, value, old_key, old_value),
+            BackendType.cache => |*iter| iter.set(io, value, old_key, old_value),
         };
     }
 
     /// Removes the current record.
     pub fn remove(
         self: *Self,
+        io: Io,
         old_key: ?*std.ArrayList(u8),
         old_value: ?*std.ArrayList(u8),
     ) Status {
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.remove(old_key, old_value),
-            BackendType.tree => |*iter| iter.remove(old_key, old_value),
-            BackendType.skip => |*iter| iter.remove(old_key, old_value),
-            BackendType.tiny => |*iter| iter.remove(old_key, old_value),
-            BackendType.baby => |*iter| iter.remove(old_key, old_value),
-            BackendType.cache => |*iter| iter.remove(old_key, old_value),
+            BackendType.hash => |*iter| iter.remove(io, old_key, old_value),
+            BackendType.tree => |*iter| iter.remove(io, old_key, old_value),
+            BackendType.skip => |*iter| iter.remove(io, old_key, old_value),
+            BackendType.tiny => |*iter| iter.remove(io, old_key, old_value),
+            BackendType.baby => |*iter| iter.remove(io, old_key, old_value),
+            BackendType.cache => |*iter| iter.remove(io, old_key, old_value),
         };
     }
 
     /// Processes the current record with a custom processor.
+    /// `proc` must be a pointer to a processor type with `processFull` and `processEmpty` methods.
     pub fn process(
         self: *Self,
-        comptime P: type,
-        proc: *P,
+        io: Io,
+        proc: anytype,
         writable: bool,
     ) Status {
         return switch (self.backend) {
-            BackendType.hash => |*iter| iter.process(P, proc, writable),
-            BackendType.tree => |*iter| iter.process(P, proc, writable),
-            BackendType.skip => |*iter| iter.process(P, proc, writable),
-            BackendType.tiny => |*iter| iter.process(P, proc, writable),
-            BackendType.baby => |*iter| iter.process(P, proc, writable),
-            BackendType.cache => |*iter| iter.process(P, proc, writable),
+            BackendType.hash => |*iter| iter.process(io, proc, writable),
+            BackendType.tree => |*iter| iter.process(io, proc, writable),
+            BackendType.cache => |*iter| iter.process(io, proc, writable),
+            BackendType.skip => |*iter| iter.process(io, @TypeOf(proc.*), proc, writable),
+            BackendType.tiny => |*iter| iter.process(io, @TypeOf(proc.*), proc, writable),
+            BackendType.baby => |*iter| iter.process(io, @TypeOf(proc.*), proc, writable),
         };
     }
 };
@@ -951,13 +1217,13 @@ pub const PolyIterator = struct {
     /// The returned slices point into internal buffers and are invalidated
     /// on the next call to next() or deinit(). Copy them if you need the
     /// data to outlive this call.
-    pub fn next(self: *Self) !?Entry {
+    pub fn next(self: *Self, io: Io) !?Entry {
         if (self.done) return null;
 
         // Fill internal buffers from the current cursor position.
         self.key_buf.clearRetainingCapacity();
         self.value_buf.clearRetainingCapacity();
-        const st = self.cursor.get(self.alloc, &self.key_buf, &self.value_buf);
+        const st = self.cursor.get(self.alloc, io, &self.key_buf, &self.value_buf);
         if (!st.isOk()) {
             self.done = true;
             return null;
@@ -965,7 +1231,7 @@ pub const PolyIterator = struct {
 
         // Advance cursor. If it reaches the end, mark done so the next
         // call returns null rather than re-reading the last record.
-        if (!self.cursor.next().isOk()) self.done = true;
+        if (!self.cursor.next(io).isOk()) self.done = true;
 
         return Entry{
             .key = self.key_buf.items,
@@ -974,10 +1240,10 @@ pub const PolyIterator = struct {
     }
 
     /// Release internal buffers and the underlying cursor.
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: Io) void {
         self.key_buf.deinit(self.alloc);
         self.value_buf.deinit(self.alloc);
-        self.cursor.deinit();
+        self.cursor.deinit(io);
     }
 };
 
@@ -1016,22 +1282,22 @@ test "PolyDBM TinyDBM basic operations" {
     defer allocator.free(db_path);
 
     var db = try PolyDBM.open(db_path, .{ .writable = true, .backend = BackendType.tiny }, io, allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
     // Set a value
-    try testing.expectEqual(.SUCCESS, db.set("key1", "value1", true).code);
+    try testing.expectEqual(.SUCCESS, db.set(io, "key1", "value1", true).code);
 
     // Get the value
-    const value = try db.get("key1", allocator);
+    const value = try db.get(allocator, io, "key1");
     try testing.expectEqualStrings("value1", value);
     allocator.free(value);
 
     // Remove the value
-    try testing.expectEqual(.SUCCESS, db.remove("key1").code);
+    try testing.expectEqual(.SUCCESS, db.remove(io, "key1").code);
 
     // Verify removal — get() returns NotFound for missing keys so users can
     // distinguish "present with empty value" from "absent".
-    try testing.expectError(PolyError.NotFound, db.get("key1", allocator));
+    try testing.expectError(PolyError.NotFound, db.get(allocator, io, "key1"));
 }
 
 test "PolyDBM BabyDBM basic operations" {
@@ -1051,28 +1317,28 @@ test "PolyDBM BabyDBM basic operations" {
     defer allocator.free(db_path);
 
     var db = try PolyDBM.open(db_path, .{ .writable = true, .backend = BackendType.baby }, io, allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
     // Set values
-    try testing.expectEqual(.SUCCESS, db.set("b", "2", true).code);
-    try testing.expectEqual(.SUCCESS, db.set("a", "1", true).code);
-    try testing.expectEqual(.SUCCESS, db.set("c", "3", true).code);
+    try testing.expectEqual(.SUCCESS, db.set(io, "b", "2", true).code);
+    try testing.expectEqual(.SUCCESS, db.set(io, "a", "1", true).code);
+    try testing.expectEqual(.SUCCESS, db.set(io, "c", "3", true).code);
 
     // Get values
-    const val_a = try db.get("a", allocator);
+    const val_a = try db.get(allocator, io, "a");
     try testing.expectEqualStrings("1", val_a);
     allocator.free(val_a);
 
-    const val_b = try db.get("b", allocator);
+    const val_b = try db.get(allocator, io, "b");
     try testing.expectEqualStrings("2", val_b);
     allocator.free(val_b);
 
-    const val_c = try db.get("c", allocator);
+    const val_c = try db.get(allocator, io, "c");
     try testing.expectEqualStrings("3", val_c);
     allocator.free(val_c);
 
     // Count
-    try testing.expectEqual(@as(i64, 3), db.count());
+    try testing.expectEqual(@as(i64, 3), db.count(io));
 }
 
 fn polyTestPath(alloc: std.mem.Allocator, io: std.Io, tmp: anytype, name: []const u8) ![]u8 {
@@ -1090,15 +1356,15 @@ test "PolyDBM.iterate() visits all records" {
     defer alloc.free(db_path);
 
     var db = try PolyDBM.open(db_path, .{ .writable = true, .backend = .tiny }, io, alloc);
-    defer db.deinit();
-    _ = db.set("a", "1", true);
-    _ = db.set("b", "2", true);
-    _ = db.set("c", "3", true);
+    defer db.deinit(io);
+    _ = db.set(io, "a", "1", true);
+    _ = db.set(io, "b", "2", true);
+    _ = db.set(io, "c", "3", true);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, io);
+    defer iter.deinit(io);
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         _ = entry.key;
         _ = entry.value;
         count += 1;
@@ -1115,17 +1381,17 @@ test "PolyDBM.iterate() lifetime contract" {
     defer alloc.free(db_path);
 
     var db = try PolyDBM.open(db_path, .{ .writable = true, .backend = .tiny }, io, alloc);
-    defer db.deinit();
-    _ = db.set("x", "val_x", true);
-    _ = db.set("y", "val_y", true);
+    defer db.deinit(io);
+    _ = db.set(io, "x", "val_x", true);
+    _ = db.set(io, "y", "val_y", true);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
-    const first = try iter.next();
+    var iter = try db.iterate(alloc, io);
+    defer iter.deinit(io);
+    const first = try iter.next(io);
     try std.testing.expect(first != null);
     const key_copy = try alloc.dupe(u8, first.?.key);
     defer alloc.free(key_copy);
-    _ = try iter.next();
+    _ = try iter.next(io);
     try std.testing.expect(key_copy.len > 0);
 }
 
@@ -1138,12 +1404,12 @@ test "PolyDBM.iterate() empty database" {
     defer alloc.free(db_path);
 
     var db = try PolyDBM.open(db_path, .{ .writable = true, .backend = .tiny }, io, alloc);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
-    try std.testing.expect(try iter.next() == null);
-    try std.testing.expect(try iter.next() == null);
+    var iter = try db.iterate(alloc, io);
+    defer iter.deinit(io);
+    try std.testing.expect(try iter.next(io) == null);
+    try std.testing.expect(try iter.next(io) == null);
 }
 
 test "PolyDBM.iterateFrom() ordered backend" {
@@ -1155,20 +1421,20 @@ test "PolyDBM.iterateFrom() ordered backend" {
     defer alloc.free(db_path);
 
     var db = try PolyDBM.open(db_path, .{ .writable = true, .backend = .baby }, io, alloc);
-    defer db.deinit();
-    _ = db.set("aaa", "v1", true);
-    _ = db.set("bbb", "v2", true);
-    _ = db.set("ccc", "v3", true);
+    defer db.deinit(io);
+    _ = db.set(io, "aaa", "v1", true);
+    _ = db.set(io, "bbb", "v2", true);
+    _ = db.set(io, "ccc", "v3", true);
 
-    var iter = try db.iterateFrom("bbb", alloc);
-    defer iter.deinit();
-    const first = try iter.next();
+    var iter = try db.iterateFrom(alloc, io, "bbb");
+    defer iter.deinit(io);
+    const first = try iter.next(io);
     try std.testing.expect(first != null);
     try std.testing.expectEqualSlices(u8, "bbb", first.?.key);
-    const second = try iter.next();
+    const second = try iter.next(io);
     try std.testing.expect(second != null);
     try std.testing.expectEqualSlices(u8, "ccc", second.?.key);
-    try std.testing.expect(try iter.next() == null);
+    try std.testing.expect(try iter.next(io) == null);
 }
 
 test "PolyDBM explicit backend type" {
@@ -1192,10 +1458,10 @@ test "PolyDBM explicit backend type" {
         .writable = true,
         .backend = BackendType.tiny,
     }, io, allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    try testing.expectEqual(.SUCCESS, db.set("test", "data", true).code);
-    const value = try db.get("test", allocator);
+    try testing.expectEqual(.SUCCESS, db.set(io, "test", "data", true).code);
+    const value = try db.get(allocator, io, "test");
     try testing.expectEqualStrings("data", value);
     allocator.free(value);
 }

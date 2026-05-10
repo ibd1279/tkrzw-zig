@@ -17,7 +17,9 @@ pub const WRITER_LOCK: u32 = std.math.maxInt(i32);
 ///   WRITER_LOCK    — an exclusive writer holds the lock
 ///
 /// This is a faithful port of tkrzw's SpinSharedMutex.
-pub const SpinSharedMutex = struct {
+/// Private — only used internally by HashMutex for per-bucket slot locking.
+/// Not part of the public API; use std.Io.RwLock for application-level locking.
+const SpinSharedMutex = struct {
     count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Acquire an exclusive (writer) lock. Spins until the lock is free.

@@ -9,11 +9,11 @@ const tkzrw = @import("tkrzw_zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    _ = init.io; // smoke test uses in-memory TinyDBM; no open/synchronize/pushLast calls needed
+    const io = init.io;
 
     const std_file = try tkzrw.StdFile.create(allocator);
     var db = try tkzrw.TinyDBM.init(std_file.asFile(), 0, allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
     const N: usize = 1000;
     var key_buf: [32]u8 = undefined;
@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     for (0..N) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
         const v = try std.fmt.bufPrint(&val_buf, "val{d}", .{i});
-        const st = db.set(k, v, true, null);
+        const st = db.set(io, k, v, true, null);
         if (!st.isOk()) {
             std.debug.print("FAIL set key{d}: {s}\n", .{ i, @tagName(st.code) });
             std.process.exit(1);
@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         const expected = try std.fmt.bufPrint(&val_buf, "val{d}", .{i});
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(allocator);
-        const st = db.get(k, &value_list);
+        const st = db.get(io, k, &value_list);
         if (!st.isOk() or !std.mem.eql(u8, value_list.items, expected)) {
             mismatches += 1;
         }
@@ -52,27 +52,27 @@ pub fn main(init: std.process.Init) !void {
     // --- Phase 3: remove even-indexed keys (500 removals) ---
     for (0..N / 2) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i * 2});
-        _ = db.remove(k);
+        _ = db.remove(io, k);
     }
     std.debug.print("removed {d} keys, count={d}\n", .{ N / 2, db.countSimple() });
 
     // --- Phase 4: iterate remaining records ---
-    var iter = try db.makeCursor();
-    defer iter.deinit();
-    _ = iter.first();
+    var iter = try db.makeCursor(io);
+    defer iter.deinit(io);
+    _ = iter.first(io);
 
     var iterated: usize = 0;
     var iter_key: std.ArrayList(u8) = .empty;
     defer iter_key.deinit(allocator);
     while (true) {
-        const get_st = iter.get(&iter_key, null);
+        const get_st = iter.get(io, &iter_key, null);
         if (get_st.code == .NOT_FOUND_ERROR) break;
         if (!get_st.isOk()) {
             std.debug.print("FAIL: iterator get returned {s}\n", .{@tagName(get_st.code)});
             std.process.exit(1);
         }
         iterated += 1;
-        _ = iter.next();
+        _ = iter.next(io);
     }
 
     if (iterated != N / 2) {

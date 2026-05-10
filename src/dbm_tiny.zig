@@ -29,7 +29,6 @@ pub const OpenOptions = file_mod.OpenOptions;
 pub const FlatRecord = file_util.FlatRecord;
 pub const FlatRecordReader = file_util.FlatRecordReader;
 pub const RecordType = file_util.RecordType;
-pub const SpinSharedMutex = thread_util.SpinSharedMutex;
 pub const HashMutex = thread_util.HashMutex;
 
 // ---------------------------------------------------------------------------
@@ -455,7 +454,7 @@ const TinyDBMImpl = struct {
     num_buckets: i64,
     buckets: []?[*]u8,
     update_logger: ?*UpdateLogger,
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock = .init,
     record_mutex: HashMutex,
 
     fn init(
@@ -484,7 +483,7 @@ const TinyDBMImpl = struct {
             .num_buckets = nb,
             .buckets = &.{},
             .update_logger = null,
-            .mutex = .{},
+            .mutex = .init,
             .record_mutex = undefined,
         };
 
@@ -500,12 +499,9 @@ const TinyDBMImpl = struct {
         return self;
     }
 
-    fn deinit(self: *TinyDBMImpl) void {
+    fn deinit(self: *TinyDBMImpl, io: std.Io) void {
         if (self.open) {
-            // Use std.Io.failing for emergency-close on deinit: the caller should
-            // have closed the DB explicitly before calling deinit. The timestamp
-            // written to the export file will be zero, which is acceptable here.
-            _ = self.closeImpl(std.Io.failing);
+            _ = self.closeImpl(io);
         }
         // Orphan any live iterators: null out dbm pointer (matches C++ ~TinyDBMImpl
         // which sets iterator->dbm_ = nullptr) and invalidate bucket_index.
@@ -569,35 +565,35 @@ const TinyDBMImpl = struct {
 
     fn openImpl(
         self: *TinyDBMImpl,
+        io: std.Io,
         path: []const u8,
         writable: bool,
         options: OpenOptions,
-        io: std.Io,
     ) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "already open");
         }
 
         const norm_path = file_mod.normalizePath(path);
-        const st_open = self.file.open(norm_path, writable, options);
+        const st_open = self.file.open(io, norm_path, writable, options);
         if (!st_open.isOk()) return st_open;
 
         if (self.file.getSizeSimple() < 1) {
             self.timestamp = std.Io.Clock.real.now(io);
         }
 
-        const st_import = self.importRecords();
+        const st_import = self.importRecords(io);
         if (!st_import.isOk()) {
-            _ = self.file.close();
+            _ = self.file.close(io);
             return st_import;
         }
 
         self.path.clearRetainingCapacity();
         self.path.appendSlice(self.allocator, norm_path) catch {
-            _ = self.file.close();
+            _ = self.file.close(io);
             return Status.init(.SYSTEM_ERROR);
         };
         self.open = true;
@@ -607,8 +603,8 @@ const TinyDBMImpl = struct {
     }
 
     fn closeImpl(self: *TinyDBMImpl, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
@@ -618,7 +614,7 @@ const TinyDBMImpl = struct {
         if (self.writable) {
             status.mergeFrom(self.exportRecords(io));
         }
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         self.releaseAllRecords();
         self.cancelIterators();
         self.allocator.free(self.buckets);
@@ -787,7 +783,7 @@ const TinyDBMImpl = struct {
     // Import / Export
     // -----------------------------------------------------------------------
 
-    fn importRecords(self: *TinyDBMImpl) Status {
+    fn importRecords(self: *TinyDBMImpl, io: std.Io) Status {
         var reader = FlatRecordReader.init(
             self.file,
             self.allocator,
@@ -801,7 +797,7 @@ const TinyDBMImpl = struct {
         while (true) {
             var str: []const u8 = undefined;
             var rec_type: RecordType = undefined;
-            const st = reader.read(&str, &rec_type);
+            const st = reader.read(io, &str, &rec_type);
             if (!st.isOk()) {
                 if (st.code == .NOT_FOUND_ERROR) break;
                 return st;
@@ -835,7 +831,7 @@ const TinyDBMImpl = struct {
             // Read paired value.
             var val_str: []const u8 = undefined;
             var val_type: RecordType = undefined;
-            const st2 = reader.read(&val_str, &val_type);
+            const st2 = reader.read(io, &val_str, &val_type);
             if (!st2.isOk()) {
                 if (st2.code == .NOT_FOUND_ERROR) {
                     return Status.initMsg(.BROKEN_DATA_ERROR, "odd number of records");
@@ -872,7 +868,7 @@ const TinyDBMImpl = struct {
     fn exportRecords(self: *TinyDBMImpl, io: std.Io) Status {
         var status = Status.init(.SUCCESS);
 
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         if (!status.isOk()) return status;
 
         // Build export path.
@@ -893,11 +889,11 @@ const TinyDBMImpl = struct {
             .sync_hard = self.open_options.sync_hard,
         };
 
-        const st_open = self.file.open(export_path, true, export_options);
+        const st_open = self.file.open(io, export_path, true, export_options);
         if (!st_open.isOk()) {
             var reopen_opts = self.open_options;
             reopen_opts.truncate = false;
-            _ = self.file.open(self.path.items, true, reopen_opts);
+            _ = self.file.open(io, self.path.items, true, reopen_opts);
             return st_open;
         }
 
@@ -905,7 +901,7 @@ const TinyDBMImpl = struct {
         var export_file_open = true;
         defer {
             if (export_file_open) {
-                _ = self.file.close();
+                _ = self.file.close(io);
             }
         }
 
@@ -939,7 +935,7 @@ const TinyDBMImpl = struct {
                 return Status.init(.SYSTEM_ERROR);
             defer self.allocator.free(serialized);
 
-            status.mergeFrom(flat_rec.write(serialized, .metadata));
+            status.mergeFrom(flat_rec.write(io, serialized, .metadata));
         }
 
         // Write all records.
@@ -947,21 +943,21 @@ const TinyDBMImpl = struct {
             var ptr: ?[*]u8 = head;
             while (ptr) |p| {
                 const rv = deserializeRecord(p);
-                status.mergeFrom(flat_rec.write(rv.key, .normal));
-                status.mergeFrom(flat_rec.write(rv.value, .normal));
+                status.mergeFrom(flat_rec.write(io, rv.key, .normal));
+                status.mergeFrom(flat_rec.write(io, rv.value, .normal));
                 if (!status.isOk()) break :outer;
                 ptr = rv.child;
             }
         }
 
         export_file_open = false;
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         status.mergeFrom(file_mod.renameFile(export_path, self.path.items));
         _ = file_mod.removeFile(export_path);
 
         var reopen_opts = self.open_options;
         reopen_opts.truncate = false;
-        status.mergeFrom(self.file.open(self.path.items, true, reopen_opts));
+        status.mergeFrom(self.file.open(io, self.path.items, true, reopen_opts));
         return status;
     }
 
@@ -969,9 +965,9 @@ const TinyDBMImpl = struct {
     // Higher-level operations
     // -----------------------------------------------------------------------
 
-    fn clear(self: *TinyDBMImpl) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn clear(self: *TinyDBMImpl, io: std.Io) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.update_logger) |ul| {
             _ = ul.writeClear();
@@ -985,11 +981,11 @@ const TinyDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn rebuild(self: *TinyDBMImpl, num_buckets_req: i64) Status {
+    fn rebuild(self: *TinyDBMImpl, io: std.Io, num_buckets_req: i64) Status {
         // No update logger call here — C++ Rebuild also skips WriteClear(). Rebuild
         // only rehashes buckets; existing WAL entries remain valid.
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         const old_num_buckets = self.num_buckets;
         const old_buckets = self.buckets;
@@ -1031,9 +1027,9 @@ const TinyDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn synchronize(self: *TinyDBMImpl, hard: bool, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn synchronize(self: *TinyDBMImpl, io: std.Io, hard: bool) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var status = Status.init(.SUCCESS);
         if (self.writable) {
@@ -1042,7 +1038,7 @@ const TinyDBMImpl = struct {
             }
             if (self.open) {
                 status.mergeFrom(self.exportRecords(io));
-                status.mergeFrom(self.file.synchronize(hard));
+                status.mergeFrom(self.file.synchronize(io, hard));
             }
         }
         return status;
@@ -1058,13 +1054,14 @@ const TinyDBMImpl = struct {
     // writable path; the shared lock is sufficient for read-only.
     fn processFirst(
         self: *TinyDBMImpl,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         writable: bool,
     ) Status {
         if (writable) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
             for (self.buckets, 0..) |head, bidx| {
                 if (head != null) {
                     const rv = deserializeRecord(head.?);
@@ -1078,8 +1075,8 @@ const TinyDBMImpl = struct {
                 }
             }
         } else {
-            self.mutex.lockShared();
-            defer self.mutex.unlockShared();
+            self.mutex.lockSharedUncancelable(io);
+            defer self.mutex.unlockShared(io);
             for (self.buckets) |head| {
                 if (head) |p| {
                     const rv = deserializeRecord(p);
@@ -1099,14 +1096,15 @@ const TinyDBMImpl = struct {
     // same comptime type P (Zig comptime monomorphism constraint).
     fn processMulti(
         self: *TinyDBMImpl,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
         writable: bool,
     ) Status {
         std.debug.assert(keys.len == procs.len);
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         const bucket_indices = if (writable)
             self.record_mutex.lockMulti(keys, self.allocator) catch
@@ -1128,70 +1126,66 @@ const TinyDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
+    // Read-only accessors below are lock-free snapshots (matching HashDBM
+    // convention). num_records is atomic; other fields are written only under
+    // exclusive impl mutex during open/close/rebuild and read here racily —
+    // tests rely on these working before openImpl runs, so we cannot acquire
+    // the RwLock unconditionally.
     fn count(self: *TinyDBMImpl) i64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.num_records.load(.monotonic);
     }
 
     fn isOpen(self: *TinyDBMImpl) bool {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.open;
     }
 
     fn isWritable(self: *TinyDBMImpl) bool {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.open and self.writable;
     }
 
     fn setUpdateLogger(self: *TinyDBMImpl, logger: ?*UpdateLogger) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Lock-free single-pointer write. update_logger is a single pointer
+        // field; readers see either the old or new value atomically on all
+        // supported targets. Concurrent setUpdateLogger calls are not safe.
         self.update_logger = logger;
     }
 
     fn getUpdateLogger(self: *TinyDBMImpl) ?*UpdateLogger {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.update_logger;
     }
 
     fn getFilePath(self: *TinyDBMImpl) []const u8 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.path.items;
     }
 
     fn getTimestamp(self: *TinyDBMImpl) f64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return @as(f64, @floatFromInt(self.timestamp.nanoseconds)) / 1_000_000_000.0;
     }
 
     fn getFileSize(self: *TinyDBMImpl) i64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.file.getSizeSimple();
     }
 
     fn shouldBeRebuilt(self: *TinyDBMImpl) bool {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.num_records.load(.monotonic) > self.num_buckets;
     }
 
     fn getInternalFile(self: *TinyDBMImpl) File {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
         return self.file;
     }
 
-    fn inspect(self: *TinyDBMImpl, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn inspect(self: *TinyDBMImpl, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        // Acquire shared lock post-open (concurrent callers). Pre-open (in-memory
+        // use without open()) is single-threaded — no lock needed.
+        if (self.open) {
+            self.mutex.lockSharedUncancelable(io);
+            defer self.mutex.unlockShared(io);
+            return self.inspectLocked(allocator);
+        }
+        return self.inspectLocked(allocator);
+    }
 
+    fn inspectLocked(self: *TinyDBMImpl, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
         var list: std.ArrayList([2][]u8) = .empty;
         errdefer {
             for (list.items) |pair| {
@@ -1286,7 +1280,7 @@ const TinyDBMImpl = struct {
 // TinyDBMIteratorImpl methods
 // ---------------------------------------------------------------------------
 
-fn iterInit(dbm: *TinyDBMImpl, allocator: std.mem.Allocator) !*TinyDBMIteratorImpl {
+fn iterInit(dbm: *TinyDBMImpl, io: std.Io, allocator: std.mem.Allocator) !*TinyDBMIteratorImpl {
     const self = try allocator.create(TinyDBMIteratorImpl);
     errdefer allocator.destroy(self);
     self.* = TinyDBMIteratorImpl{
@@ -1295,17 +1289,17 @@ fn iterInit(dbm: *TinyDBMImpl, allocator: std.mem.Allocator) !*TinyDBMIteratorIm
         .keys = .empty,
         .allocator = allocator,
     };
-    dbm.mutex.lock();
-    defer dbm.mutex.unlock();
+    dbm.mutex.lockUncancelable(io);
+    defer dbm.mutex.unlock(io);
     try dbm.iterators.append(dbm.allocator, self);
     return self;
 }
 
-fn iterDeinit(self: *TinyDBMIteratorImpl) void {
+fn iterDeinit(self: *TinyDBMIteratorImpl, io: std.Io) void {
     // dbm may be null if TinyDBMImpl.deinit ran first — matches C++ null check
     // in ~TinyDBMIteratorImpl before acquiring the mutex.
     if (self.dbm) |d| {
-        d.mutex.lock();
+        d.mutex.lockUncancelable(io);
         const items = d.iterators.items;
         for (items, 0..) |it, i| {
             if (it == self) {
@@ -1313,7 +1307,7 @@ fn iterDeinit(self: *TinyDBMIteratorImpl) void {
                 break;
             }
         }
-        d.mutex.unlock();
+        d.mutex.unlock(io);
     }
 
     // Free all key copies.
@@ -1324,18 +1318,18 @@ fn iterDeinit(self: *TinyDBMIteratorImpl) void {
     self.allocator.destroy(self);
 }
 
-fn iterFirst(self: *TinyDBMIteratorImpl) Status {
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+fn iterFirst(self: *TinyDBMIteratorImpl, io: std.Io) Status {
+    self.dbm.?.mutex.lockSharedUncancelable(io);
+    defer self.dbm.?.mutex.unlockShared(io);
     self.bucket_index.store(0, .release);
     for (self.keys.items) |k| self.allocator.free(k);
     self.keys.clearRetainingCapacity();
     return Status.init(.SUCCESS);
 }
 
-fn iterJump(self: *TinyDBMIteratorImpl, key: []const u8) Status {
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+fn iterJump(self: *TinyDBMIteratorImpl, io: std.Io, key: []const u8) Status {
+    self.dbm.?.mutex.lockSharedUncancelable(io);
+    defer self.dbm.?.mutex.unlockShared(io);
 
     self.bucket_index.store(-1, .release);
     for (self.keys.items) |k| self.allocator.free(k);
@@ -1376,9 +1370,9 @@ fn iterJump(self: *TinyDBMIteratorImpl, key: []const u8) Status {
     return Status.init(.SUCCESS);
 }
 
-fn iterNext(self: *TinyDBMIteratorImpl) Status {
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+fn iterNext(self: *TinyDBMIteratorImpl, io: std.Io) Status {
+    self.dbm.?.mutex.lockSharedUncancelable(io);
+    defer self.dbm.?.mutex.unlockShared(io);
 
     const st = iterReadKeys(self);
     if (!st.isOk()) return st;
@@ -1391,12 +1385,13 @@ fn iterNext(self: *TinyDBMIteratorImpl) Status {
 
 fn iterProcess(
     self: *TinyDBMIteratorImpl,
+    io: std.Io,
     comptime P: type,
     proc: *P,
     writable: bool,
 ) Status {
-    self.dbm.?.mutex.lockShared();
-    defer self.dbm.?.mutex.unlockShared();
+    self.dbm.?.mutex.lockSharedUncancelable(io);
+    defer self.dbm.?.mutex.unlockShared(io);
 
     const st = iterReadKeys(self);
     if (!st.isOk()) return st;
@@ -1480,13 +1475,14 @@ fn iterReadKeys(self: *TinyDBMIteratorImpl) Status {
 // Iterator get — reads current key+value into caller-allocated buffers.
 fn iterGet(
     self: *TinyDBMIteratorImpl,
+    io: std.Io,
     key_out: ?*std.ArrayList(u8),
     value_out: ?*std.ArrayList(u8),
 ) Status {
     const dbm = self.dbm orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const allocator = dbm.allocator;
-    dbm.mutex.lockShared();
-    defer dbm.mutex.unlockShared();
+    dbm.mutex.lockSharedUncancelable(io);
+    defer dbm.mutex.unlockShared(io);
 
     const st = iterReadKeys(self);
     if (!st.isOk()) return st;
@@ -1543,40 +1539,42 @@ pub const TinyDBM = struct {
         impl: *TinyDBMIteratorImpl,
         allocator: std.mem.Allocator,
 
-        pub fn deinit(self: *Cursor) void {
-            iterDeinit(self.impl);
+        pub fn deinit(self: *Cursor, io: std.Io) void {
+            iterDeinit(self.impl, io);
         }
 
-        pub fn first(self: *Cursor) Status {
-            return iterFirst(self.impl);
+        pub fn first(self: *Cursor, io: std.Io) Status {
+            return iterFirst(self.impl, io);
         }
 
-        pub fn jump(self: *Cursor, key: []const u8) Status {
-            return iterJump(self.impl, key);
+        pub fn jump(self: *Cursor, io: std.Io, key: []const u8) Status {
+            return iterJump(self.impl, io, key);
         }
 
-        pub fn next(self: *Cursor) Status {
-            return iterNext(self.impl);
+        pub fn next(self: *Cursor, io: std.Io) Status {
+            return iterNext(self.impl, io);
         }
 
         /// Reads the current key and/or value into caller-provided ArrayLists.
         /// The lists are cleared and populated; caller owns the memory.
         pub fn get(
             self: *Cursor,
+            io: std.Io,
             key_out: ?*std.ArrayList(u8),
             value_out: ?*std.ArrayList(u8),
         ) Status {
-            return iterGet(self.impl, key_out, value_out);
+            return iterGet(self.impl, io, key_out, value_out);
         }
 
         /// Process the current record with a comptime processor.
         pub fn process(
             self: *Cursor,
+            io: std.Io,
             comptime P: type,
             proc: *P,
             writable: bool,
         ) Status {
-            return iterProcess(self.impl, P, proc, writable);
+            return iterProcess(self.impl, io, P, proc, writable);
         }
 
         /// Overwrites the current record's value. Optionally captures the old
@@ -1584,6 +1582,7 @@ pub const TinyDBM = struct {
         /// DBM-internal allocator).
         pub fn set(
             self: *Cursor,
+            io: std.Io,
             value: []const u8,
             old_key: ?*std.ArrayList(u8),
             old_value: ?*std.ArrayList(u8),
@@ -1621,7 +1620,7 @@ pub const TinyDBM = struct {
                 .old_value = old_value,
                 .allocator = self.allocator,
             };
-            const st = self.process(SetProc, &proc, true);
+            const st = self.process(io, SetProc, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
@@ -1630,6 +1629,7 @@ pub const TinyDBM = struct {
         /// captures the old key and value into caller-owned ArrayLists.
         pub fn remove(
             self: *Cursor,
+            io: std.Io,
             old_key: ?*std.ArrayList(u8),
             old_value: ?*std.ArrayList(u8),
         ) Status {
@@ -1665,7 +1665,7 @@ pub const TinyDBM = struct {
                 .old_value = old_value,
                 .allocator = self.allocator,
             };
-            const st = self.process(RemoveProc, &proc, true);
+            const st = self.process(io, RemoveProc, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
@@ -1675,29 +1675,33 @@ pub const TinyDBM = struct {
         /// caller owns the memory.
         pub fn step(
             self: *Cursor,
+            io: std.Io,
             key_out: ?*std.ArrayList(u8),
             value_out: ?*std.ArrayList(u8),
         ) Status {
-            const st = self.get(key_out, value_out);
+            const st = self.get(io, key_out, value_out);
             if (!st.isOk()) return st;
-            _ = self.next();
+            _ = self.next(io);
             return Status.init(.SUCCESS);
         }
 
         /// Last is not supported on unordered hash tables.
-        pub fn last(self: *Cursor) Status {
+        pub fn last(self: *Cursor, io: std.Io) Status {
+            _ = io;
             _ = self;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
         /// Previous is not supported on unordered hash tables.
-        pub fn previous(self: *Cursor) Status {
+        pub fn previous(self: *Cursor, io: std.Io) Status {
+            _ = io;
             _ = self;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
         /// JumpLower is not supported on unordered hash tables.
-        pub fn jumpLower(self: *Cursor, key: []const u8, inclusive: bool) Status {
+        pub fn jumpLower(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            _ = io;
             _ = self;
             _ = key;
             _ = inclusive;
@@ -1705,7 +1709,8 @@ pub const TinyDBM = struct {
         }
 
         /// JumpUpper is not supported on unordered hash tables.
-        pub fn jumpUpper(self: *Cursor, key: []const u8, inclusive: bool) Status {
+        pub fn jumpUpper(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            _ = io;
             _ = self;
             _ = key;
             _ = inclusive;
@@ -1740,7 +1745,7 @@ pub const TinyDBM = struct {
         /// The returned slices point into internal buffers and are invalidated
         /// on the next call to next() or deinit(). Copy them if you need the
         /// data to outlive this call.
-        pub fn next(self: *Iterator) !?Entry {
+        pub fn next(self: *Iterator, io: std.Io) !?Entry {
             if (self.done) return null;
 
             // Fill internal buffers from the current cursor position.
@@ -1766,7 +1771,7 @@ pub const TinyDBM = struct {
                 .val_buf = &self.value_buf,
                 .alloc = self.alloc,
             };
-            if (self.cursor.process(Proc, &proc, false).isOk() and !proc.oom) filled = true;
+            if (self.cursor.process(io, Proc, &proc, false).isOk() and !proc.oom) filled = true;
             if (proc.oom) return error.OutOfMemory;
 
             if (!filled) {
@@ -1776,7 +1781,7 @@ pub const TinyDBM = struct {
 
             // Advance cursor. If it reaches the end, mark done so the next
             // call returns null rather than re-reading the last record.
-            if (!self.cursor.next().isOk()) self.done = true;
+            if (!self.cursor.next(io).isOk()) self.done = true;
 
             return Entry{
                 .key = self.key_buf.items,
@@ -1785,10 +1790,10 @@ pub const TinyDBM = struct {
         }
 
         /// Release internal buffers and the underlying cursor.
-        pub fn deinit(self: *Iterator) void {
+        pub fn deinit(self: *Iterator, io: std.Io) void {
             self.key_buf.deinit(self.alloc);
             self.value_buf.deinit(self.alloc);
-            self.cursor.deinit();
+            self.cursor.deinit(io);
         }
     };
 
@@ -1798,9 +1803,9 @@ pub const TinyDBM = struct {
     /// Thread-safety: Iteration is weakly consistent with concurrent writes.
     /// Each call to next() acquires and releases the DBM lock independently.
     /// Records inserted or deleted between calls may or may not be visible.
-    pub fn iterate(self: *TinyDBM, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterate(self: *TinyDBM, alloc: std.mem.Allocator, io: std.Io) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -1808,15 +1813,15 @@ pub const TinyDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
     /// Return a Zig-style iterator positioned at the first record >= key.
     /// The caller must call deinit() when done.
-    pub fn iterateFrom(self: *TinyDBM, key: []const u8, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *TinyDBM, alloc: std.mem.Allocator, io: std.Io, key: []const u8) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -1824,7 +1829,7 @@ pub const TinyDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump(io, key).isOk()) iter.done = true;
         return iter;
     }
 
@@ -1840,12 +1845,12 @@ pub const TinyDBM = struct {
     }
 
     /// Destroys the TinyDBM, closing if open and releasing all memory.
-    pub fn deinit(self: *TinyDBM) void {
-        self.impl.deinit();
+    pub fn deinit(self: *TinyDBM, io: std.Io) void {
+        self.impl.deinit(io);
     }
 
-    pub fn open(self: *TinyDBM, path: []const u8, writable: bool, options: OpenOptions, io: std.Io) Status {
-        return self.impl.openImpl(path, writable, options, io);
+    pub fn open(self: *TinyDBM, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status {
+        return self.impl.openImpl(io, path, writable, options);
     }
 
     pub fn close(self: *TinyDBM, io: std.Io) Status {
@@ -1855,13 +1860,14 @@ pub const TinyDBM = struct {
     /// Get the value for key. If value is non-null, the DBM's own allocator is used to populate it.
     pub fn get(
         self: *TinyDBM,
+        io: std.Io,
         key: []const u8,
         value: ?*std.ArrayList(u8),
     ) Status {
         var status = Status.init(.SUCCESS);
         var getter = ProcessorGet{ .status = &status, .value = value, .allocator = self.impl.allocator };
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = self.impl.record_mutex.lockOneShared(key);
         defer self.impl.record_mutex.unlockOneShared(bucket_index);
         self.impl.processImpl(ProcessorGet, &getter, key, bucket_index, false) catch
@@ -1875,9 +1881,10 @@ pub const TinyDBM = struct {
     /// allocator.
     pub fn getSimple(
         self: *TinyDBM,
+        allocator: std.mem.Allocator,
+        io: std.Io,
         key: []const u8,
         default_value: []const u8,
-        allocator: std.mem.Allocator,
     ) ![]const u8 {
         // The DBM's internal allocator is used to back `buf` because `get`
         // delegates to ProcessorGet which appends using self.impl.allocator.
@@ -1886,7 +1893,7 @@ pub const TinyDBM = struct {
         const impl_alloc = self.impl.allocator;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(impl_alloc);
-        const st = self.get(key, &buf);
+        const st = self.get(io, key, &buf);
         if (st.isOk()) return try allocator.dupe(u8, buf.items);
         return try allocator.dupe(u8, default_value);
     }
@@ -1894,6 +1901,7 @@ pub const TinyDBM = struct {
     /// Set value for key. If old_value is non-null, the DBM's own allocator is used to populate it.
     pub fn set(
         self: *TinyDBM,
+        io: std.Io,
         key: []const u8,
         value: []const u8,
         overwrite: bool,
@@ -1907,8 +1915,8 @@ pub const TinyDBM = struct {
             .old_value = old_value,
             .allocator = self.impl.allocator,
         };
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = self.impl.record_mutex.lockOne(key);
         defer self.impl.record_mutex.unlockOne(bucket_index);
         self.impl.processImpl(ProcessorSet, &setter, key, bucket_index, true) catch
@@ -1916,11 +1924,11 @@ pub const TinyDBM = struct {
         return status;
     }
 
-    pub fn remove(self: *TinyDBM, key: []const u8) Status {
+    pub fn remove(self: *TinyDBM, io: std.Io, key: []const u8) Status {
         var status = Status.init(.SUCCESS);
         var remover = ProcessorRemove{ .status = &status };
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = self.impl.record_mutex.lockOne(key);
         defer self.impl.record_mutex.unlockOne(bucket_index);
         self.impl.processImpl(ProcessorRemove, &remover, key, bucket_index, true) catch
@@ -1930,12 +1938,13 @@ pub const TinyDBM = struct {
 
     pub fn append(
         self: *TinyDBM,
+        io: std.Io,
         key: []const u8,
         value: []const u8,
         delim: []const u8,
     ) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = self.impl.record_mutex.lockOne(key);
         defer self.impl.record_mutex.unlockOne(bucket_index);
         self.impl.appendImpl(key, bucket_index, value, delim) catch
@@ -1950,6 +1959,7 @@ pub const TinyDBM = struct {
     /// map.  Iterates all keys without early exit.
     pub fn getMulti(
         self: *TinyDBM,
+        io: std.Io,
         keys: []const []const u8,
         records: *std.StringHashMap([]u8),
     ) Status {
@@ -1959,7 +1969,7 @@ pub const TinyDBM = struct {
         defer val_buf.deinit(self.impl.allocator);
         for (keys) |key| {
             val_buf.clearRetainingCapacity();
-            const st = self.get(key, &val_buf);
+            const st = self.get(io, key, &val_buf);
             if (st.isOk()) {
                 const duped_key = map_alloc.dupe(u8, key) catch return Status.init(.SYSTEM_ERROR);
                 const duped_val = map_alloc.dupe(u8, val_buf.items) catch {
@@ -1982,12 +1992,13 @@ pub const TinyDBM = struct {
     /// DUPLICATION_ERROR (which is soft — overwrite=false conflicts).
     pub fn setMulti(
         self: *TinyDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         overwrite: bool,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.set(r[0], r[1], overwrite, null);
+            const st = self.set(io, r[0], r[1], overwrite, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .DUPLICATION_ERROR) break;
         }
@@ -1997,11 +2008,12 @@ pub const TinyDBM = struct {
     /// Remove multiple keys.  Stops on any error other than NOT_FOUND_ERROR.
     pub fn removeMulti(
         self: *TinyDBM,
+        io: std.Io,
         keys: []const []const u8,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (keys) |key| {
-            const st = self.remove(key);
+            const st = self.remove(io, key);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .NOT_FOUND_ERROR) break;
         }
@@ -2011,12 +2023,13 @@ pub const TinyDBM = struct {
     /// Append to multiple keys using the given delimiter.  Stops on first error.
     pub fn appendMulti(
         self: *TinyDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         delim: []const u8,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.append(r[0], r[1], delim);
+            const st = self.append(io, r[0], r[1], delim);
             status.mergeFrom(st);
             if (!status.isOk()) break;
         }
@@ -2026,13 +2039,14 @@ pub const TinyDBM = struct {
     /// Process a single key with a comptime processor under shared mutex.
     pub fn process(
         self: *TinyDBM,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         key: []const u8,
         writable: bool,
     ) !Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = if (writable)
             self.impl.record_mutex.lockOne(key)
         else
@@ -2049,13 +2063,14 @@ pub const TinyDBM = struct {
     /// the full scan (matching C++ ProcessEach semantics).
     pub fn processEach(
         self: *TinyDBM,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         writable: bool,
     ) !Status {
         if (writable) {
-            self.impl.mutex.lock();
-            defer self.impl.mutex.unlock();
+            self.impl.mutex.lockUncancelable(io);
+            defer self.impl.mutex.unlock(io);
 
             _ = proc.processEmpty("");
             for (0..@intCast(self.impl.num_buckets)) |bidx| {
@@ -2072,8 +2087,8 @@ pub const TinyDBM = struct {
             }
             _ = proc.processEmpty("");
         } else {
-            self.impl.mutex.lockShared();
-            defer self.impl.mutex.unlockShared();
+            self.impl.mutex.lockSharedUncancelable(io);
+            defer self.impl.mutex.unlockShared(io);
 
             _ = proc.processEmpty("");
             for (self.impl.buckets) |head| {
@@ -2095,43 +2110,45 @@ pub const TinyDBM = struct {
     /// Read-only: shared outer mutex, proc.processFull called but return value ignored.
     pub fn processFirst(
         self: *TinyDBM,
+        io: std.Io,
         comptime P: type,
         proc: *P,
         writable: bool,
     ) Status {
-        return self.impl.processFirst(P, proc, writable);
+        return self.impl.processFirst(io, P, proc, writable);
     }
 
     /// Process N keys atomically under a multi-slot hash lock.
     /// `keys` and `procs` must have equal length; all processors share type P.
     pub fn processMulti(
         self: *TinyDBM,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
         writable: bool,
     ) Status {
-        return self.impl.processMulti(P, keys, procs, writable);
+        return self.impl.processMulti(io, P, keys, procs, writable);
     }
 
     fn countInternal(self: *TinyDBM) i64 {
         return self.impl.count();
     }
 
-    pub fn clear(self: *TinyDBM) Status {
-        return self.impl.clear();
+    pub fn clear(self: *TinyDBM, io: std.Io) Status {
+        return self.impl.clear(io);
     }
 
-    pub fn rebuild(self: *TinyDBM) Status {
-        return self.impl.rebuild(-1);
+    pub fn rebuild(self: *TinyDBM, io: std.Io) Status {
+        return self.impl.rebuild(io, -1);
     }
 
-    pub fn rebuildAdvanced(self: *TinyDBM, num_buckets: i64) Status {
-        return self.impl.rebuild(num_buckets);
+    pub fn rebuildAdvanced(self: *TinyDBM, io: std.Io, num_buckets: i64) Status {
+        return self.impl.rebuild(io, num_buckets);
     }
 
-    pub fn synchronize(self: *TinyDBM, hard: bool, io: std.Io) Status {
-        return self.impl.synchronize(hard, io);
+    pub fn synchronize(self: *TinyDBM, io: std.Io, hard: bool) Status {
+        return self.impl.synchronize(io, hard);
     }
 
     pub fn isOpen(self: *TinyDBM) bool {
@@ -2150,16 +2167,14 @@ pub const TinyDBM = struct {
         return false;
     }
 
-    pub fn makeCursor(self: *TinyDBM) !Cursor {
-        const iter_impl = try iterInit(self.impl, self.allocator);
+    pub fn makeCursor(self: *TinyDBM, io: std.Io) !Cursor {
+        const iter_impl = try iterInit(self.impl, io, self.allocator);
         return Cursor{ .impl = iter_impl, .allocator = self.allocator };
     }
 
-    /// Deprecated: use makeCursor instead.
-    pub const makeIterator = makeCursor;
 
-    pub fn inspect(self: *TinyDBM, alloc: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        return self.impl.inspect(alloc);
+    pub fn inspect(self: *TinyDBM, alloc: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        return self.impl.inspect(alloc, io);
     }
 
     pub fn setUpdateLogger(self: *TinyDBM, logger: ?*UpdateLogger) void {
@@ -2240,6 +2255,7 @@ pub const TinyDBM = struct {
     /// Atomically compare and conditionally exchange the value for a key.
     pub fn compareExchange(
         self: *TinyDBM,
+        io: std.Io,
         key: []const u8,
         expected: dbm_mod.CompareExpected,
         desired: dbm_mod.CompareDesired,
@@ -2247,8 +2263,8 @@ pub const TinyDBM = struct {
         found_out: ?*bool,
     ) Status {
         var status = Status.init(.SUCCESS);
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = self.impl.record_mutex.lockOne(key);
         defer self.impl.record_mutex.unlockOne(bucket_index);
         var proc = ProcessorCompareExchange{
@@ -2267,14 +2283,15 @@ pub const TinyDBM = struct {
     /// Atomically increment a stored i64 value by delta, returning the new value.
     pub fn increment(
         self: *TinyDBM,
+        io: std.Io,
         key: []const u8,
         delta: i64,
         current_out: ?*i64,
         initial: i64,
     ) Status {
         var status = Status.init(.SUCCESS);
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         const bucket_index = self.impl.record_mutex.lockOne(key);
         defer self.impl.record_mutex.unlockOne(bucket_index);
         var proc = ProcessorIncrement{
@@ -2294,18 +2311,20 @@ pub const TinyDBM = struct {
     /// before applying delta. On error the return value is initial.
     pub fn incrementSimple(
         self: *TinyDBM,
+        io: std.Io,
         key: []const u8,
         delta: i64,
         initial: i64,
     ) i64 {
         var result: i64 = initial;
-        _ = self.increment(key, delta, &result, initial);
+        _ = self.increment(io, key, delta, &result, initial);
         return result;
     }
 
     /// Remove and return the first record in the database (arbitrary order on unordered DBMs).
     pub fn popFirst(
         self: *TinyDBM,
+        io: std.Io,
         key_out: ?*std.ArrayList(u8),
         value_out: ?*std.ArrayList(u8),
     ) !Status {
@@ -2316,7 +2335,7 @@ pub const TinyDBM = struct {
             .value_out = value_out,
             .allocator = self.impl.allocator,
         };
-        const st = self.processFirst(ProcessorPopFirst, &proc, true);
+        const st = self.processFirst(io, ProcessorPopFirst, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
@@ -2326,10 +2345,10 @@ pub const TinyDBM = struct {
     /// Key is returned in key_out if non-null.
     pub fn pushLast(
         self: *TinyDBM,
+        io: std.Io,
         value: []const u8,
         wtime: f64,
         key_out: ?*std.ArrayList(u8),
-        io: std.Io,
     ) Status {
         const base: u64 = time_util.pushLastKeyBase(wtime, io);
         var seq: u64 = 0;
@@ -2337,7 +2356,7 @@ pub const TinyDBM = struct {
             const ts: u64 = base +% seq;
             var key_buf: [8]u8 = undefined;
             const key = str_util.intToStrBigEndian(ts, 8, &key_buf);
-            const st = self.set(key, value, false, null);
+            const st = self.set(io, key, value, false, null);
             if (st.code != .DUPLICATION_ERROR) {
                 if (key_out) |ko| {
                     ko.clearRetainingCapacity();
@@ -2391,10 +2410,10 @@ pub const TinyDBM = struct {
 
     /// Copies the backing file to dest_path, optionally syncing first.
     /// Returns NOT_IMPLEMENTED_ERROR when no backing file path is set.
-    pub fn copyFileData(self: *TinyDBM, dest_path: []const u8, sync_hard: bool, io: std.Io) Status {
+    pub fn copyFileData(self: *TinyDBM, io: std.Io, dest_path: []const u8, sync_hard: bool) Status {
         if (!self.isOpen()) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (sync_hard) {
-            const st = self.synchronize(true, io);
+            const st = self.synchronize(io, true);
             if (!st.isOk()) return st;
         }
         const src_path = self.getFilePathInternal();
@@ -2405,30 +2424,30 @@ pub const TinyDBM = struct {
     }
 
     /// Renames a key. Reads old value, sets under new_key, removes old_key unless copying=true.
-    pub fn rekey(self: *TinyDBM, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+    pub fn rekey(self: *TinyDBM, io: std.Io, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
         if (!self.isOpen() or !self.isWritable())
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(self.allocator);
 
-        const st_get = self.get(old_key, &value_list);
+        const st_get = self.get(io, old_key, &value_list);
         if (!st_get.isOk()) return st_get;
 
-        const st_set = self.set(new_key, value_list.items, overwrite, null);
+        const st_set = self.set(io, new_key, value_list.items, overwrite, null);
         if (!st_set.isOk()) return st_set;
 
         if (!copying) {
-            _ = self.remove(old_key);
+            _ = self.remove(io, old_key);
         }
         return Status.init(.SUCCESS);
     }
 
     /// Exports all records from this DBM to dest (any DBM with a set() method).
-    pub fn export_(self: *TinyDBM, dest: anytype) Status {
-        var iter = self.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        var st = iter.first();
+    pub fn export_(self: *TinyDBM, io: std.Io, dest: anytype) Status {
+        var iter = self.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        var st = iter.first(io);
         if (st.code == .NOT_FOUND_ERROR) return Status.init(.SUCCESS);
         if (!st.isOk()) return st;
         while (true) {
@@ -2436,11 +2455,11 @@ pub const TinyDBM = struct {
             defer key_list.deinit(self.allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get(io, &key_list, &val_list);
             if (!st_get.isOk()) break;
-            const st_set = dest.set(key_list.items, val_list.items, true, null);
+            const st_set = dest.set(io, key_list.items, val_list.items, true, null);
             if (!st_set.isOk()) return st_set;
-            st = iter.next();
+            st = iter.next(io);
             if (!st.isOk()) break;
         }
         return Status.init(.SUCCESS);
@@ -2449,13 +2468,14 @@ pub const TinyDBM = struct {
     /// Atomically checks multiple expected conditions then applies multiple desired changes.
     pub fn compareExchangeMulti(
         self: *TinyDBM,
+        io: std.Io,
         expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
         desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const get_st = self.get(cond.key, &val_list);
+            const get_st = self.get(io, cond.key, &val_list);
             switch (cond.value) {
                 .absent => {
                     if (get_st.isOk()) return Status.init(.DUPLICATION_ERROR);
@@ -2472,11 +2492,11 @@ pub const TinyDBM = struct {
         for (desired) |change| {
             switch (change.value) {
                 .remove => {
-                    const st = self.remove(change.key);
+                    const st = self.remove(io, change.key);
                     if (!st.isOk() and st.code != .NOT_FOUND_ERROR) return st;
                 },
                 .set => |new_val| {
-                    const st = self.set(change.key, new_val, true, null);
+                    const st = self.set(io, change.key, new_val, true, null);
                     if (!st.isOk()) return st;
                 },
                 .noop => {},
@@ -2502,7 +2522,7 @@ fn makeInMemoryDB(allocator: std.mem.Allocator) !TinyDBM {
 test "basic set/get/remove: 100 keys" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key_buf: [32]u8 = undefined;
     var val_buf: [32]u8 = undefined;
@@ -2511,7 +2531,7 @@ test "basic set/get/remove: 100 keys" {
     for (0..100) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
         const v = try std.fmt.bufPrint(&val_buf, "val{d}", .{i});
-        const st = db.set(k, v, true, null);
+        const st = db.set(std.testing.io, k, v, true, null);
         try std.testing.expect(st.isOk());
     }
 
@@ -2523,7 +2543,7 @@ test "basic set/get/remove: 100 keys" {
         const expected_v = try std.fmt.bufPrint(&val_buf, "val{d}", .{i});
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(alloc);
-        const st = db.get(k, &value_list);
+        const st = db.get(std.testing.io, k, &value_list);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings(expected_v, value_list.items);
     }
@@ -2531,7 +2551,7 @@ test "basic set/get/remove: 100 keys" {
     // Remove even-indexed keys.
     for (0..50) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i * 2});
-        const st = db.remove(k);
+        const st = db.remove(std.testing.io, k);
         try std.testing.expect(st.isOk());
     }
 
@@ -2540,7 +2560,7 @@ test "basic set/get/remove: 100 keys" {
     // Removed keys should return NOT_FOUND_ERROR.
     for (0..50) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i * 2});
-        const st = db.get(k, null);
+        const st = db.get(std.testing.io, k, null);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
     }
 }
@@ -2548,17 +2568,17 @@ test "basic set/get/remove: 100 keys" {
 test "append: concatenation with empty delimiter" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    var st = db.set("greeting", "hello", true, null);
+    var st = db.set(std.testing.io, "greeting", "hello", true, null);
     try std.testing.expect(st.isOk());
 
-    st = db.append("greeting", " world", "");
+    st = db.append(std.testing.io, "greeting", " world", "");
     try std.testing.expect(st.isOk());
 
     var value_list: std.ArrayList(u8) = .empty;
     defer value_list.deinit(alloc);
-    st = db.get("greeting", &value_list);
+    st = db.get(std.testing.io, "greeting", &value_list);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualStrings("hello world", value_list.items);
 }
@@ -2566,14 +2586,14 @@ test "append: concatenation with empty delimiter" {
 test "append: creates new record when missing" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    const st = db.append("newkey", "first", ",");
+    const st = db.append(std.testing.io, "newkey", "first", ",");
     try std.testing.expect(st.isOk());
 
     var value_list: std.ArrayList(u8) = .empty;
     defer value_list.deinit(alloc);
-    const get_st_1 = db.get("newkey", &value_list);
+    const get_st_1 = db.get(std.testing.io, "newkey", &value_list);
     try std.testing.expect(get_st_1.isOk());
     try std.testing.expectEqualStrings("first", value_list.items);
 }
@@ -2581,27 +2601,27 @@ test "append: creates new record when missing" {
 test "overwrite: DUPLICATION_ERROR when overwrite=false" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    var st = db.set("key", "original", true, null);
+    var st = db.set(std.testing.io, "key", "original", true, null);
     try std.testing.expect(st.isOk());
 
-    st = db.set("key", "new", false, null);
+    st = db.set(std.testing.io, "key", "new", false, null);
     try std.testing.expectEqual(Code.DUPLICATION_ERROR, st.code);
 
     // Value should be unchanged.
     var value_list: std.ArrayList(u8) = .empty;
     defer value_list.deinit(alloc);
-    const get_st_2a = db.get("key", &value_list);
+    const get_st_2a = db.get(std.testing.io, "key", &value_list);
     try std.testing.expect(get_st_2a.isOk());
     try std.testing.expectEqualStrings("original", value_list.items);
 
     // Now overwrite=true should succeed.
-    st = db.set("key", "new", true, null);
+    st = db.set(std.testing.io, "key", "new", true, null);
     try std.testing.expect(st.isOk());
 
     value_list.clearRetainingCapacity();
-    const get_st_2b = db.get("key", &value_list);
+    const get_st_2b = db.get(std.testing.io, "key", &value_list);
     try std.testing.expect(get_st_2b.isOk());
     try std.testing.expectEqualStrings("new", value_list.items);
 }
@@ -2609,20 +2629,20 @@ test "overwrite: DUPLICATION_ERROR when overwrite=false" {
 test "iterator: visit all 10 keys" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key_buf: [16]u8 = undefined;
     var val_buf: [16]u8 = undefined;
     for (0..10) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
         const v = try std.fmt.bufPrint(&val_buf, "v{d}", .{i});
-        _ = db.set(k, v, true, null);
+        _ = db.set(std.testing.io, k, v, true, null);
     }
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    var st = iter.first();
+    var st = iter.first(std.testing.io);
     try std.testing.expect(st.isOk());
 
     var seen: u32 = 0;
@@ -2631,11 +2651,11 @@ test "iterator: visit all 10 keys" {
     var iter_v: std.ArrayList(u8) = .empty;
     defer iter_v.deinit(alloc);
     while (true) {
-        const get_st = iter.get(&iter_k, &iter_v);
+        const get_st = iter.get(std.testing.io, &iter_k, &iter_v);
         if (get_st.code == .NOT_FOUND_ERROR) break;
         try std.testing.expect(get_st.isOk());
         seen += 1;
-        st = iter.next();
+        st = iter.next(std.testing.io);
         if (st.code == .NOT_FOUND_ERROR) break;
         try std.testing.expect(st.isOk());
     }
@@ -2645,23 +2665,23 @@ test "iterator: visit all 10 keys" {
 test "iterator: jump to existing key" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("apple", "a", true, null);
-    _ = db.set("banana", "b", true, null);
-    _ = db.set("cherry", "c", true, null);
+    _ = db.set(std.testing.io, "apple", "a", true, null);
+    _ = db.set(std.testing.io, "banana", "b", true, null);
+    _ = db.set(std.testing.io, "cherry", "c", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    const st = iter.jump("banana");
+    const st = iter.jump(std.testing.io, "banana");
     try std.testing.expect(st.isOk());
 
     var k: std.ArrayList(u8) = .empty;
     defer k.deinit(alloc);
     var v: std.ArrayList(u8) = .empty;
     defer v.deinit(alloc);
-    const get_st = iter.get(&k, &v);
+    const get_st = iter.get(std.testing.io, &k, &v);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualStrings("banana", k.items);
 }
@@ -2680,12 +2700,12 @@ test "persistence: set, close, reopen, verify" {
     {
         const std_file = try file_mod.StdFile.create(alloc);
         var db = try TinyDBM.init(std_file.asFile(), 0, alloc);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
-        var st = db.open(db_path, true, .{}, std.testing.io);
+        var st = db.open(std.testing.io, db_path, true, .{});
         try std.testing.expect(st.isOk());
 
-        st = db.set("persistent_key", "persistent_value", true, null);
+        st = db.set(std.testing.io, "persistent_key", "persistent_value", true, null);
         try std.testing.expect(st.isOk());
 
         st = db.close(std.testing.io);
@@ -2696,14 +2716,14 @@ test "persistence: set, close, reopen, verify" {
     {
         const std_file2 = try file_mod.StdFile.create(alloc);
         var db2 = try TinyDBM.init(std_file2.asFile(), 0, alloc);
-        defer db2.deinit();
+        defer db2.deinit(std.testing.io);
 
-        var st = db2.open(db_path, false, .{}, std.testing.io);
+        var st = db2.open(std.testing.io, db_path, false, .{});
         try std.testing.expect(st.isOk());
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(alloc);
-        st = db2.get("persistent_key", &value_list);
+        st = db2.get(std.testing.io, "persistent_key", &value_list);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("persistent_value", value_list.items);
 
@@ -2714,14 +2734,14 @@ test "persistence: set, close, reopen, verify" {
 test "processEach: count visits" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     for (0..5) |i| {
         var kb: [8]u8 = undefined;
         var vb: [8]u8 = undefined;
         const k = try std.fmt.bufPrint(&kb, "k{d}", .{i});
         const v = try std.fmt.bufPrint(&vb, "v{d}", .{i});
-        _ = db.set(k, v, true, null);
+        _ = db.set(std.testing.io, k, v, true, null);
     }
 
     const Counter = struct {
@@ -2741,25 +2761,25 @@ test "processEach: count visits" {
     };
 
     var counter = Counter{};
-    _ = try db.processEach(Counter, &counter, false);
+    _ = try db.processEach(std.testing.io, Counter, &counter, false);
     try std.testing.expectEqual(@as(usize, 5), counter.count);
 }
 
 test "clear: count drops to zero" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     for (0..20) |i| {
         var kb: [8]u8 = undefined;
         var vb: [8]u8 = undefined;
         const k = try std.fmt.bufPrint(&kb, "k{d}", .{i});
         const v = try std.fmt.bufPrint(&vb, "v{d}", .{i});
-        _ = db.set(k, v, true, null);
+        _ = db.set(std.testing.io, k, v, true, null);
     }
     try std.testing.expectEqual(@as(i64, 20), db.countSimple());
 
-    const st = db.clear();
+    const st = db.clear(std.testing.io);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 0), db.countSimple());
 }
@@ -2767,17 +2787,17 @@ test "clear: count drops to zero" {
 test "rebuild: all records survive" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key_buf: [16]u8 = undefined;
     var val_buf: [16]u8 = undefined;
     for (0..30) |i| {
         const k = try std.fmt.bufPrint(&key_buf, "rkey{d}", .{i});
         const v = try std.fmt.bufPrint(&val_buf, "rval{d}", .{i});
-        _ = db.set(k, v, true, null);
+        _ = db.set(std.testing.io, k, v, true, null);
     }
 
-    _ = db.rebuildAdvanced(64);
+    _ = db.rebuildAdvanced(std.testing.io, 64);
     try std.testing.expectEqual(@as(i64, 30), db.countSimple());
 
     // Spot-check a few records.
@@ -2786,7 +2806,7 @@ test "rebuild: all records survive" {
         const expected_v = try std.fmt.bufPrint(&val_buf, "rval{d}", .{i});
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(alloc);
-        const st = db.get(k, &value_list);
+        const st = db.get(std.testing.io, k, &value_list);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings(expected_v, value_list.items);
     }
@@ -2795,11 +2815,11 @@ test "rebuild: all records survive" {
 test "inspect: returns expected keys" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("ikey", "ival", true, null);
+    _ = db.set(std.testing.io, "ikey", "ival", true, null);
 
-    var pairs = try db.inspect(alloc);
+    var pairs = try db.inspect(alloc, std.testing.io);
     defer {
         for (pairs.items) |p| {
             alloc.free(p[0]);
@@ -2822,36 +2842,36 @@ test "inspect: returns expected keys" {
 test "remove: NOT_FOUND_ERROR on missing key" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    const st = db.remove("nonexistent");
+    const st = db.remove(std.testing.io, "nonexistent");
     try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
 }
 
 test "processFirst: returns NOT_FOUND_ERROR on empty db" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var status = Status.init(.SUCCESS);
     var getter = ProcessorGet{ .status = &status, .value = null, .allocator = alloc };
-    const st = db.processFirst(ProcessorGet, &getter, false);
+    const st = db.processFirst(std.testing.io, ProcessorGet, &getter, false);
     try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
 }
 
 test "processFirst: read-only visits one record" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("alpha", "1", true, null);
-    _ = db.set("beta", "2", true, null);
+    _ = db.set(std.testing.io, "alpha", "1", true, null);
+    _ = db.set(std.testing.io, "beta", "2", true, null);
 
     var status = Status.init(.SUCCESS);
     var value_buf: std.ArrayList(u8) = .empty;
     defer value_buf.deinit(alloc);
     var getter = ProcessorGet{ .status = &status, .value = &value_buf, .allocator = alloc };
-    const st = db.processFirst(ProcessorGet, &getter, false);
+    const st = db.processFirst(std.testing.io, ProcessorGet, &getter, false);
     try std.testing.expect(st.isOk());
     // Exactly one record was visited; value_buf holds its value.
     try std.testing.expect(value_buf.items.len > 0);
@@ -2860,15 +2880,15 @@ test "processFirst: read-only visits one record" {
 test "processFirst: writable can remove the first record" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("k1", "v1", true, null);
-    _ = db.set("k2", "v2", true, null);
+    _ = db.set(std.testing.io, "k1", "v1", true, null);
+    _ = db.set(std.testing.io, "k2", "v2", true, null);
     try std.testing.expectEqual(@as(i64, 2), db.countSimple());
 
     var status = Status.init(.SUCCESS);
     var remover = ProcessorRemove{ .status = &status };
-    const st = db.processFirst(ProcessorRemove, &remover, true);
+    const st = db.processFirst(std.testing.io, ProcessorRemove, &remover, true);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 1), db.countSimple());
 }
@@ -2876,10 +2896,10 @@ test "processFirst: writable can remove the first record" {
 test "processMulti: atomic get of two keys" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("x", "10", true, null);
-    _ = db.set("y", "20", true, null);
+    _ = db.set(std.testing.io, "x", "10", true, null);
+    _ = db.set(std.testing.io, "y", "20", true, null);
 
     var st_x = Status.init(.SUCCESS);
     var st_y = Status.init(.SUCCESS);
@@ -2893,7 +2913,7 @@ test "processMulti: atomic get of two keys" {
 
     const keys = [_][]const u8{ "x", "y" };
     const procs = [_]*ProcessorGet{ &px, &py };
-    const st = db.processMulti(ProcessorGet, &keys, &procs, false);
+    const st = db.processMulti(std.testing.io, ProcessorGet, &keys, &procs, false);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualStrings("10", buf_x.items);
     try std.testing.expectEqualStrings("20", buf_y.items);
@@ -2902,7 +2922,7 @@ test "processMulti: atomic get of two keys" {
 test "processMulti: writable set of two keys" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var st_a = Status.init(.SUCCESS);
     var st_b = Status.init(.SUCCESS);
@@ -2911,13 +2931,13 @@ test "processMulti: writable set of two keys" {
 
     const keys = [_][]const u8{ "a", "b" };
     const procs = [_]*ProcessorSet{ &pa, &pb };
-    const st = db.processMulti(ProcessorSet, &keys, &procs, true);
+    const st = db.processMulti(std.testing.io, ProcessorSet, &keys, &procs, true);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 2), db.countSimple());
 
     var vbuf: std.ArrayList(u8) = .empty;
     defer vbuf.deinit(alloc);
-    const get_st_3 = db.get("a", &vbuf);
+    const get_st_3 = db.get(std.testing.io, "a", &vbuf);
     try std.testing.expect(get_st_3.isOk());
     try std.testing.expectEqualStrings("va", vbuf.items);
 }
@@ -2927,7 +2947,7 @@ test "getFilePath / getTimestamp / getFileSize / shouldBeRebuilt" {
 
     // getFilePath returns empty string before open.
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
     try std.testing.expectEqualStrings("", db.getFilePathSimple());
     try std.testing.expect(std.math.isNan(db.getTimestampSimple()));
 
@@ -2950,9 +2970,9 @@ test "getFilePath: returns path after open" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try TinyDBM.init(std_file.asFile(), 0, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    const st = db.open(db_path, true, .{}, std.testing.io);
+    const st = db.open(std.testing.io, db_path, true, .{});
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualStrings(db_path, db.getFilePathSimple());
     try std.testing.expect(db.getTimestampSimple() > 0);
@@ -2964,12 +2984,12 @@ test "shouldBeRebuilt: true when records exceed buckets" {
     // Force a very small bucket count so records quickly exceed it.
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try TinyDBM.init(std_file.asFile(), 3, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
-    _ = db.set("c", "3", true, null);
-    _ = db.set("d", "4", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
+    _ = db.set(std.testing.io, "c", "3", true, null);
+    _ = db.set(std.testing.io, "d", "4", true, null);
 
     // 4 records vs 3-ish buckets → should want a rebuild.
     try std.testing.expect(db.shouldBeRebuiltSimple());
@@ -2983,7 +3003,7 @@ test "concurrent access: parallel set/get/remove" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try TinyDBM.init(std_file.asFile(), 0, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const NUM_THREADS = 4;
     const OPS_PER_THREAD: usize = 50;
@@ -3000,17 +3020,17 @@ test "concurrent access: parallel set/get/remove" {
             for (0..OPS_PER_THREAD) |i| {
                 const k = std.fmt.bufPrint(&key_buf, "t{d}k{d}", .{ self.thread_id, i }) catch continue;
                 const v = std.fmt.bufPrint(&val_buf, "t{d}v{d}", .{ self.thread_id, i }) catch continue;
-                _ = self.db.set(k, v, true, null);
+                _ = self.db.set(std.testing.io, k, v, true, null);
             }
             // Read back all keys (ignore result — just exercise the read path).
             for (0..OPS_PER_THREAD) |i| {
                 const k = std.fmt.bufPrint(&key_buf, "t{d}k{d}", .{ self.thread_id, i }) catch continue;
-                _ = self.db.get(k, null);
+                _ = self.db.get(std.testing.io, k, null);
             }
             // Remove the first half.
             for (0..OPS_PER_THREAD / 2) |i| {
                 const k = std.fmt.bufPrint(&key_buf, "t{d}k{d}", .{ self.thread_id, i }) catch continue;
-                _ = self.db.remove(k);
+                _ = self.db.remove(std.testing.io, k);
             }
         }
     };
@@ -3035,15 +3055,15 @@ test "concurrent access: parallel set/get/remove" {
 test "TinyDBM.Cursor.last returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    _ = iter.first();
-    const status = iter.last();
+    _ = iter.first(std.testing.io);
+    const status = iter.last(std.testing.io);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -3051,15 +3071,15 @@ test "TinyDBM.Cursor.last returns NOT_IMPLEMENTED_ERROR" {
 test "TinyDBM.Cursor.previous returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    _ = iter.first();
-    const status = iter.previous();
+    _ = iter.first(std.testing.io);
+    const status = iter.previous(std.testing.io);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -3067,14 +3087,14 @@ test "TinyDBM.Cursor.previous returns NOT_IMPLEMENTED_ERROR" {
 test "TinyDBM.Cursor.jumpLower returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    const status = iter.jumpLower("key1", true);
+    const status = iter.jumpLower(std.testing.io, "key1", true);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -3082,14 +3102,14 @@ test "TinyDBM.Cursor.jumpLower returns NOT_IMPLEMENTED_ERROR" {
 test "TinyDBM.Cursor.jumpUpper returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    const status = iter.jumpUpper("key1", false);
+    const status = iter.jumpUpper(std.testing.io, "key1", false);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -3097,23 +3117,23 @@ test "TinyDBM.Cursor.jumpUpper returns NOT_IMPLEMENTED_ERROR" {
 test "TinyDBM.compareExchange: match and exchange" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // Set initial value
-    try std.testing.expectEqual(.SUCCESS, db.set("key1", "foo", true, null).code);
+    try std.testing.expectEqual(.SUCCESS, db.set(std.testing.io, "key1", "foo", true, null).code);
 
     // CAS with exact match should succeed
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st1 = db.compareExchange("key1", .{ .exact = "foo" }, .{ .set = "bar" }, &actual, &found);
+    const st1 = db.compareExchange(std.testing.io, "key1", .{ .exact = "foo" }, .{ .set = "bar" }, &actual, &found);
     try std.testing.expect(st1.isOk());
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "foo", actual.items);
 
     // Verify value changed
     actual.clearRetainingCapacity();
-    const get_st_4 = db.get("key1", &actual);
+    const get_st_4 = db.get(std.testing.io, "key1", &actual);
     try std.testing.expect(get_st_4.isOk());
     try std.testing.expectEqualSlices(u8, "bar", actual.items);
 }
@@ -3121,14 +3141,14 @@ test "TinyDBM.compareExchange: match and exchange" {
 test "TinyDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    try std.testing.expectEqual(.SUCCESS, db.set("key2", "old", true, null).code);
+    try std.testing.expectEqual(.SUCCESS, db.set(std.testing.io, "key2", "old", true, null).code);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key2", .{ .exact = "wrong" }, .{ .set = "new" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key2", .{ .exact = "wrong" }, .{ .set = "new" }, &actual, &found);
     try std.testing.expect(st.code == .INFEASIBLE_ERROR);
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "old", actual.items);
@@ -3137,18 +3157,18 @@ test "TinyDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
 test "TinyDBM.compareExchange: absent creates record" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("newkey", .absent, .{ .set = "value" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "newkey", .absent, .{ .set = "value" }, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(!found);
 
     // Verify record was created
     actual.clearRetainingCapacity();
-    const get_st = db.get("newkey", &actual);
+    const get_st = db.get(std.testing.io, "newkey", &actual);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualSlices(u8, "value", actual.items);
 }
@@ -3156,39 +3176,39 @@ test "TinyDBM.compareExchange: absent creates record" {
 test "TinyDBM.compareExchange: absent noop on missing key" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("missing", .absent, .noop, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "missing", .absent, .noop, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(!found);
 
     // Verify key still absent
     actual.clearRetainingCapacity();
-    const get_st = db.get("missing", &actual);
+    const get_st = db.get(std.testing.io, "missing", &actual);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
 test "TinyDBM.compareExchange: any probe reads without writing" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "original", true, null);
+    _ = db.set(std.testing.io, "key", "original", true, null);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .any, .noop, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .any, .noop, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "original", actual.items);
 
     // Verify value unchanged
     actual.clearRetainingCapacity();
-    const get_st_5 = db.get("key", &actual);
+    const get_st_5 = db.get(std.testing.io, "key", &actual);
     try std.testing.expect(get_st_5.isOk());
     try std.testing.expectEqualSlices(u8, "original", actual.items);
 }
@@ -3196,33 +3216,33 @@ test "TinyDBM.compareExchange: any probe reads without writing" {
 test "TinyDBM.compareExchange: desired remove deletes record" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "foo", true, null);
+    _ = db.set(std.testing.io, "key", "foo", true, null);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .{ .exact = "foo" }, .remove, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .{ .exact = "foo" }, .remove, &actual, &found);
     try std.testing.expect(st.isOk());
 
     // Verify key removed
     actual.clearRetainingCapacity();
-    const get_st = db.get("key", &actual);
+    const get_st = db.get(std.testing.io, "key", &actual);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
 test "TinyDBM.compareExchange: absent fails when key exists" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "exists", true, null);
+    _ = db.set(std.testing.io, "key", "exists", true, null);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .absent, .{ .set = "new" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .absent, .{ .set = "new" }, &actual, &found);
     try std.testing.expect(st.code == .INFEASIBLE_ERROR);
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "exists", actual.items);
@@ -3231,17 +3251,17 @@ test "TinyDBM.compareExchange: absent fails when key exists" {
 test "TinyDBM.increment: fresh key uses initial+delta" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var current: i64 = undefined;
-    const st = db.increment("counter", 3, &current, 10);
+    const st = db.increment(std.testing.io, "counter", 3, &current, 10);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 13), current);
 
     // Verify stored as 8-byte big-endian
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st_6 = db.get("counter", &val);
+    const get_st_6 = db.get(std.testing.io, "counter", &val);
     try std.testing.expect(get_st_6.isOk());
     try std.testing.expectEqual(@as(usize, 8), val.items.len);
     const stored = @as(i64, @bitCast(str_util.strToIntBigEndian(val.items)));
@@ -3251,14 +3271,14 @@ test "TinyDBM.increment: fresh key uses initial+delta" {
 test "TinyDBM.increment: existing key adds delta" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var buf: [8]u8 = undefined;
     const initial_bytes = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 10))), 8, &buf);
-    _ = db.set("num", initial_bytes, true, null);
+    _ = db.set(std.testing.io, "num", initial_bytes, true, null);
 
     var current: i64 = undefined;
-    const st = db.increment("num", 5, &current, 0);
+    const st = db.increment(std.testing.io, "num", 5, &current, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 15), current);
 }
@@ -3266,21 +3286,21 @@ test "TinyDBM.increment: existing key adds delta" {
 test "TinyDBM.increment: INT64MIN probe reads without writing" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var buf: [8]u8 = undefined;
     const initial_bytes = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 7))), 8, &buf);
-    _ = db.set("num", initial_bytes, true, null);
+    _ = db.set(std.testing.io, "num", initial_bytes, true, null);
 
     var current: i64 = undefined;
-    const st = db.increment("num", lib_common.INT64MIN, &current, 0);
+    const st = db.increment(std.testing.io, "num", lib_common.INT64MIN, &current, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 7), current);
 
     // Verify value unchanged
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st_7 = db.get("num", &val);
+    const get_st_7 = db.get(std.testing.io, "num", &val);
     try std.testing.expect(get_st_7.isOk());
     const stored = @as(i64, @bitCast(str_util.strToIntBigEndian(val.items)));
     try std.testing.expectEqual(@as(i64, 7), stored);
@@ -3289,28 +3309,28 @@ test "TinyDBM.increment: INT64MIN probe reads without writing" {
 test "TinyDBM.increment: INT64MIN probe on missing key returns initial" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var current: i64 = undefined;
-    const st = db.increment("missing", lib_common.INT64MIN, &current, 42);
+    const st = db.increment(std.testing.io, "missing", lib_common.INT64MIN, &current, 42);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 42), current);
 
     // Verify key still absent
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st = db.get("missing", &val);
+    const get_st = db.get(std.testing.io, "missing", &val);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
 test "TinyDBM.popFirst: returns and removes first record" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
-    _ = db.set("key2", "value2", true, null);
-    _ = db.set("key3", "value3", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key2", "value2", true, null);
+    _ = db.set(std.testing.io, "key3", "value3", true, null);
     try std.testing.expectEqual(@as(i64, 3), db.countSimple());
 
     var key: std.ArrayList(u8) = .empty;
@@ -3318,7 +3338,7 @@ test "TinyDBM.popFirst: returns and removes first record" {
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = try db.popFirst(&key, &value);
+    const st = try db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.isOk());
     try std.testing.expect(key.items.len > 0);
     try std.testing.expect(value.items.len > 0);
@@ -3331,32 +3351,32 @@ test "TinyDBM.popFirst: returns and removes first record" {
 test "TinyDBM.popFirst: empty returns NOT_FOUND_ERROR" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = try db.popFirst(&key, &value);
+    const st = try db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.code == .NOT_FOUND_ERROR);
 }
 
 test "TinyDBM.pushLast: creates record with key_out" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
-    const st = db.pushLast("hello", 1.0, &key, std.testing.io);
+    const st = db.pushLast(std.testing.io, "hello", 1.0, &key);
     try std.testing.expect(st.isOk());
     try std.testing.expect(key.items.len > 0);
 
     // Verify value retrievable by key
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st = db.get(key.items, &val);
+    const get_st = db.get(std.testing.io, key.items, &val);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualSlices(u8, "hello", val.items);
 }
@@ -3364,15 +3384,15 @@ test "TinyDBM.pushLast: creates record with key_out" {
 test "TinyDBM.pushLast: two pushes at same wtime produce sequential keys" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key1: std.ArrayList(u8) = .empty;
     defer key1.deinit(alloc);
     var key2: std.ArrayList(u8) = .empty;
     defer key2.deinit(alloc);
 
-    _ = db.pushLast("a", 1.0, &key1, std.testing.io);
-    _ = db.pushLast("b", 1.0, &key2, std.testing.io);
+    _ = db.pushLast(std.testing.io, "a", 1.0, &key1);
+    _ = db.pushLast(std.testing.io, "b", 1.0, &key2);
 
     try std.testing.expectEqual(@as(usize, 8), key1.items.len);
     try std.testing.expectEqual(@as(usize, 8), key2.items.len);
@@ -3385,19 +3405,19 @@ test "TinyDBM.pushLast: two pushes at same wtime produce sequential keys" {
 test "TinyDBM.pushLast: pop-after-push round-trips value" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const original = "round-trip-value";
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
-    _ = db.pushLast(original, 2.0, &key, std.testing.io);
+    _ = db.pushLast(std.testing.io, original, 2.0, &key);
 
     var popped_key: std.ArrayList(u8) = .empty;
     defer popped_key.deinit(alloc);
     var popped_val: std.ArrayList(u8) = .empty;
     defer popped_val.deinit(alloc);
 
-    const st = try db.popFirst(&popped_key, &popped_val);
+    const st = try db.popFirst(std.testing.io, &popped_key, &popped_val);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualSlices(u8, original, popped_val.items);
 }
@@ -3405,15 +3425,15 @@ test "TinyDBM.pushLast: pop-after-push round-trips value" {
 test "TinyDBM.get: null value buffer returns SUCCESS on found key" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("exists", "hello", true, null);
+    _ = db.set(std.testing.io, "exists", "hello", true, null);
 
     // null value = existence check only
-    const present = db.get("exists", null);
+    const present = db.get(std.testing.io, "exists", null);
     try std.testing.expect(present.isOk());
 
-    const absent = db.get("missing", null);
+    const absent = db.get(std.testing.io, "missing", null);
     try std.testing.expect(absent.code == .NOT_FOUND_ERROR);
 }
 
@@ -3429,10 +3449,10 @@ test "TinyDBM: timestamp persists across close and reopen" {
     const ts_before: f64 = blk: {
         const file1 = try file_mod.StdFile.create(allocator);
         var db = try TinyDBM.init(file1.asFile(), 0, allocator);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
-        try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-        try std.testing.expect(db.set("k", "v", true, null).isOk());
+        try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+        try std.testing.expect(db.set(std.testing.io, "k", "v", true, null).isOk());
         const ts = db.getTimestampSimple();
         try std.testing.expect(ts > 0.0);
         try std.testing.expect(db.close(std.testing.io).isOk());
@@ -3442,8 +3462,8 @@ test "TinyDBM: timestamp persists across close and reopen" {
     // Reopen and verify timestamp survived serialization.
     const file2 = try file_mod.StdFile.create(allocator);
     var db2 = try TinyDBM.init(file2.asFile(), 0, allocator);
-    defer db2.deinit();
-    try std.testing.expect(db2.open(full_path, false, .{}, std.testing.io).isOk());
+    defer db2.deinit(std.testing.io);
+    try std.testing.expect(db2.open(std.testing.io, full_path, false, .{}).isOk());
     const ts_after = db2.getTimestampSimple();
     // Timestamp must be positive and within 1 second of the original open time.
     try std.testing.expect(ts_after > 0.0);
@@ -3454,13 +3474,13 @@ test "TinyDBM: timestamp persists across close and reopen" {
 test "TinyDBM.*Multi: bulk set/get/remove/append" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // setMulti: insert 3 keys
     const pairs = [_][2][]const u8{
         .{ "key1", "val1" }, .{ "key2", "val2" }, .{ "key3", "val3" },
     };
-    try std.testing.expect(db.setMulti(&pairs, true).isOk());
+    try std.testing.expect(db.setMulti(std.testing.io, &pairs, true).isOk());
     try std.testing.expectEqual(@as(i64, 3), db.countSimple());
 
     // getMulti: 2 existing + 1 missing -> NOT_FOUND_ERROR, map has 2 entries
@@ -3473,21 +3493,21 @@ test "TinyDBM.*Multi: bulk set/get/remove/append" {
         }
         records.deinit();
     }
-    const get_st = db.getMulti(&.{ "key1", "key2", "missing" }, &records);
+    const get_st = db.getMulti(std.testing.io, &.{ "key1", "key2", "missing" }, &records);
     try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, get_st.code);
     try std.testing.expectEqual(@as(usize, 2), records.count());
     try std.testing.expectEqualStrings("val1", records.get("key1").?);
     try std.testing.expectEqualStrings("val2", records.get("key2").?);
 
     // removeMulti: remove 2 keys
-    const rm_st = db.removeMulti(&.{ "key1", "key2" });
+    const rm_st = db.removeMulti(std.testing.io, &.{ "key1", "key2" });
     try std.testing.expect(rm_st.isOk());
     try std.testing.expectEqual(@as(i64, 1), db.countSimple());
 
     // appendMulti: append to remaining key
     const app_pairs = [_][2][]const u8{.{ "key3", "_appended" }};
-    try std.testing.expect(db.appendMulti(&app_pairs, "").isOk());
-    const got = try db.getSimple("key3", "", alloc);
+    try std.testing.expect(db.appendMulti(std.testing.io, &app_pairs, "").isOk());
+    const got = try db.getSimple(alloc, std.testing.io, "key3", "");
     defer alloc.free(got);
     try std.testing.expectEqualStrings("val3_appended", got);
 }
@@ -3495,7 +3515,7 @@ test "TinyDBM.*Multi: bulk set/get/remove/append" {
 test "TinyDBM.Iterator: iterate() visits all records" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // Insert 5 records.
     for (0..5) |i| {
@@ -3503,14 +3523,14 @@ test "TinyDBM.Iterator: iterate() visits all records" {
         var vb: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&kb, "key{d}", .{i});
         const v = try std.fmt.bufPrint(&vb, "val{d}", .{i});
-        _ = db.set(k, v, true, null);
+        _ = db.set(std.testing.io, k, v, true, null);
     }
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         _ = entry.key;
         _ = entry.value;
         count += 1;
@@ -3521,39 +3541,39 @@ test "TinyDBM.Iterator: iterate() visits all records" {
 test "TinyDBM.Iterator: iterateFrom() starts at correct key" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("apple", "a", true, null);
-    _ = db.set("banana", "b", true, null);
-    _ = db.set("cherry", "c", true, null);
+    _ = db.set(std.testing.io, "apple", "a", true, null);
+    _ = db.set(std.testing.io, "banana", "b", true, null);
+    _ = db.set(std.testing.io, "cherry", "c", true, null);
 
-    var iter = try db.iterateFrom("banana", alloc);
-    defer iter.deinit();
+    var iter = try db.iterateFrom(alloc, std.testing.io, "banana");
+    defer iter.deinit(std.testing.io);
 
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try std.testing.expect(first != null);
     // Note: TinyDBM is unordered, so we can only verify that we got *a* record.
     // The jump() call ensures we're positioned at or after the key if it exists.
     const key_copy = try alloc.dupe(u8, first.?.key);
     defer alloc.free(key_copy);
     // Second next() — first.?.key is now invalid, key_copy is safe.
-    _ = try iter.next();
+    _ = try iter.next(std.testing.io);
 }
 
 test "TinyDBM.Iterator: basic iteration" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
-    _ = db.set("c", "3", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
+    _ = db.set(std.testing.io, "c", "3", true, null);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
     
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         _ = entry.key;
         _ = entry.value;
         count += 1;
@@ -3564,16 +3584,16 @@ test "TinyDBM.Iterator: basic iteration" {
 test "TinyDBM.Iterator: iterateFrom and lifetime contract" {
     const alloc = std.testing.allocator;
     var db = try makeInMemoryDB(alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
-    _ = db.set("c", "3", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
+    _ = db.set(std.testing.io, "c", "3", true, null);
 
-    var iter = try db.iterateFrom("b", alloc);
-    defer iter.deinit();
+    var iter = try db.iterateFrom(alloc, std.testing.io, "b");
+    defer iter.deinit(std.testing.io);
     
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try std.testing.expect(first != null);
     try std.testing.expect(std.mem.startsWith(u8, first.?.key, "b"));
     
@@ -3582,7 +3602,7 @@ test "TinyDBM.Iterator: iterateFrom and lifetime contract" {
     defer alloc.free(key_copy);
     
     // Second next() — first.?.key is now invalid.
-    _ = try iter.next();
+    _ = try iter.next(std.testing.io);
     // key_copy is still valid here.
     try std.testing.expect(key_copy.len > 0);
 }

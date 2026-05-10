@@ -115,9 +115,9 @@ test "BloomFilter accessible via root re-export" {
     // path (tkrzw.BloomFilter) and the sub-namespace path (tkrzw.bloom.BloomFilter).
     var f = try BloomFilter.init(std.testing.allocator, .{});
     defer f.deinit();
-    try f.add("tkrzw");
-    try std.testing.expect(f.mightContain("tkrzw"));
-    try std.testing.expect(!f.mightContain("not-inserted"));
+    try f.add(std.testing.io, "tkrzw");
+    try std.testing.expect(f.mightContain(std.testing.io, "tkrzw"));
+    try std.testing.expect(!f.mightContain(std.testing.io, "not-inserted"));
     // Also verify sub-namespace path compiles.
     const SubNs: type = bloom.BloomFilter;
     _ = SubNs;

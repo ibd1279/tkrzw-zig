@@ -27,13 +27,13 @@ pub const File = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        open: *const fn (ctx: *anyopaque, path: []const u8, writable: bool, options: OpenOptions) Status,
-        close: *const fn (ctx: *anyopaque) Status,
-        read: *const fn (ctx: *anyopaque, off: i64, buf: []u8) Status,
-        write: *const fn (ctx: *anyopaque, off: i64, data: []const u8) Status,
-        append: *const fn (ctx: *anyopaque, data: []const u8, off: ?*i64) Status,
-        truncate: *const fn (ctx: *anyopaque, size: i64) Status,
-        synchronize: *const fn (ctx: *anyopaque, hard: bool) Status,
+        open: *const fn (ctx: *anyopaque, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status,
+        close: *const fn (ctx: *anyopaque, io: std.Io) Status,
+        read: *const fn (ctx: *anyopaque, io: std.Io, off: i64, buf: []u8) Status,
+        write: *const fn (ctx: *anyopaque, io: std.Io, off: i64, data: []const u8) Status,
+        append: *const fn (ctx: *anyopaque, io: std.Io, data: []const u8, off: ?*i64) Status,
+        truncate: *const fn (ctx: *anyopaque, io: std.Io, size: i64) Status,
+        synchronize: *const fn (ctx: *anyopaque, io: std.Io, hard: bool) Status,
         getSize: *const fn (ctx: *anyopaque, out: *i64) Status,
         makeFile: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) std.mem.Allocator.Error!*File,
         deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
@@ -44,32 +44,32 @@ pub const File = struct {
     /// Pass `options.no_lock = true` to skip locking (caller must ensure safety).
     /// Pass `options.no_wait = true` for a non-blocking attempt; returns
     /// INFEASIBLE_ERROR immediately if the lock is held by another process.
-    pub fn open(self: File, path: []const u8, writable: bool, options: OpenOptions) Status {
-        return self.vtable.open(self.ctx, path, writable, options);
+    pub fn open(self: File, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status {
+        return self.vtable.open(self.ctx, io, path, writable, options);
     }
 
-    pub fn close(self: File) Status {
-        return self.vtable.close(self.ctx);
+    pub fn close(self: File, io: std.Io) Status {
+        return self.vtable.close(self.ctx, io);
     }
 
-    pub fn read(self: File, off: i64, buf: []u8) Status {
-        return self.vtable.read(self.ctx, off, buf);
+    pub fn read(self: File, io: std.Io, off: i64, buf: []u8) Status {
+        return self.vtable.read(self.ctx, io, off, buf);
     }
 
-    pub fn write(self: File, off: i64, data: []const u8) Status {
-        return self.vtable.write(self.ctx, off, data);
+    pub fn write(self: File, io: std.Io, off: i64, data: []const u8) Status {
+        return self.vtable.write(self.ctx, io, off, data);
     }
 
-    pub fn append(self: File, data: []const u8, off: ?*i64) Status {
-        return self.vtable.append(self.ctx, data, off);
+    pub fn append(self: File, io: std.Io, data: []const u8, off: ?*i64) Status {
+        return self.vtable.append(self.ctx, io, data, off);
     }
 
-    pub fn truncate(self: File, size: i64) Status {
-        return self.vtable.truncate(self.ctx, size);
+    pub fn truncate(self: File, io: std.Io, size: i64) Status {
+        return self.vtable.truncate(self.ctx, io, size);
     }
 
-    pub fn synchronize(self: File, hard: bool) Status {
-        return self.vtable.synchronize(self.ctx, hard);
+    pub fn synchronize(self: File, io: std.Io, hard: bool) Status {
+        return self.vtable.synchronize(self.ctx, io, hard);
     }
 
     pub fn getSize(self: File, out: *i64) Status {
@@ -98,8 +98,8 @@ pub const File = struct {
 // ---------------------------------------------------------------------------
 
 pub const StdFile = struct {
-    /// -1 means closed.
-    fd: std.posix.fd_t = -1,
+    /// `null` means closed.
+    file: ?std.Io.File = null,
     /// Heap-allocated copy of the path, freed on close/deinit.
     path: ?[]u8 = null,
     writable: bool = false,
@@ -139,107 +139,83 @@ pub const StdFile = struct {
     // Vtable implementations
     // -----------------------------------------------------------------------
 
-    fn vtOpen(ctx: *anyopaque, path: []const u8, writable: bool, options: OpenOptions) Status {
+    /// Maps std.Io.Dir open/create errors to Status codes.
+    fn mapOpenErr(err: anyerror, no_wait: bool) Status {
+        return switch (err) {
+            error.FileNotFound => Status.init(.NOT_FOUND_ERROR),
+            error.WouldBlock => if (no_wait) Status.init(.INFEASIBLE_ERROR) else Status.init(.SYSTEM_ERROR),
+            error.AccessDenied,
+            error.PermissionDenied,
+            => Status.init(.SYSTEM_ERROR),
+            error.IsDir,
+            error.NotDir,
+            => Status.init(.INVALID_ARGUMENT_ERROR),
+            // All other errors (SystemResources, FileTooBig, NoSpaceLeft,
+            // ReadOnlyFileSystem, PathAlreadyExists, FileBusy, etc.)
+            else => Status.init(.SYSTEM_ERROR),
+        };
+    }
+
+    fn vtOpen(ctx: *anyopaque, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
+        if (self.file != null) return Status.init(.PRECONDITION_ERROR);
 
-        if (self.fd != -1) {
-            // Already open; caller should close first.
-            return Status.init(.PRECONDITION_ERROR);
-        }
+        // Dir.*Absolute asserts the path is absolute in debug builds; return
+        // INVALID_ARGUMENT_ERROR instead of panicking on relative paths.
+        if (!std.fs.path.isAbsolute(path)) return Status.init(.INVALID_ARGUMENT_ERROR);
 
-        const fd: std.posix.fd_t = blk: {
-            // Build a null-terminated copy of the path for POSIX calls.
-            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            if (path.len >= path_buf.len) return Status.init(.INVALID_ARGUMENT_ERROR);
-            @memcpy(path_buf[0..path.len], path);
-            path_buf[path.len] = 0;
-            const pathZ: [*:0]const u8 = path_buf[0..path.len :0];
+        const lock_kind: std.Io.File.Lock =
+            if (options.no_lock) .none else if (writable) .exclusive else .shared;
 
+        const file: std.Io.File = blk: {
             if (writable) {
                 if (options.no_create) {
-                    // Fail if the file doesn't exist.
-                    const access_result = std.c.access(pathZ, std.c.F_OK);
-                    if (access_result != 0) return Status.init(.NOT_FOUND_ERROR);
+                    break :blk std.Io.Dir.openFileAbsolute(io, path, .{
+                        .mode = .read_write,
+                        .allow_directory = false,
+                        .lock = lock_kind,
+                        .lock_nonblocking = options.no_wait,
+                    }) catch |err| return mapOpenErr(err, options.no_wait);
+                } else {
+                    break :blk std.Io.Dir.createFileAbsolute(io, path, .{
+                        .read = true,
+                        .truncate = options.truncate,
+                        .lock = lock_kind,
+                        .lock_nonblocking = options.no_wait,
+                    }) catch |err| return mapOpenErr(err, options.no_wait);
                 }
-                var flags: std.posix.O = .{
-                    .ACCMODE = .RDWR,
-                    .CREAT = true,
-                };
-                if (options.truncate) flags.TRUNC = true;
-                const new_fd = std.posix.openatZ(std.posix.AT.FDCWD, pathZ, flags, 0o644) catch
-                    return Status.init(.SYSTEM_ERROR);
-                break :blk new_fd;
             } else {
-                const new_fd = std.posix.openatZ(std.posix.AT.FDCWD, pathZ, .{ .ACCMODE = .RDONLY }, 0) catch |err| {
-                    return switch (err) {
-                        error.FileNotFound => Status.init(.NOT_FOUND_ERROR),
-                        else => Status.init(.SYSTEM_ERROR),
-                    };
-                };
-                break :blk new_fd;
+                break :blk std.Io.Dir.openFileAbsolute(io, path, .{
+                    .mode = .read_only,
+                    .allow_directory = false,
+                    .lock = lock_kind,
+                    .lock_nonblocking = options.no_wait,
+                }) catch |err| return mapOpenErr(err, options.no_wait);
             }
         };
-        // All error returns below this point must close fd explicitly since
-        // vtable functions return Status (not !Status), so errdefer is not applicable.
 
-        // Determine current logical size via fstat.
-        const file_size: i64 = blk: {
-            var stat_buf: std.c.Stat = undefined;
-            if (std.c.fstat(fd, &stat_buf) != 0) break :blk -1;
-            break :blk @intCast(stat_buf.size);
-        };
-        if (file_size < 0) {
-            _ = std.c.close(fd);
+        const file_size: u64 = file.length(io) catch {
+            file.close(io);
             return Status.init(.SYSTEM_ERROR);
-        }
-
-        // Acquire an OS-level advisory lock unless the caller opted out.
-        // Writable opens use LOCK_EX (exclusive); read-only opens use LOCK_SH (shared).
-        // no_wait=true adds LOCK_NB so the syscall fails immediately on contention.
-        // Blocking flock (no_wait=false) can be interrupted by a signal (EINTR); retry
-        // in that case. LOCK_NB never returns EINTR, so the retry is a no-op for no_wait.
-        // Note: flock is advisory-only — processes that do not call flock can still
-        // access the file. All tkrzw-zig callers must open through this vtable to
-        // participate in the locking protocol.
-        if (!options.no_lock) {
-            const lock_op: c_int = if (writable) std.posix.LOCK.EX else std.posix.LOCK.SH;
-            const nb_flag: c_int = if (options.no_wait) std.posix.LOCK.NB else 0;
-            const flock_err = blk: {
-                while (true) {
-                    const rc = std.c.flock(fd, lock_op | nb_flag);
-                    if (rc == 0) break :blk @as(std.c.E, .SUCCESS);
-                    // Capture errno BEFORE any other syscall can overwrite it.
-                    const err = std.c.errno(rc);
-                    if (err == .INTR and !options.no_wait) continue; // retry on signal
-                    break :blk err;
-                }
-            };
-            if (flock_err != .SUCCESS) {
-                _ = std.c.close(fd);
-                return if (options.no_wait and flock_err == .AGAIN)
-                    Status.init(.INFEASIBLE_ERROR)
-                else
-                    Status.init(.SYSTEM_ERROR);
-            }
-        }
+        };
 
         const path_copy = self.allocator.dupe(u8, path) catch {
-            _ = std.c.close(fd);
+            file.close(io);
             return Status.init(.SYSTEM_ERROR);
         };
 
-        self.fd = fd;
+        self.file = file;
         self.path = path_copy;
         self.writable = writable;
         self.logical_size = @intCast(file_size);
         return Status.init(.SUCCESS);
     }
 
-    fn vtClose(ctx: *anyopaque) Status {
+    fn vtClose(ctx: *anyopaque, io: std.Io) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd != -1) {
-            _ = std.c.close(self.fd);
-            self.fd = -1;
+        if (self.file) |f| {
+            f.close(io);
+            self.file = null;
         }
         if (self.path) |p| {
             self.allocator.free(p);
@@ -250,75 +226,70 @@ pub const StdFile = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn vtRead(ctx: *anyopaque, off: i64, buf: []u8) Status {
+    fn vtRead(ctx: *anyopaque, io: std.Io, off: i64, buf: []u8) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd == -1) return Status.init(.PRECONDITION_ERROR);
-
+        if (self.file == null) return Status.init(.PRECONDITION_ERROR);
         if (buf.len == 0) return Status.init(.SUCCESS);
         if (off < 0) return Status.init(.INVALID_ARGUMENT_ERROR);
 
-        const n = std.c.pread(self.fd, buf.ptr, buf.len, off);
-        if (n < 0) return Status.init(.SYSTEM_ERROR);
-
-        if (@as(usize, @intCast(n)) < buf.len) {
-            return Status.initMsg(.BROKEN_DATA_ERROR, "short read");
-        }
-        return Status.init(.SUCCESS);
+        const n = self.file.?.readPositionalAll(io, buf, @intCast(off)) catch
+            return Status.init(.SYSTEM_ERROR);
+        return if (n < buf.len)
+            Status.initMsg(.BROKEN_DATA_ERROR, "short read")
+        else
+            Status.init(.SUCCESS);
     }
 
-    fn vtWrite(ctx: *anyopaque, off: i64, data: []const u8) Status {
+    fn vtWrite(ctx: *anyopaque, io: std.Io, off: i64, data: []const u8) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd == -1) return Status.init(.PRECONDITION_ERROR);
-
+        if (self.file == null) return Status.init(.PRECONDITION_ERROR);
         if (data.len == 0) return Status.init(.SUCCESS);
         if (off < 0) return Status.init(.INVALID_ARGUMENT_ERROR);
 
-        const n = std.c.pwrite(self.fd, data.ptr, data.len, off);
-        if (n < 0 or @as(usize, @intCast(n)) < data.len) return Status.initMsg(.SYSTEM_ERROR, "short write");
-
+        self.file.?.writePositionalAll(io, data, @intCast(off)) catch
+            return Status.initMsg(.SYSTEM_ERROR, "short write");
         return Status.init(.SUCCESS);
     }
 
-    fn vtAppend(ctx: *anyopaque, data: []const u8, off: ?*i64) Status {
+    fn vtAppend(ctx: *anyopaque, io: std.Io, data: []const u8, off: ?*i64) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd == -1) return Status.init(.PRECONDITION_ERROR);
-
+        if (self.file == null) return Status.init(.PRECONDITION_ERROR);
         if (data.len == 0) {
             if (off) |p| p.* = self.logical_size;
             return Status.init(.SUCCESS);
         }
 
-        // Write at logical end via pwrite (avoids seek/write races).
-        const n = std.c.pwrite(self.fd, data.ptr, data.len, self.logical_size);
-        if (n < 0 or @as(usize, @intCast(n)) < data.len) return Status.initMsg(.SYSTEM_ERROR, "short append write");
+        self.file.?.writePositionalAll(io, data, @intCast(self.logical_size)) catch
+            return Status.initMsg(.SYSTEM_ERROR, "short append write");
 
         if (off) |p| p.* = self.logical_size;
         self.logical_size += @intCast(data.len);
         return Status.init(.SUCCESS);
     }
 
-    fn vtTruncate(ctx: *anyopaque, size: i64) Status {
+    fn vtTruncate(ctx: *anyopaque, io: std.Io, size: i64) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd == -1) return Status.init(.PRECONDITION_ERROR);
+        if (self.file == null) return Status.init(.PRECONDITION_ERROR);
+        if (size < 0) return Status.init(.INVALID_ARGUMENT_ERROR);
 
-        const rc = std.c.ftruncate(self.fd, @intCast(size));
-        if (rc != 0) return Status.init(.SYSTEM_ERROR);
+        self.file.?.setLength(io, @intCast(size)) catch
+            return Status.init(.SYSTEM_ERROR);
         self.logical_size = size;
         return Status.init(.SUCCESS);
     }
 
-    fn vtSynchronize(ctx: *anyopaque, hard: bool) Status {
-        _ = hard;
+    fn vtSynchronize(ctx: *anyopaque, io: std.Io, hard: bool) Status {
+        _ = hard; // std.Io.File.sync is always fsync; no fdatasync distinction
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd == -1) return Status.init(.PRECONDITION_ERROR);
-        const rc = std.c.fsync(self.fd);
-        if (rc != 0) return Status.init(.SYSTEM_ERROR);
+        if (self.file == null) return Status.init(.PRECONDITION_ERROR);
+
+        self.file.?.sync(io) catch return Status.init(.SYSTEM_ERROR);
         return Status.init(.SUCCESS);
     }
 
     fn vtGetSize(ctx: *anyopaque, out: *i64) Status {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        if (self.fd == -1) return Status.init(.PRECONDITION_ERROR);
+        if (self.file == null) return Status.init(.PRECONDITION_ERROR);
         out.* = self.logical_size;
         return Status.init(.SUCCESS);
     }
@@ -337,9 +308,16 @@ pub const StdFile = struct {
 
     fn vtDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *StdFile = @ptrCast(@alignCast(ctx));
-        // Close if still open (best-effort; ignore errors on deinit).
-        if (self.fd != -1) {
-            _ = vtClose(ctx);
+        // Best-effort close on deinit. Cannot call vtClose(std.Io.failing) because
+        // std.Io.failing's fileClose slot calls unreachable. Close the fd directly;
+        // this also releases any advisory flock held on the file.
+        if (self.file) |f| {
+            _ = std.c.close(f.handle);
+            self.file = null;
+        }
+        if (self.path) |p| {
+            self.allocator.free(p);
+            self.path = null;
         }
         allocator.destroy(self);
     }
@@ -419,48 +397,55 @@ pub fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
 // NullFile: noop File implementation for in-memory-only use (e.g., MemIndex)
 // ---------------------------------------------------------------------------
 
-fn nullFileOpen(ctx: *anyopaque, path: []const u8, writable: bool, options: OpenOptions) Status {
+fn nullFileOpen(ctx: *anyopaque, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status {
     _ = ctx;
+    _ = io;
     _ = path;
     _ = writable;
     _ = options;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
 
-fn nullFileClose(ctx: *anyopaque) Status {
+fn nullFileClose(ctx: *anyopaque, io: std.Io) Status {
     _ = ctx;
+    _ = io;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
 
-fn nullFileRead(ctx: *anyopaque, off: i64, buf: []u8) Status {
+fn nullFileRead(ctx: *anyopaque, io: std.Io, off: i64, buf: []u8) Status {
     _ = ctx;
+    _ = io;
     _ = off;
     _ = buf;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
 
-fn nullFileWrite(ctx: *anyopaque, off: i64, data: []const u8) Status {
+fn nullFileWrite(ctx: *anyopaque, io: std.Io, off: i64, data: []const u8) Status {
     _ = ctx;
+    _ = io;
     _ = off;
     _ = data;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
 
-fn nullFileAppend(ctx: *anyopaque, data: []const u8, off: ?*i64) Status {
+fn nullFileAppend(ctx: *anyopaque, io: std.Io, data: []const u8, off: ?*i64) Status {
     _ = ctx;
+    _ = io;
     _ = data;
     _ = off;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
 
-fn nullFileTruncate(ctx: *anyopaque, size: i64) Status {
+fn nullFileTruncate(ctx: *anyopaque, io: std.Io, size: i64) Status {
     _ = ctx;
+    _ = io;
     _ = size;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
 
-fn nullFileSynchronize(ctx: *anyopaque, hard: bool) Status {
+fn nullFileSynchronize(ctx: *anyopaque, io: std.Io, hard: bool) Status {
     _ = ctx;
+    _ = io;
     _ = hard;
     return Status.init(.NOT_IMPLEMENTED_ERROR);
 }
@@ -529,30 +514,30 @@ test "StdFile open/write/read/close round-trip" {
     var f = sf.asFile();
 
     // Open for writing (create).
-    var st = f.open(file_name, true, .{});
+    var st = f.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     // Write some bytes at offset 0.
     const data = "hello, world";
-    st = f.write(0, data);
+    st = f.write(std.testing.io, 0, data);
     try std.testing.expect(st.isOk());
 
     // Close.
-    st = f.close();
+    st = f.close(std.testing.io);
     try std.testing.expect(st.isOk());
 
     // Re-open read-only.
-    st = f.open(file_name, false, .{});
+    st = f.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
     // Read back.
     var buf: [12]u8 = undefined;
-    st = f.read(0, &buf);
+    st = f.read(std.testing.io, 0, &buf);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualStrings(data, &buf);
 
     // Close and destroy.
-    st = f.close();
+    st = f.close(std.testing.io);
     try std.testing.expect(st.isOk());
 
     f.deinit(std.testing.allocator);
@@ -573,16 +558,16 @@ test "StdFile append increases logical size correctly" {
     var f = sf.asFile();
     defer f.deinit(std.testing.allocator);
 
-    var st = f.open(file_name, true, .{});
+    var st = f.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     var off1: i64 = -1;
-    st = f.append("abc", &off1);
+    st = f.append(std.testing.io, "abc", &off1);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 0), off1);
 
     var off2: i64 = -1;
-    st = f.append("de", &off2);
+    st = f.append(std.testing.io, "de", &off2);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 3), off2);
 
@@ -591,7 +576,7 @@ test "StdFile append increases logical size correctly" {
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 5), size);
 
-    _ = f.close();
+    _ = f.close(std.testing.io);
 }
 
 test "renameFile and removeFile" {
@@ -666,16 +651,16 @@ test "StdFile no_lock skips flock" {
     defer f2.deinit(std.testing.allocator);
 
     // f1 acquires LOCK_EX via normal locking.
-    var st = f1.open(file_name, true, .{});
+    var st = f1.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     // f2 uses no_lock=true — must succeed DESPITE f1 holding LOCK_EX.
     // If no_lock were ignored, this would block (deadlock), proving the flag works.
-    st = f2.open(file_name, true, .{ .no_lock = true });
+    st = f2.open(std.testing.io, file_name, true, .{ .no_lock = true });
     try std.testing.expect(st.isOk());
 
-    _ = f1.close();
-    _ = f2.close();
+    _ = f1.close(std.testing.io);
+    _ = f2.close(std.testing.io);
 }
 
 test "StdFile no_wait returns INFEASIBLE_ERROR on contention" {
@@ -698,14 +683,14 @@ test "StdFile no_wait returns INFEASIBLE_ERROR on contention" {
     defer f2.deinit(std.testing.allocator);
 
     // sf1 acquires LOCK_EX and holds it.
-    var st = f1.open(file_name, true, .{});
+    var st = f1.open(std.testing.io, file_name, true, .{});
     try std.testing.expect(st.isOk());
 
     // sf2 attempts LOCK_EX | LOCK_NB on the same file — must fail immediately.
-    st = f2.open(file_name, true, .{ .no_wait = true });
+    st = f2.open(std.testing.io, file_name, true, .{ .no_wait = true });
     try std.testing.expectEqual(StatusCode.INFEASIBLE_ERROR, st.code);
 
-    _ = f1.close();
+    _ = f1.close(std.testing.io);
 }
 
 test "StdFile shared locks coexist" {
@@ -723,9 +708,9 @@ test "StdFile shared locks coexist" {
     {
         const sf_init = try StdFile.create(std.testing.allocator);
         var f_init = sf_init.asFile();
-        const st = f_init.open(file_name, true, .{ .no_lock = true });
+        const st = f_init.open(std.testing.io, file_name, true, .{ .no_lock = true });
         try std.testing.expect(st.isOk());
-        _ = f_init.close();
+        _ = f_init.close(std.testing.io);
         f_init.deinit(std.testing.allocator);
     }
 
@@ -738,12 +723,94 @@ test "StdFile shared locks coexist" {
     defer f2.deinit(std.testing.allocator);
 
     // Both open read-only — LOCK_SH is compatible with another LOCK_SH.
-    var st = f1.open(file_name, false, .{});
+    var st = f1.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
-    st = f2.open(file_name, false, .{});
+    st = f2.open(std.testing.io, file_name, false, .{});
     try std.testing.expect(st.isOk());
 
-    _ = f1.close();
-    _ = f2.close();
+    _ = f1.close(std.testing.io);
+    _ = f2.close(std.testing.io);
+}
+
+test "StdFile no_create on missing file returns NOT_FOUND_ERROR" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.Io.Dir.realPathFileAlloc(tmp.dir, std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}/does_not_exist.bin", .{tmp_path});
+    defer std.testing.allocator.free(missing);
+
+    const sf = try StdFile.create(std.testing.allocator);
+    var f = sf.asFile();
+    defer f.deinit(std.testing.allocator);
+    const st = f.open(std.testing.io, missing, true, .{ .no_create = true });
+    try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, st.code);
+}
+
+test "StdFile no_create on existing file succeeds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.Io.Dir.realPathFileAlloc(tmp.dir, std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const file_name = try std.fmt.allocPrint(std.testing.allocator, "{s}/existing.bin", .{tmp_path});
+    defer std.testing.allocator.free(file_name);
+
+    // Create the file first.
+    {
+        const sf2 = try StdFile.create(std.testing.allocator);
+        var f2 = sf2.asFile();
+        defer f2.deinit(std.testing.allocator);
+        _ = f2.open(std.testing.io, file_name, true, .{});
+        _ = f2.close(std.testing.io);
+    }
+
+    const sf = try StdFile.create(std.testing.allocator);
+    var f = sf.asFile();
+    defer f.deinit(std.testing.allocator);
+    const st = f.open(std.testing.io, file_name, true, .{ .no_create = true });
+    try std.testing.expect(st.isOk());
+    _ = f.close(std.testing.io);
+}
+
+test "StdFile read-only open of missing file returns NOT_FOUND_ERROR" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.Io.Dir.realPathFileAlloc(tmp.dir, std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}/also_missing.bin", .{tmp_path});
+    defer std.testing.allocator.free(missing);
+
+    const sf = try StdFile.create(std.testing.allocator);
+    var f = sf.asFile();
+    defer f.deinit(std.testing.allocator);
+    const st = f.open(std.testing.io, missing, false, .{});
+    try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, st.code);
+}
+
+test "StdFile read beyond EOF returns BROKEN_DATA_ERROR" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try std.Io.Dir.realPathFileAlloc(tmp.dir, std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const file_name = try std.fmt.allocPrint(std.testing.allocator, "{s}/short.bin", .{tmp_path});
+    defer std.testing.allocator.free(file_name);
+
+    {
+        const sf = try StdFile.create(std.testing.allocator);
+        var f = sf.asFile();
+        defer f.deinit(std.testing.allocator);
+        _ = f.open(std.testing.io, file_name, true, .{});
+        _ = f.write(std.testing.io, 0, "hi");
+        _ = f.close(std.testing.io);
+    }
+
+    const sf2 = try StdFile.create(std.testing.allocator);
+    var f2 = sf2.asFile();
+    defer f2.deinit(std.testing.allocator);
+    _ = f2.open(std.testing.io, file_name, false, .{});
+    var buf: [8]u8 = undefined;
+    const st = f2.read(std.testing.io, 0, &buf);
+    try std.testing.expectEqual(lib_common.Code.BROKEN_DATA_ERROR, st.code);
+    _ = f2.close(std.testing.io);
 }

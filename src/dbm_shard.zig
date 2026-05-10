@@ -137,10 +137,6 @@ pub const ShardDBM = struct {
     writable: bool,
     /// True while shards are open.
     is_open: bool,
-    /// Io handle captured at open() time; used by close() and inherited by
-    /// iterator / routing operations added in later waves.
-    io: Io,
-
     /// Returns the shard index for a given key using secondary hash.
     pub fn getShardIndex(self: *const Self, key: []const u8) usize {
         return @intCast(hash_util.secondaryHash(key, self.num_shards));
@@ -158,15 +154,21 @@ pub const ShardDBM = struct {
             .base_path = &[_]u8{},
             .writable = false,
             .is_open = false,
-            .io = undefined,
         };
         return self;
     }
 
-    /// Closes the database if still open and then frees the ShardDBM struct.
-    pub fn deinit(self: *Self) void {
+    /// Frees the ShardDBM struct. Call close(io) before deinit() to flush
+    /// any pending writes; deinit alone skips file I/O cleanup.
+    pub fn deinit(self: *Self, io: std.Io) void {
         if (self.is_open) {
-            _ = self.close();
+            // Free shard resources without I/O (callers should close() first).
+            for (self.shards) |*shard| shard.deinit(io);
+            self.allocator.free(self.shards);
+            self.allocator.free(self.base_path);
+            self.shards = &[_]PolyDBM{};
+            self.base_path = &[_]u8{};
+            self.is_open = false;
         }
         self.allocator.destroy(self);
     }
@@ -187,11 +189,11 @@ pub const ShardDBM = struct {
     ///            a disambiguating suffix that defeats extension parsing).
     pub fn open(
         self: *Self,
+        allocator: std.mem.Allocator,
+        io: Io,
         path: []const u8,
         num_shards: u64,
         writable: bool,
-        io: Io,
-        allocator: std.mem.Allocator,
         options: OpenOptionsPoly,
     ) Status {
         // Intentionally unused: accepted for API symmetry with PolyDBM.open.
@@ -248,7 +250,6 @@ pub const ShardDBM = struct {
         self.num_shards = num_shards;
         self.base_path = base_dup;
         self.writable = writable;
-        self.io = io;
         self.is_open = true;
 
         return Status.init(.SUCCESS);
@@ -256,7 +257,7 @@ pub const ShardDBM = struct {
 
     /// Closes every shard in reverse open-order, merging their Status values,
     /// then releases owned memory and marks the database as not open.
-    pub fn close(self: *Self) Status {
+    pub fn close(self: *Self, io: std.Io) Status {
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
@@ -264,8 +265,8 @@ pub const ShardDBM = struct {
         var i: usize = self.shards.len;
         while (i > 0) {
             i -= 1;
-            status.mergeFrom(self.shards[i].close(self.io));
-            self.shards[i].deinit();
+            status.mergeFrom(self.shards[i].close(io));
+            self.shards[i].deinit(io);
         }
         self.allocator.free(self.shards);
         self.shards = &[_]PolyDBM{};
@@ -285,12 +286,13 @@ pub const ShardDBM = struct {
     /// \param key The key to look up
     /// \param allocator Allocator for the result value
     /// \return The value (caller must free) or error
-    pub fn get(self: *Self, key: []const u8, allocator: std.mem.Allocator) PolyError![]const u8 {
+    pub fn get(self: *Self, allocator: std.mem.Allocator, io: std.Io, key: []const u8) PolyError![]const u8 {
+
         if (!self.is_open) {
             return PolyError.PreconditionError;
         }
         const shard_index = self.getShardIndex(key);
-        return self.shards[shard_index].get(key, allocator);
+        return self.shards[shard_index].get(allocator, io, key);
     }
 
     /// Sets a record.
@@ -299,24 +301,26 @@ pub const ShardDBM = struct {
     /// \param value The value to store
     /// \param overwrite If true, overwrite existing records. If false, return DUPLICATION_ERROR.
     /// \return Status indicating success or failure
-    pub fn set(self: *Self, key: []const u8, value: []const u8, overwrite: bool) Status {
+    pub fn set(self: *Self, io: std.Io, key: []const u8, value: []const u8, overwrite: bool) Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
         const shard_index = self.getShardIndex(key);
-        return self.shards[shard_index].set(key, value, overwrite);
+        return self.shards[shard_index].set(io, key, value, overwrite);
     }
 
     /// Removes a record by key.
     ///
     /// \param key The key to remove
     /// \return Status indicating success or failure
-    pub fn remove(self: *Self, key: []const u8) Status {
+    pub fn remove(self: *Self, io: std.Io, key: []const u8) Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
         const shard_index = self.getShardIndex(key);
-        return self.shards[shard_index].remove(key);
+        return self.shards[shard_index].remove(io, key);
     }
 
     /// Appends data to an existing record.
@@ -325,12 +329,13 @@ pub const ShardDBM = struct {
     /// \param value The value to append
     /// \param delim Delimiter to insert between existing and new value
     /// \return Status indicating success or failure
-    pub fn append(self: *Self, key: []const u8, value: []const u8, delim: []const u8) Status {
+    pub fn append(self: *Self, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
         const shard_index = self.getShardIndex(key);
-        return self.shards[shard_index].append(key, value, delim);
+        return self.shards[shard_index].append(io, key, value, delim);
     }
 
     /// Processes a single record with a custom processor.
@@ -339,12 +344,13 @@ pub const ShardDBM = struct {
     /// \param proc The processor to use
     /// \param writable Whether to allow writes
     /// \return Status indicating success or failure
-    pub fn process(self: *Self, comptime P: type, key: []const u8, proc: *P, writable: bool) Status {
+    pub fn process(self: *Self, io: std.Io, comptime P: type, key: []const u8, proc: *P, writable: bool) Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
         const shard_index = self.getShardIndex(key);
-        return self.shards[shard_index].process(P, key, proc, writable);
+        return self.shards[shard_index].process(io, P, key, proc, writable);
     }
 
     // ---------------------------------------------------------------------------
@@ -354,13 +360,13 @@ pub const ShardDBM = struct {
     /// Returns the total number of records across all shards.
     ///
     /// \return Total record count
-    pub fn count(self: *Self) i64 {
+    pub fn count(self: *Self, io: std.Io) i64 {
         if (!self.is_open) {
             return 0;
         }
         var total: i64 = 0;
         for (self.shards) |*shard| {
-            total += shard.count();
+            total += shard.count(io);
         }
         return total;
     }
@@ -393,6 +399,7 @@ pub const ShardDBM = struct {
     /// \return Status indicating success or failure
     pub fn compareExchangeMulti(
         self: *Self,
+        io: std.Io,
         expected: []const CompareExpectedItem,
         desired: []const CompareDesiredItem,
     ) Status {
@@ -415,7 +422,7 @@ pub const ShardDBM = struct {
             // leaving `current_value` dangling before the condition check below.
             // Free at end of the outer iteration instead.
             var current_value: ?[]const u8 = null;
-            if (shard.get(exp.key, self.allocator)) |val| {
+            if (shard.get(self.allocator, io, exp.key)) |val| {
                 current_value = val;
             } else |err| {
                 if (err != PolyError.NotFound) {
@@ -456,13 +463,13 @@ pub const ShardDBM = struct {
 
             switch (des.value) {
                 .remove => {
-                    overall_status.mergeFrom(shard.remove(des.key));
+                    overall_status.mergeFrom(shard.remove(io, des.key));
                 },
                 .noop => {
                     // Do nothing
                 },
                 .set => |new_val| {
-                    overall_status.mergeFrom(shard.set(des.key, new_val, true));
+                    overall_status.mergeFrom(shard.set(io, des.key, new_val, true));
                 },
             }
 
@@ -479,7 +486,8 @@ pub const ShardDBM = struct {
     /// \param proc The processor to use
     /// \param writable Whether to allow writes
     /// \return Status indicating success or failure
-    pub fn processEach(self: *Self, comptime P: type, proc: *P, writable: bool) !Status {
+    pub fn processEach(self: *Self, io: std.Io, comptime P: type, proc: *P, writable: bool) !Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
@@ -504,7 +512,7 @@ pub const ShardDBM = struct {
 
         // Process each shard
         for (self.shards) |*shard| {
-            _ = try shard.processEach(ProxyProcessor, &proxy, writable);
+            _ = try shard.processEach(io, ProxyProcessor, &proxy, writable);
         }
 
         // Post-loop sentinel
@@ -600,13 +608,14 @@ pub const ShardDBM = struct {
     /// \param hard If true, performs a hard sync (fsync). If false, performs a soft sync.
     /// \param io Io handle for file operations
     /// \return Status indicating success or failure
-    pub fn synchronize(self: *Self, hard: bool, io: Io) Status {
+    pub fn synchronize(self: *Self, io: Io, hard: bool) Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
         var status = Status.init(.SUCCESS);
         for (self.shards) |*shard| {
-            status.mergeFrom(shard.synchronize(hard, io));
+            status.mergeFrom(shard.synchronize(io, hard));
         }
         return status;
     }
@@ -632,7 +641,8 @@ pub const ShardDBM = struct {
     /// \param sync_hard If true, performs a hard sync after copying
     /// \param io Io handle for file operations
     /// \return Status indicating success or failure
-    pub fn copyFileData(self: *Self, dest_path: []const u8, sync_hard: bool, io: Io) Status {
+    pub fn copyFileData(self: *Self, io: Io, dest_path: []const u8, sync_hard: bool) Status {
+
         if (!self.is_open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened database");
         }
@@ -666,7 +676,7 @@ pub const ShardDBM = struct {
             defer self.allocator.free(dest_shard_path);
 
             // Copy file
-            const copy_status = shard.copyFileData(dest_shard_path, sync_hard, io);
+            const copy_status = shard.copyFileData(io, dest_shard_path, sync_hard);
             status.mergeFrom(copy_status);
         }
 
@@ -682,7 +692,8 @@ pub const ShardDBM = struct {
     /// \param path The base path to scan
     /// \param io Io handle for file operations
     /// \return Number of shards, or error
-    pub fn getNumberOfShards(path: []const u8, io: Io) !u64 {
+    pub fn getNumberOfShards(path: []const u8, io: std.Io) !u64 {
+
         return detectExistingNumShards(io, path) catch |err| switch (err) {
             ScanError.NoneFound => return 0,
             ScanError.Duplication => return error.DuplicationError,
@@ -696,7 +707,8 @@ pub const ShardDBM = struct {
     /// \param new_path The destination base path
     /// \param io Io handle for file operations
     /// \return Status indicating success or failure
-    pub fn restoreDatabase(old_path: []const u8, new_path: []const u8, io: Io) Status {
+    pub fn restoreDatabase(old_path: []const u8, new_path: []const u8, io: std.Io) Status {
+
         // Get number of shards from old location
         const num_shards = getNumberOfShards(old_path, io) catch {
             return Status.init(.SYSTEM_ERROR);
@@ -735,7 +747,7 @@ pub const ShardDBM = struct {
             defer temp_allocator.free(new_shard_path);
 
             // Use PolyDBM to restore each shard
-            const restore_status = PolyDBM.restoreDatabase(old_shard_path, new_shard_path, io);
+            const restore_status = PolyDBM.restoreDatabase(io, old_shard_path, new_shard_path);
             status.mergeFrom(restore_status);
         }
 
@@ -748,7 +760,8 @@ pub const ShardDBM = struct {
     /// \param new_path The destination base path
     /// \param io Io handle for file operations
     /// \return Status indicating success or failure
-    pub fn renameDatabase(old_path: []const u8, new_path: []const u8, io: Io) Status {
+    pub fn renameDatabase(old_path: []const u8, new_path: []const u8, io: std.Io) Status {
+
         // Get number of shards from old location
         const num_shards = getNumberOfShards(old_path, io) catch {
             return Status.init(.SYSTEM_ERROR);
@@ -787,7 +800,7 @@ pub const ShardDBM = struct {
             defer temp_allocator.free(new_shard_path);
 
             // Rename the file
-            std.Io.Dir.rename(.cwd(), old_shard_path, .cwd(), new_shard_path, io) catch {
+            std.Io.Dir.rename(io, .cwd(), old_shard_path, .cwd(), new_shard_path) catch {
                 status.mergeFrom(Status.init(.SYSTEM_ERROR));
             };
         }
@@ -800,19 +813,19 @@ pub const ShardDBM = struct {
     ///
     /// \param allocator Allocator for the iterator
     /// \return ShardCursor instance
-    pub fn makeCursor(self: *Self, allocator: std.mem.Allocator) !ShardCursor {
-        return self.iterator(allocator);
+    pub fn makeCursor(self: *Self, allocator: std.mem.Allocator, io: std.Io) !ShardCursor {
+        return self.iterator(allocator, io);
     }
     
-    pub fn iterator(self: *Self, allocator: std.mem.Allocator) !ShardCursor {
-        return ShardCursor.init(self, allocator);
+    pub fn iterator(self: *Self, allocator: std.mem.Allocator, io: std.Io) !ShardCursor {
+        return ShardCursor.init(self, allocator, io);
     }
 
     /// Return a Zig-style iterator positioned at the first record.
     /// The caller must call deinit() when done.
-    pub fn iterate(self: *Self, alloc: std.mem.Allocator) !ShardIterator {
-        var cursor = try self.iterator(alloc);
-        errdefer cursor.deinit();
+    pub fn iterate(self: *Self, alloc: std.mem.Allocator, io: std.Io) !ShardIterator {
+        var cursor = try self.iterator(alloc, io);
+        errdefer cursor.deinit(io);
         var iter = ShardIterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -820,7 +833,8 @@ pub const ShardDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
+        
         return iter;
     }
 
@@ -829,9 +843,11 @@ pub const ShardDBM = struct {
     /// for API compatibility but ordered positioning is not supported —
     /// iteration always starts from the global minimum. Use an ordered backend
     /// (e.g. BabyDBM/TreeDBM via PolyDBM) if you need ordered iterateFrom.
-    pub fn iterateFrom(self: *Self, _: []const u8, alloc: std.mem.Allocator) !ShardIterator {
-        return self.iterate(alloc);
+    pub fn iterateFrom(self: *Self, alloc: std.mem.Allocator, io: std.Io, _: []const u8) !ShardIterator {
+
+        return self.iterate(alloc, io);
     }
+
 };
 
 // ---------------------------------------------------------------------------
@@ -858,14 +874,14 @@ const ShardSlot = struct {
     }
 
     /// Deinitializes the slot, freeing key/value and the iterator.
-    fn deinit(self: *Self) void {
+    fn deinit(self: *Self, io: std.Io) void {
         if (self.key.len > 0) {
             self.allocator.free(self.key);
         }
         if (self.value.len > 0) {
             self.allocator.free(self.value);
         }
-        self.iter.deinit();
+        self.iter.deinit(io);
     }
 };
 
@@ -880,7 +896,7 @@ pub const ShardCursor = struct {
     allocator: std.mem.Allocator,
 
     /// Initializes a ShardCursor for the given ShardDBM.
-    fn init(db: *ShardDBM, allocator: std.mem.Allocator) !Self {
+    fn init(db: *ShardDBM, allocator: std.mem.Allocator, io: std.Io) !Self {
         if (!db.is_open) {
             return error.PreconditionError;
         }
@@ -904,13 +920,13 @@ pub const ShardCursor = struct {
         const slots = try allocator.alloc(ShardSlot, db.shards.len);
         for (db.shards, 0..) |*shard_ptr, i| {
             slots[i] = ShardSlot.init(allocator);
-            slots[i].iter = try dbm_poly_mod.PolyCursor.init(shard_ptr);
+            slots[i].iter = try dbm_poly_mod.PolyCursor.init(shard_ptr, io);
         }
         errdefer {
             // Clean up already-initialized slots on failure
             var i: usize = 0;
             while (i < slots.len) : (i += 1) {
-                slots[i].deinit();
+                slots[i].deinit(io);
             }
             allocator.free(slots);
         }
@@ -927,16 +943,16 @@ pub const ShardCursor = struct {
     }
 
     /// Deinitializes the iterator, freeing all resources.
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: std.Io) void {
         for (self.slots) |*slot| {
-            slot.deinit();
+            slot.deinit(io);
         }
         self.allocator.free(self.slots);
         self.allocator.free(self.heap);
     }
 
     /// Moves to the first record across all shards (global minimum).
-    pub fn first(self: *Self) Status {
+    pub fn first(self: *Self, io: std.Io) Status {
         // Clear any existing heap
         if (self.heap.len > 0) {
             self.allocator.free(self.heap);
@@ -946,7 +962,7 @@ pub const ShardCursor = struct {
         // Initialize each shard iterator and build heap
         for (self.slots, 0..) |*slot, i| {
             // Move to first record in this shard
-            const status = slot.iter.first();
+            const status = slot.iter.first(io);
             if (!status.isOk()) {
                 if (status.code == .NOT_FOUND_ERROR) {
                     // Empty shard, skip it
@@ -963,7 +979,7 @@ pub const ShardCursor = struct {
                 value_list.deinit(self.allocator);
             }
 
-            const get_status = slot.iter.get(self.allocator, &key_list, &value_list);
+            const get_status = slot.iter.get(self.allocator, io, &key_list, &value_list);
             if (!get_status.isOk()) {
                 return get_status;
             }
@@ -992,7 +1008,7 @@ pub const ShardCursor = struct {
     }
 
     /// Moves to the next record in sorted order.
-    pub fn next(self: *Self) Status {
+    pub fn next(self: *Self, io: std.Io) Status {
         if (self.heap.len == 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
@@ -1002,7 +1018,7 @@ pub const ShardCursor = struct {
         const min_slot_ptr = &self.slots[min_slot_index];
 
         // Move to next record in that shard
-        const status = min_slot_ptr.iter.next();
+        const status = min_slot_ptr.iter.next(io);
         if (!status.isOk()) {
             if (status.code == .NOT_FOUND_ERROR) {
                 // This shard is exhausted: remove it from the heap.
@@ -1027,7 +1043,7 @@ pub const ShardCursor = struct {
             value_list.deinit(self.allocator);
         }
 
-        const get_status = min_slot_ptr.iter.get(self.allocator, &key_list, &value_list);
+        const get_status = min_slot_ptr.iter.get(self.allocator, io, &key_list, &value_list);
         if (!get_status.isOk()) {
             return get_status;
         }
@@ -1075,7 +1091,8 @@ pub const ShardCursor = struct {
     }
 
     /// Sets the current record's value.
-    pub fn set(self: *Self, value: []const u8, old_key: ?*[]u8, old_value: ?*[]u8) Status {
+    pub fn set(self: *Self, io: std.Io, value: []const u8, old_key: ?*[]u8, old_value: ?*[]u8) Status {
+
         if (self.heap.len == 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
@@ -1094,7 +1111,7 @@ pub const ShardCursor = struct {
         }
 
         // Delegate to the shard iterator (without old_key/old_value since we handled them above)
-        const status = min_slot_ptr.iter.set(value, null, null);
+        const status = min_slot_ptr.iter.set(io, value, null, null);
         if (!status.isOk()) return status;
 
         // Refresh the slot's cached value so a subsequent get() returns the
@@ -1109,7 +1126,8 @@ pub const ShardCursor = struct {
     }
 
     /// Removes the current record.
-    pub fn remove(self: *Self, old_key: ?*[]u8, old_value: ?*[]u8) Status {
+    pub fn remove(self: *Self, io: std.Io, old_key: ?*[]u8, old_value: ?*[]u8) Status {
+
         if (self.heap.len == 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
@@ -1128,14 +1146,14 @@ pub const ShardCursor = struct {
         }
 
         // Delegate to the shard iterator (without old_key/old_value since we handled them above)
-        const status = min_slot_ptr.iter.remove(null, null);
+        const status = min_slot_ptr.iter.remove(io, null, null);
 
         if (status.isOk()) {
             // After removal, advance to next record in this shard
             self.popHeap();
 
             // Try to get next record from this shard
-            const next_status = min_slot_ptr.iter.next();
+            const next_status = min_slot_ptr.iter.next(io);
             if (next_status.isOk()) {
                 // Get new key/value
                 var key_list: std.ArrayList(u8) = .empty;
@@ -1145,7 +1163,7 @@ pub const ShardCursor = struct {
                     value_list.deinit(self.allocator);
                 }
 
-                const get_status = min_slot_ptr.iter.get(self.allocator, &key_list, &value_list);
+                const get_status = min_slot_ptr.iter.get(self.allocator, io, &key_list, &value_list);
                 if (get_status.isOk()) {
                     // Update slot and reinsert into heap
                     if (min_slot_ptr.key.len > 0) {
@@ -1166,14 +1184,16 @@ pub const ShardCursor = struct {
     }
 
     /// Processes the current record with a custom processor.
-    pub fn process(comptime P: type, self: *Self, proc: *P, writable: bool) Status {
+    pub fn process(comptime P: type, self: *Self, io: std.Io, proc: *P, writable: bool) Status {
+
+
         if (self.heap.len == 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
 
         const min_slot_index = self.heap[0];
         const min_slot_ptr = &self.slots[min_slot_index];
-        return min_slot_ptr.iter.process(P, proc, writable);
+        return min_slot_ptr.iter.process(io, proc, writable);
     }
 
     /// Pushes a slot index onto the heap, maintaining heap property.
@@ -1300,7 +1320,7 @@ fn openAllShards(
     base_path: []const u8,
     num_shards: u64,
     shard_opts: OpenOptionsPoly,
-    io: Io,
+    io: std.Io,
     shards_buf: []PolyDBM,
 ) !void {
     var opened: usize = 0;
@@ -1309,7 +1329,7 @@ fn openAllShards(
         while (j > 0) {
             j -= 1;
             _ = shards_buf[j].close(io);
-            shards_buf[j].deinit();
+            shards_buf[j].deinit(io);
         }
     }
     while (opened < num_shards) : (opened += 1) {
@@ -1340,7 +1360,7 @@ pub const ShardIterator = struct {
     const Self = @This();
 
     /// Advance and return the current entry, or null when exhausted.
-    pub fn next(self: *Self) !?Entry {
+    pub fn next(self: *Self, io: std.Io) !?Entry {
         if (self.done) return null;
 
         // Fill internal buffers from the current cursor position.
@@ -1362,7 +1382,8 @@ pub const ShardIterator = struct {
         try self.value_buf.appendSlice(self.alloc, val_ptr);
 
         // Advance cursor
-        if (!self.cursor.next().isOk()) self.done = true;
+        if (!self.cursor.next(io).isOk()) self.done = true;
+        
 
         return Entry{
             .key = self.key_buf.items,
@@ -1370,10 +1391,10 @@ pub const ShardIterator = struct {
         };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, io: std.Io) void {
         self.key_buf.deinit(self.alloc);
         self.value_buf.deinit(self.alloc);
-        self.cursor.deinit();
+        self.cursor.deinit(io);
     }
 };
 
@@ -1412,9 +1433,9 @@ test "ShardDBM open with 4 shards creates N files" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const status = db.open(base_path, 4, true, io, allocator, .{});
+    const status = db.open(allocator, io, base_path, 4, true, .{});
     try testing.expect(status.isOk());
     try testing.expectEqual(@as(u64, 4), db.num_shards);
     try testing.expectEqual(true, db.is_open);
@@ -1429,7 +1450,7 @@ test "ShardDBM open with 4 shards creates N files" {
         try std.Io.Dir.cwd().access(io, shard_path, .{});
     }
 
-    const cstatus = db.close();
+    const cstatus = db.close(std.testing.io);
     try testing.expect(cstatus.isOk());
     try testing.expectEqual(false, db.is_open);
     try testing.expectEqual(@as(usize, 0), db.shards.len);
@@ -1454,18 +1475,18 @@ test "ShardDBM open existing DB with wrong num_shards returns DUPLICATION_ERROR"
     // Create a database with 4 shards, then close it.
     {
         const db = try ShardDBM.init(allocator);
-        defer db.deinit();
-        const s = db.open(base_path, 4, true, io, allocator, .{});
+        defer db.deinit(io);
+        const s = db.open(allocator, io, base_path, 4, true, .{});
         try testing.expect(s.isOk());
-        const cs = db.close();
+        const cs = db.close(std.testing.io);
         try testing.expect(cs.isOk());
     }
 
     // Re-opening with a different num_shards must fail.
     {
         const db = try ShardDBM.init(allocator);
-        defer db.deinit();
-        const s = db.open(base_path, 8, true, io, allocator, .{});
+        defer db.deinit(io);
+        const s = db.open(allocator, io, base_path, 8, true, .{});
         try testing.expectEqual(Code.DUPLICATION_ERROR, s.code);
         try testing.expectEqual(false, db.is_open);
     }
@@ -1473,11 +1494,11 @@ test "ShardDBM open existing DB with wrong num_shards returns DUPLICATION_ERROR"
     // Re-opening with the correct num_shards succeeds.
     {
         const db = try ShardDBM.init(allocator);
-        defer db.deinit();
-        const s = db.open(base_path, 4, true, io, allocator, .{});
+        defer db.deinit(io);
+        const s = db.open(allocator, io, base_path, 4, true, .{});
         try testing.expect(s.isOk());
         try testing.expectEqual(@as(u64, 4), db.num_shards);
-        const cs = db.close();
+        const cs = db.close(std.testing.io);
         try testing.expect(cs.isOk());
     }
 }
@@ -1498,21 +1519,21 @@ test "ShardDBM close releases state and rejects double close" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 3, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 3, true, .{});
     try testing.expect(s.isOk());
     try testing.expectEqual(true, db.is_open);
     try testing.expectEqual(@as(usize, 3), db.shards.len);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
     try testing.expectEqual(false, db.is_open);
     try testing.expectEqual(@as(usize, 0), db.shards.len);
     try testing.expectEqual(@as(u64, 0), db.num_shards);
 
     // Second close must report precondition error.
-    const cs2 = db.close();
+    const cs2 = db.close(std.testing.io);
     try testing.expectEqual(Code.PRECONDITION_ERROR, cs2.code);
 }
 
@@ -1536,9 +1557,9 @@ test "ShardDBM getShardIndex routes correctly" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 4, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 4, true, .{});
     try testing.expect(s.isOk());
 
     // Test that keys route to expected shards
@@ -1552,7 +1573,7 @@ test "ShardDBM getShardIndex routes correctly" {
     try testing.expect(shard2 < 4);
     try testing.expect(shard3 < 4);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1572,9 +1593,9 @@ test "ShardDBM get/set/remove route to correct shard" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 3, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 3, true, .{});
     try testing.expect(s.isOk());
 
     // Set some values
@@ -1583,35 +1604,35 @@ test "ShardDBM get/set/remove route to correct shard" {
     const key2 = "test_key_2";
     const val2 = "test_value_2";
 
-    const set1 = db.set(key1, val1, false);
+    const set1 = db.set(std.testing.io, key1, val1, false);
     try testing.expect(set1.isOk());
 
-    const set2 = db.set(key2, val2, false);
+    const set2 = db.set(std.testing.io, key2, val2, false);
     try testing.expect(set2.isOk());
 
     // Get values back
-    const got1 = try db.get(key1, allocator);
+    const got1 = try db.get(allocator, std.testing.io, key1);
     defer allocator.free(got1);
     try testing.expectEqualStrings(val1, got1);
 
-    const got2 = try db.get(key2, allocator);
+    const got2 = try db.get(allocator, std.testing.io, key2);
     defer allocator.free(got2);
     try testing.expectEqualStrings(val2, got2);
 
     // Remove one key
-    const rem = db.remove(key1);
+    const rem = db.remove(std.testing.io, key1);
     try testing.expect(rem.isOk());
 
     // Verify it's gone
-    const get_removed = db.get(key1, allocator);
+    const get_removed = db.get(allocator, std.testing.io, key1);
     try testing.expectError(PolyError.NotFound, get_removed);
 
     // Verify other key still exists
-    const got2_again = try db.get(key2, allocator);
+    const got2_again = try db.get(allocator, std.testing.io, key2);
     defer allocator.free(got2_again);
     try testing.expectEqualStrings(val2, got2_again);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1631,23 +1652,23 @@ test "ShardDBM count sums all shards" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add records to different shards
     const key1 = "key_for_shard_0";
     const key2 = "key_for_shard_1";
 
-    try testing.expect(db.set(key1, "value1", false).isOk());
-    try testing.expect(db.set(key2, "value2", false).isOk());
+    try testing.expect(db.set(std.testing.io, key1, "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, key2, "value2", false).isOk());
 
     // Count should be 2
-    const total = db.count();
+    const total = db.count(io);
     try testing.expectEqual(@as(i64, 2), total);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1667,17 +1688,17 @@ test "ShardDBM clear clears all shards" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add records to different shards
-    try testing.expect(db.set("key1", "value1", false).isOk());
-    try testing.expect(db.set("key2", "value2", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key2", "value2", false).isOk());
 
     // Verify they exist
-    const count_before = db.count();
+    const count_before = db.count(io);
     try testing.expect(count_before > 0);
 
     // Clear all shards
@@ -1685,10 +1706,10 @@ test "ShardDBM clear clears all shards" {
     try testing.expect(clear_status.isOk());
 
     // Count should be 0
-    const count_after = db.count();
+    const count_after = db.count(io);
     try testing.expectEqual(@as(i64, 0), count_after);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1709,9 +1730,9 @@ test "ShardDBM clear clears all shards" {
 //     defer allocator.free(base_path);
 //
 //     const db = try ShardDBM.init(allocator);
-//     defer db.deinit();
+//     defer db.deinit(io);
 //
-//     const s = db.open(base_path, 3, true, io, allocator, .{});
+//     const s = db.open(allocator, io, base_path, 3, true, .{});
 //     try testing.expect(s.isOk());
 //
 //     // Set up some test data
@@ -1770,14 +1791,14 @@ test "ShardDBM compareExchangeMulti basic functionality" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Set up initial data
-    try testing.expect(db.set("key1", "value1", false).isOk());
-    try testing.expect(db.set("key2", "value2", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key2", "value2", false).isOk());
 
     // Test successful compare-exchange
     var expected = [_]CompareExpectedItem{
@@ -1790,19 +1811,19 @@ test "ShardDBM compareExchangeMulti basic functionality" {
         .{ .key = "key2", .value = .{ .set = "new_value2" } },
     };
 
-    const status = db.compareExchangeMulti(&expected, &desired);
+    const status = db.compareExchangeMulti(std.testing.io, &expected, &desired);
     try testing.expect(status.isOk());
 
     // Verify changes were applied
-    const got1 = try db.get("key1", allocator);
+    const got1 = try db.get(allocator, std.testing.io, "key1");
     defer allocator.free(got1);
     try testing.expectEqualStrings("new_value1", got1);
 
-    const got2 = try db.get("key2", allocator);
+    const got2 = try db.get(allocator, std.testing.io, "key2");
     defer allocator.free(got2);
     try testing.expectEqualStrings("new_value2", got2);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1822,13 +1843,13 @@ test "ShardDBM compareExchangeMulti fails on condition mismatch" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Set up initial data
-    try testing.expect(db.set("key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
 
     // Test failed compare-exchange (wrong expected value)
     var expected = [_]CompareExpectedItem{
@@ -1839,15 +1860,15 @@ test "ShardDBM compareExchangeMulti fails on condition mismatch" {
         .{ .key = "key1", .value = .{ .set = "new_value" } },
     };
 
-    const status = db.compareExchangeMulti(&expected, &desired);
+    const status = db.compareExchangeMulti(std.testing.io, &expected, &desired);
     try testing.expectEqual(Code.INFEASIBLE_ERROR, status.code);
 
     // Verify original value is unchanged
-    const got1 = try db.get("key1", allocator);
+    const got1 = try db.get(allocator, std.testing.io, "key1");
     defer allocator.free(got1);
     try testing.expectEqualStrings("value1", got1);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1867,15 +1888,15 @@ test "ShardDBM processEach iterates all records" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Set up test data
-    try testing.expect(db.set("key1", "value1", false).isOk());
-    try testing.expect(db.set("key2", "value2", false).isOk());
-    try testing.expect(db.set("key3", "value3", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key2", "value2", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key3", "value3", false).isOk());
 
     // Create a counting processor
     var count: i32 = 0;
@@ -1898,12 +1919,12 @@ test "ShardDBM processEach iterates all records" {
     var counter = CounterProcessor{ .count = &count };
 
     // Process all records
-    _ = try db.processEach(CounterProcessor, &counter, false);
+    _ = try db.processEach(std.testing.io, CounterProcessor, &counter, false);
 
     // Should have processed 3 records
     try testing.expectEqual(3, count);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -1927,18 +1948,18 @@ test "ShardDBM isOpen returns correct state" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
     // Should be false before open
     try testing.expectEqual(false, db.isOpen());
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Should be true after open
     try testing.expectEqual(true, db.isOpen());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 
     // Should be false after close
@@ -1963,26 +1984,26 @@ test "ShardDBM isWritable returns correct mode" {
     // Test writable mode
     {
         const db = try ShardDBM.init(allocator);
-        defer db.deinit();
+        defer db.deinit(io);
 
-        const s = db.open(base_path, 2, true, io, allocator, .{});
+        const s = db.open(allocator, io, base_path, 2, true, .{});
         try testing.expect(s.isOk());
         try testing.expectEqual(true, db.isWritable());
 
-        const cs = db.close();
+        const cs = db.close(std.testing.io);
         try testing.expect(cs.isOk());
     }
 
     // Test read-only mode
     {
         const db = try ShardDBM.init(allocator);
-        defer db.deinit();
+        defer db.deinit(io);
 
-        const s = db.open(base_path, 2, false, io, allocator, .{});
+        const s = db.open(allocator, io, base_path, 2, false, .{});
         try testing.expect(s.isOk());
         try testing.expectEqual(false, db.isWritable());
 
-        const cs = db.close();
+        const cs = db.close(std.testing.io);
         try testing.expect(cs.isOk());
     }
 }
@@ -2003,15 +2024,15 @@ test "ShardDBM isHealthy returns true for healthy shards" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Should be healthy after open
     try testing.expectEqual(true, db.isHealthy());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2031,20 +2052,20 @@ test "ShardDBM getFileSize sums all shard sizes" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add some data
-    try testing.expect(db.set("key1", "value1", false).isOk());
-    try testing.expect(db.set("key2", "value2", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key2", "value2", false).isOk());
 
     // Get file size - should be greater than 0
     const file_size = db.getFileSize();
     try testing.expect(file_size > 0);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2064,15 +2085,15 @@ test "ShardDBM getFilePath returns base path" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Should return the base path
     try testing.expectEqualStrings(base_path, db.getFilePath());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2092,16 +2113,16 @@ test "ShardDBM getTimestamp returns shard 0 timestamp" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Should return a timestamp (should be > 0)
     const timestamp = db.getTimestamp();
     try testing.expect(timestamp > 0.0);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2121,15 +2142,15 @@ test "ShardDBM shouldBeRebuilt returns false for new database" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Should not need rebuild for new database
     try testing.expectEqual(false, db.shouldBeRebuilt());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2153,19 +2174,19 @@ test "ShardDBM synchronize calls all shards" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add some data
-    try testing.expect(db.set("key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
 
     // Synchronize should succeed
-    const sync_status = db.synchronize(false, io);
+    const sync_status = db.synchronize(io, false);
     try testing.expect(sync_status.isOk());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2185,19 +2206,19 @@ test "ShardDBM rebuild calls all shards" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add some data
-    try testing.expect(db.set("key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
 
     // Rebuild should succeed
     const rebuild_status = db.rebuild(io);
     try testing.expect(rebuild_status.isOk());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2226,22 +2247,22 @@ test "ShardCursor basic functionality" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add some test data
-    try testing.expect(db.set("key1", "value1", false).isOk());
-    try testing.expect(db.set("key2", "value2", false).isOk());
-    try testing.expect(db.set("key3", "value3", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key1", "value1", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key2", "value2", false).isOk());
+    try testing.expect(db.set(std.testing.io, "key3", "value3", false).isOk());
 
     // Create iterator
-    var iter = try db.iterator(allocator);
-    defer iter.deinit();
+    var iter = try db.iterator(allocator, io);
+    defer iter.deinit(io);
 
     // Test first()
-    const first_status = iter.first();
+    const first_status = iter.first(std.testing.io);
     try testing.expect(first_status.isOk());
 
     // Test get() — initialize out-params to empty so test cleanup is safe
@@ -2258,10 +2279,10 @@ test "ShardCursor basic functionality" {
     try testing.expect(value.len > 0);
 
     // Test next()
-    const next_status = iter.next();
+    const next_status = iter.next(std.testing.io);
     try testing.expect(next_status.isOk());
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2281,17 +2302,17 @@ test "ShardCursor handles empty database" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Create iterator on empty database
-    var iter = try db.iterator(allocator);
-    defer iter.deinit();
+    var iter = try db.iterator(allocator, io);
+    defer iter.deinit(io);
 
     // first() should succeed but heap should be empty
-    const first_status = iter.first();
+    const first_status = iter.first(std.testing.io);
     try testing.expect(first_status.isOk());
 
     // get() should return NOT_FOUND_ERROR (no allocation on error path)
@@ -2300,7 +2321,7 @@ test "ShardCursor handles empty database" {
     const get_status = iter.get(&key, &value);
     try testing.expectEqual(Code.NOT_FOUND_ERROR, get_status.code);
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2320,26 +2341,26 @@ test "ShardCursor get/set/remove operations" {
     defer allocator.free(base_path);
 
     const db = try ShardDBM.init(allocator);
-    defer db.deinit();
+    defer db.deinit(io);
 
-    const s = db.open(base_path, 2, true, io, allocator, .{});
+    const s = db.open(allocator, io, base_path, 2, true, .{});
     try testing.expect(s.isOk());
 
     // Add test data
-    try testing.expect(db.set("test_key", "original_value", false).isOk());
+    try testing.expect(db.set(std.testing.io, "test_key", "original_value", false).isOk());
 
     // Create iterator
-    var iter = try db.iterator(allocator);
-    defer iter.deinit();
+    var iter = try db.iterator(allocator, io);
+    defer iter.deinit(io);
 
-    const first_status = iter.first();
+    const first_status = iter.first(std.testing.io);
     try testing.expect(first_status.isOk());
 
     // Test set() operation — out-params are newly allocated by set()
     {
         var old_key: []u8 = &[_]u8{};
         var old_value: []u8 = &[_]u8{};
-        const set_status = iter.set("new_value", &old_key, &old_value);
+        const set_status = iter.set(std.testing.io, "new_value", &old_key, &old_value);
         defer allocator.free(old_key);
         defer allocator.free(old_value);
         try testing.expect(set_status.isOk());
@@ -2362,7 +2383,7 @@ test "ShardCursor get/set/remove operations" {
     {
         var old_key: []u8 = &[_]u8{};
         var old_value: []u8 = &[_]u8{};
-        const remove_status = iter.remove(&old_key, &old_value);
+        const remove_status = iter.remove(std.testing.io, &old_key, &old_value);
         defer allocator.free(old_key);
         defer allocator.free(old_value);
         try testing.expect(remove_status.isOk());
@@ -2377,7 +2398,7 @@ test "ShardCursor get/set/remove operations" {
         // get() only allocates k/v on SUCCESS; nothing to free.
     }
 
-    const cs = db.close();
+    const cs = db.close(std.testing.io);
     try testing.expect(cs.isOk());
 }
 
@@ -2403,10 +2424,10 @@ test "ShardDBM getNumberOfShards detects existing shards" {
     // Create a database with 3 shards
     {
         const db = try ShardDBM.init(allocator);
-        defer db.deinit();
-        const s = db.open(base_path, 3, true, io, allocator, .{});
+        defer db.deinit(io);
+        const s = db.open(allocator, io, base_path, 3, true, .{});
         try testing.expect(s.isOk());
-        const cs = db.close();
+        const cs = db.close(std.testing.io);
         try testing.expect(cs.isOk());
     }
 
@@ -2448,18 +2469,18 @@ test "ShardDBM.iterate() visits all records" {
     defer alloc.free(base_path);
 
     const db = try ShardDBM.init(alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(base_path, 2, true, io, alloc, .{}).isOk());
+    defer db.deinit(io);
+    try std.testing.expect(db.open(alloc, io, base_path, 2, true, .{}).isOk());
 
-    _ = db.set("a", "1", false);
-    _ = db.set("b", "2", false);
-    _ = db.set("c", "3", false);
+    _ = db.set(std.testing.io, "a", "1", false);
+    _ = db.set(std.testing.io, "b", "2", false);
+    _ = db.set(std.testing.io, "c", "3", false);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(io);
 
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         _ = entry.key;
         _ = entry.value;
         count += 1;
@@ -2479,14 +2500,14 @@ test "ShardDBM.iterate() empty database" {
     defer alloc.free(base_path);
 
     const db = try ShardDBM.init(alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(base_path, 2, true, io, alloc, .{}).isOk());
+    defer db.deinit(io);
+    try std.testing.expect(db.open(alloc, io, base_path, 2, true, .{}).isOk());
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(io);
 
-    try std.testing.expect(try iter.next() == null);
-    try std.testing.expect(try iter.next() == null);
+    try std.testing.expect(try iter.next(std.testing.io) == null);
+    try std.testing.expect(try iter.next(std.testing.io) == null);
 }
 
 test "ShardDBM.iterate() lifetime contract" {
@@ -2501,21 +2522,21 @@ test "ShardDBM.iterate() lifetime contract" {
     defer alloc.free(base_path);
 
     const db = try ShardDBM.init(alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(base_path, 2, true, io, alloc, .{}).isOk());
+    defer db.deinit(io);
+    try std.testing.expect(db.open(alloc, io, base_path, 2, true, .{}).isOk());
 
-    _ = db.set("p", "v1", false);
-    _ = db.set("q", "v2", false);
+    _ = db.set(std.testing.io, "p", "v1", false);
+    _ = db.set(std.testing.io, "q", "v2", false);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(io);
 
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try std.testing.expect(first != null);
     // Copy before calling next() — demonstrates lifetime contract.
     const key_copy = try alloc.dupe(u8, first.?.key);
     defer alloc.free(key_copy);
-    _ = try iter.next();
+    _ = try iter.next(std.testing.io);
     try std.testing.expect(key_copy.len > 0);
 }
 

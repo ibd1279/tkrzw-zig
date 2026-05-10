@@ -8,7 +8,7 @@
 //   - For random-order inserts, RecordSorter buffers in-memory entries, flushes
 //     to tmp files, then merges all sources (existing skip records, flat tmp files)
 //     via a priority-queue heap during finishStorage.
-//   - Thread safety: SpinSharedMutex protects file access; atomics for record_count.
+//   - Thread safety: std.Io.RwLock protects file access; atomics for record_count.
 //   - File header (128 bytes): magic, version, params, metadata, dirty-close markers.
 
 const std = @import("std");
@@ -33,7 +33,6 @@ pub const StdFile = file_mod.StdFile;
 pub const FlatRecord = file_util.FlatRecord;
 pub const FlatRecordReader = file_util.FlatRecordReader;
 pub const RecordType = file_util.RecordType;
-pub const SpinSharedMutex = thread_util.SpinSharedMutex;
 
 // ---------------------------------------------------------------------------
 // Constants (Phase 1)
@@ -120,7 +119,7 @@ fn computeLevel(index: i64, step_unit: u8, max_level: u8) u8 {
     return level;
 }
 
-fn saveMetadata(impl: *SkipDBMImpl, file: File, finish: bool) Status {
+fn saveMetadata(impl: *SkipDBMImpl, io: std.Io, file: File, finish: bool) Status {
     impl.cyclic_magic +%= 1;
 
     var buf: [METADATA_SIZE]u8 = undefined;
@@ -156,13 +155,13 @@ fn saveMetadata(impl: *SkipDBMImpl, file: File, finish: bool) Status {
 
     buf[127] = impl.cyclic_magic;
 
-    const status = file.write(0, &buf);
+    const status = file.write(io, 0, &buf);
     return status;
 }
 
-fn loadMetadata(impl: *SkipDBMImpl, file: File) Status {
+fn loadMetadata(impl: *SkipDBMImpl, io: std.Io, file: File) Status {
     var buf: [METADATA_SIZE]u8 = undefined;
-    const read_status = file.read(0, &buf);
+    const read_status = file.read(io, 0, &buf);
     if (!read_status.isOk()) {
         return read_status;
     }
@@ -280,7 +279,7 @@ const SkipRecord = struct {
         self.whole_size = 1 + self.offset_width * self.level + key_size_varint + value_size_varint + key.len + value.len;
     }
 
-    fn write(self: *SkipRecord) Status {
+    fn write(self: *SkipRecord, io: std.Io) Status {
         var stack_buf: [4096]u8 = undefined;
         const write_buf = if (self.whole_size <= 4096)
             stack_buf[0..self.whole_size]
@@ -311,14 +310,14 @@ const SkipRecord = struct {
         offset += self.value_size;
 
         var append_offset: i64 = 0;
-        if (!self.file.append(write_buf, &append_offset).isOk()) {
+        if (!self.file.append(io, write_buf, &append_offset).isOk()) {
             return Status.init(.SYSTEM_ERROR);
         }
         self.offset = append_offset;
         return Status.init(.SUCCESS);
     }
 
-    fn readMetadataKey(self: *SkipRecord, offset: i64, index: i64) Status {
+    fn readMetadataKey(self: *SkipRecord, io: std.Io, offset: i64, index: i64) Status {
         self.level = computeLevel(index, self.step_unit, self.max_level);
         self.index = index;
         self.offset = offset;
@@ -336,7 +335,7 @@ const SkipRecord = struct {
             return Status.init(.BROKEN_DATA_ERROR);
         }
 
-        const read_status = self.file.read(offset, self.buf[0..record_size]);
+        const read_status = self.file.read(io, offset, self.buf[0..record_size]);
         if (!read_status.isOk()) {
             return read_status;
         }
@@ -400,7 +399,7 @@ const SkipRecord = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn readBody(self: *SkipRecord) Status {
+    fn readBody(self: *SkipRecord, io: std.Io) Status {
         const needed_size = self.key_size + self.value_size;
 
         if (self.body_buf != null and self.body_buf.?.len >= needed_size) {
@@ -415,7 +414,7 @@ const SkipRecord = struct {
             self.body_buf = buf_alloc;
         }
 
-        const read_status = self.file.read(self.body_offset, self.body_buf.?);
+        const read_status = self.file.read(io, self.body_offset, self.body_buf.?);
         if (!read_status.isOk()) {
             return read_status;
         }
@@ -426,7 +425,7 @@ const SkipRecord = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn updatePastRecords(self: *SkipRecord, _index: i64, rec_offset: i64, past_offsets: *[MAX_MAX_LEVEL]i64) Status {
+    fn updatePastRecords(self: *SkipRecord, io: std.Io, _index: i64, rec_offset: i64, past_offsets: *[MAX_MAX_LEVEL]i64) Status {
         var past_index_diff: i64 = 1;
         for (0..self.level) |i| {
             past_index_diff *= @as(i64, self.step_unit);
@@ -448,7 +447,7 @@ const SkipRecord = struct {
             _ = str_util.intToStrBigEndian(@as(u64, @intCast(rec_offset)), self.offset_width, &patch_buf);
 
             const write_offset = past_offset + 1 + @as(i64, @intCast(i)) * @as(i64, self.offset_width);
-            const write_status = self.file.write(write_offset, patch_buf[0..self.offset_width]);
+            const write_status = self.file.write(io, write_offset, patch_buf[0..self.offset_width]);
             if (!write_status.isOk()) {
                 return write_status;
             }
@@ -628,7 +627,7 @@ const SkipRecord = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn search(self: *SkipRecord, record_base: i64, cache: ?*SkipRecordCache, key: []const u8, upper: bool) Status {
+    fn search(self: *SkipRecord, io: std.Io, record_base: i64, cache: ?*SkipRecordCache, key: []const u8, upper: bool) Status {
         var offset = record_base;
         var cur_idx: i64 = 0;
         var end_offset = self.file.getSizeSimple();
@@ -640,10 +639,10 @@ const SkipRecord = struct {
                 if (c.prepare(cur_idx, self)) {
                     load_status = Status.init(.SUCCESS);
                 } else {
-                    load_status = self.readMetadataKey(offset, cur_idx);
+                    load_status = self.readMetadataKey(io, offset, cur_idx);
                 }
             } else {
-                load_status = self.readMetadataKey(offset, cur_idx);
+                load_status = self.readMetadataKey(io, offset, cur_idx);
             }
 
             if (!load_status.isOk()) {
@@ -651,7 +650,7 @@ const SkipRecord = struct {
             }
 
             if (self.key_ptr.len == 0) {
-                const body_status = self.readBody();
+                const body_status = self.readBody(io);
                 if (!body_status.isOk()) {
                     return body_status;
                 }
@@ -678,14 +677,14 @@ const SkipRecord = struct {
                     var next_rec = SkipRecord.init(self.file, self.offset_width, self.step_unit, self.max_level, self.allocator);
                     defer next_rec.deinit();
 
-                    const next_status = next_rec.readMetadataKey(next_off, cur_idx + powI64(@as(i64, self.step_unit), @as(u8, @intCast(lv_u + 1))));
+                    const next_status = next_rec.readMetadataKey(io, next_off, cur_idx + powI64(@as(i64, self.step_unit), @as(u8, @intCast(lv_u + 1))));
                     if (!next_status.isOk()) {
                         lv -= 1;
                         continue;
                     }
 
                     if (next_rec.key_ptr.len == 0) {
-                        const body_status = next_rec.readBody();
+                        const body_status = next_rec.readBody(io);
                         if (!body_status.isOk()) {
                             lv -= 1;
                             continue;
@@ -714,7 +713,7 @@ const SkipRecord = struct {
         }
 
         if (upper and offset < self.file.getSizeSimple()) {
-            const load_status = self.readMetadataKey(offset, cur_idx);
+            const load_status = self.readMetadataKey(io, offset, cur_idx);
             if (load_status.isOk()) {
                 return Status.init(.SUCCESS);
             }
@@ -724,7 +723,7 @@ const SkipRecord = struct {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
-    fn searchByIndex(self: *SkipRecord, record_base: i64, cache: ?*SkipRecordCache, target_index: i64) Status {
+    fn searchByIndex(self: *SkipRecord, io: std.Io, record_base: i64, cache: ?*SkipRecordCache, target_index: i64) Status {
         var offset = record_base;
         var cur_idx: i64 = 0;
         var end_offset = self.file.getSizeSimple();
@@ -736,10 +735,10 @@ const SkipRecord = struct {
                 if (c.prepare(cur_idx, self)) {
                     load_status = Status.init(.SUCCESS);
                 } else {
-                    load_status = self.readMetadataKey(offset, cur_idx);
+                    load_status = self.readMetadataKey(io, offset, cur_idx);
                 }
             } else {
-                load_status = self.readMetadataKey(offset, cur_idx);
+                load_status = self.readMetadataKey(io, offset, cur_idx);
             }
 
             if (!load_status.isOk()) {
@@ -771,7 +770,7 @@ const SkipRecord = struct {
             }
         }
 
-        return self.readMetadataKey(offset, cur_idx);
+        return self.readMetadataKey(io, offset, cur_idx);
     }
 };
 
@@ -930,7 +929,7 @@ const RecordSorter = struct {
         return self;
     }
 
-    fn deinit(self: *RecordSorter) void {
+    fn deinit(self: *RecordSorter, io: std.Io) void {
         const allocator = self.allocator;
 
         for (self.current_entries.items) |entry| {
@@ -954,7 +953,7 @@ const RecordSorter = struct {
         self.slots.deinit(allocator);
 
         for (self.tmp_file_owners.items) |file| {
-            _ = file.close();
+            _ = file.close(io);
         }
         self.tmp_file_owners.deinit(allocator);
 
@@ -968,7 +967,7 @@ const RecordSorter = struct {
         allocator.destroy(self);
     }
 
-    fn add(self: *RecordSorter, key: []const u8, value: []const u8) !void {
+    fn add(self: *RecordSorter, io: std.Io, key: []const u8, value: []const u8) !void {
         const key_dup = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_dup);
 
@@ -983,11 +982,11 @@ const RecordSorter = struct {
         self.current_mem_size += @as(i64, @intCast(key.len + value.len + REC_MEM_FOOT));
 
         if (self.current_mem_size >= self.max_mem_size) {
-            try self.flush();
+            try self.flush(io);
         }
     }
 
-    fn flush(self: *RecordSorter) !void {
+    fn flush(self: *RecordSorter, io: std.Io) !void {
         if (self.current_entries.items.len == 0) {
             return;
         }
@@ -1003,11 +1002,11 @@ const RecordSorter = struct {
 
         const std_file_ptr = try StdFile.create(self.allocator);
         const tmp_file = std_file_ptr.asFile();
-        errdefer _ = tmp_file.close();
+        errdefer _ = tmp_file.close(io);
 
-        const open_status = tmp_file.open(tmp_path_owned, true, .{ .truncate = true, .no_lock = true }); // process-private temp file
+        const open_status = tmp_file.open(io, tmp_path_owned, true, .{ .truncate = true, .no_lock = true }); // process-private temp file
         if (!open_status.isOk()) {
-            _ = tmp_file.close();
+            _ = tmp_file.close(io);
             self.allocator.destroy(std_file_ptr);
             self.allocator.free(tmp_path_owned);
             return error.OutOfMemory;
@@ -1018,13 +1017,13 @@ const RecordSorter = struct {
 
         for (self.current_entries.items) |entry| {
             var flat_key: FlatRecord = .{ .file = tmp_file, .allocator = self.allocator };
-            const key_status = flat_key.write(entry.key, .normal);
+            const key_status = flat_key.write(io, entry.key, .normal);
             if (!key_status.isOk()) {
                 return error.WriteFailed;
             }
 
             var flat_value: FlatRecord = .{ .file = tmp_file, .allocator = self.allocator };
-            const value_status = flat_value.write(entry.value, .normal);
+            const value_status = flat_value.write(io, entry.value, .normal);
             if (!value_status.isOk()) {
                 return error.WriteFailed;
             }
@@ -1038,17 +1037,17 @@ const RecordSorter = struct {
         self.current_mem_size = 0;
     }
 
-    fn addSkipRecord(self: *RecordSorter, rec: *SkipRecord, record_base: i64) !void {
+    fn addSkipRecord(self: *RecordSorter, io: std.Io, rec: *SkipRecord, record_base: i64) !void {
         // Store skip record source for merge; will be processed in finish()
         // Note: rec is a temporary stack object; we extract its data and file reference
 
         // Read first record to initialize the slot
-        const meta_status = rec.readMetadataKey(record_base, 0);
+        const meta_status = rec.readMetadataKey(io, record_base, 0);
         if (!meta_status.isOk()) {
             return;
         }
 
-        const body_status = rec.readBody();
+        const body_status = rec.readBody(io);
         if (!body_status.isOk()) {
             return;
         }
@@ -1072,8 +1071,8 @@ const RecordSorter = struct {
         try self.slots.append(self.allocator, slot);
     }
 
-    fn finish(self: *RecordSorter) !void {
-        try self.flush();
+    fn finish(self: *RecordSorter, io: std.Io) !void {
+        try self.flush(io);
 
         // Build the merge heap from all sources
         var id_counter: usize = 0;
@@ -1094,7 +1093,7 @@ const RecordSorter = struct {
 
             // Read first key record
             var first_key: []const u8 = undefined;
-            var read_status = reader.read(&first_key, null);
+            var read_status = reader.read(io, &first_key, null);
             if (!read_status.isOk()) {
                 reader.deinit();
                 continue;
@@ -1102,7 +1101,7 @@ const RecordSorter = struct {
 
             // Read first value record
             var first_value: []const u8 = undefined;
-            read_status = reader.read(&first_value, null);
+            read_status = reader.read(io, &first_value, null);
             if (!read_status.isOk()) {
                 reader.deinit();
                 self.allocator.free(first_key);
@@ -1133,7 +1132,7 @@ const RecordSorter = struct {
         self.finished = true;
     }
 
-    fn get(self: *RecordSorter, key_out: *[]u8, value_out: *[]u8) !void {
+    fn get(self: *RecordSorter, io: std.Io, key_out: *[]u8, value_out: *[]u8) !void {
         if (self.heap.count() == 0) {
             return error.NotFound;
         }
@@ -1147,11 +1146,11 @@ const RecordSorter = struct {
 
         if (slot.flat_reader) |reader| {
             var next_data: []const u8 = undefined;
-            const read_status = reader.read(&next_data, null);
+            const read_status = reader.read(io, &next_data, null);
             if (read_status.isOk()) {
                 const new_key = try self.allocator.dupe(u8, next_data);
                 var value_data: []const u8 = undefined;
-                const value_status = reader.read(&value_data, null);
+                const value_status = reader.read(io, &value_data, null);
                 if (value_status.isOk()) {
                     // Overwrite slot fields in-place, then push the same pointer back.
                     slot.key = new_key;
@@ -1164,9 +1163,9 @@ const RecordSorter = struct {
         } else if (slot.skip_record) |rec| {
             if (slot.offset < slot.end_offset) {
                 // Read the next record in-place. rec IS slot.skip_record — mutated in-place.
-                const meta_status = rec.readMetadataKey(slot.offset, rec.index + 1);
+                const meta_status = rec.readMetadataKey(io, slot.offset, rec.index + 1);
                 if (meta_status.isOk()) {
-                    const body_status = rec.readBody();
+                    const body_status = rec.readBody(io);
                     if (body_status.isOk()) {
                         const new_key = try self.allocator.dupe(u8, rec.key_ptr);
                         const new_value = if (rec.value_ptr) |vp|
@@ -1209,7 +1208,7 @@ const SkipDBMIteratorImpl = struct {
     record_size: usize,
     allocator: std.mem.Allocator,
 
-    fn init(dbm: *SkipDBMImpl, allocator: std.mem.Allocator) !*SkipDBMIteratorImpl {
+    fn init(dbm: *SkipDBMImpl, io: std.Io, allocator: std.mem.Allocator) !*SkipDBMIteratorImpl {
         const self = try allocator.create(SkipDBMIteratorImpl);
         self.* = .{
             .dbm = dbm,
@@ -1219,18 +1218,20 @@ const SkipDBMIteratorImpl = struct {
             .allocator = allocator,
         };
 
-        dbm.mutex.lock();
-        defer dbm.mutex.unlock();
-        try dbm.iterators.append(allocator, self);
+        dbm.mutex.lockUncancelable(io);
+        dbm.iterators.append(allocator, self) catch {
+            dbm.mutex.unlock(io);
+            return error.OutOfMemory;
+        };
+        dbm.mutex.unlock(io);
 
         return self;
     }
 
-    fn deinit(self: *SkipDBMIteratorImpl) void {
+    fn deinit(self: *SkipDBMIteratorImpl, io: std.Io) void {
         if (self.dbm) |dbm| {
-            dbm.mutex.lock();
-            defer dbm.mutex.unlock();
-
+            dbm.mutex.lockUncancelable(io);
+            defer dbm.mutex.unlock(io);
             for (dbm.iterators.items, 0..) |iter, i| {
                 if (iter == self) {
                     _ = dbm.iterators.orderedRemove(i);
@@ -1264,7 +1265,7 @@ const SkipDBMIteratorImpl = struct {
         }
     }
 
-    fn last(self: *SkipDBMIteratorImpl) Status {
+    fn last(self: *SkipDBMIteratorImpl, io: std.Io) Status {
         if (self.dbm == null or !self.dbm.?.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         }
@@ -1276,7 +1277,7 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
         defer rec.deinit();
 
-        const status = rec.searchByIndex(METADATA_SIZE, self.dbm.?.cache, self.dbm.?.num_records - 1);
+        const status = rec.searchByIndex(io, METADATA_SIZE, self.dbm.?.cache, self.dbm.?.num_records - 1);
         if (!status.isOk()) {
             return status;
         }
@@ -1288,7 +1289,7 @@ const SkipDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn jump(self: *SkipDBMIteratorImpl, key: []const u8) Status {
+    fn jump(self: *SkipDBMIteratorImpl, io: std.Io, key: []const u8) Status {
         if (self.dbm == null or !self.dbm.?.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         }
@@ -1296,7 +1297,7 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
         defer rec.deinit();
 
-        const status = rec.search(METADATA_SIZE, self.dbm.?.cache, key, true);
+        const status = rec.search(io, METADATA_SIZE, self.dbm.?.cache, key, true);
         if (status.isOk()) {
             self.record_offset = rec.offset;
             self.record_index = rec.index;
@@ -1309,7 +1310,7 @@ const SkipDBMIteratorImpl = struct {
         return status;
     }
 
-    fn jumpLower(self: *SkipDBMIteratorImpl, key: []const u8, inclusive: bool) Status {
+    fn jumpLower(self: *SkipDBMIteratorImpl, io: std.Io, key: []const u8, inclusive: bool) Status {
         if (self.dbm == null or !self.dbm.?.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         }
@@ -1317,45 +1318,51 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
         defer rec.deinit();
 
-        const status = rec.search(METADATA_SIZE, self.dbm.?.cache, key, true);
+        const status = rec.search(io, METADATA_SIZE, self.dbm.?.cache, key, true);
         if (!status.isOk()) {
             return status;
         }
 
-        if (inclusive and std.mem.eql(u8, rec.key_ptr, key)) {
-            self.record_offset = rec.offset;
-            self.record_index = rec.index;
-            self.record_size = 0;
-            return Status.init(.SUCCESS);
-        }
-
-        return self.previous();
-    }
-
-    fn jumpUpper(self: *SkipDBMIteratorImpl, key: []const u8, inclusive: bool) Status {
-        if (self.dbm == null or !self.dbm.?.open) {
-            return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        }
-
-        var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
-        defer rec.deinit();
-
-        const status = rec.search(METADATA_SIZE, self.dbm.?.cache, key, true);
-        if (!status.isOk()) {
-            return status;
-        }
-
-        if (!inclusive and std.mem.eql(u8, rec.key_ptr, key)) {
-            return self.next();
-        }
-
+        // Always set iterator position to the found record first.
+        // previous() uses self.record_index to step back one position.
         self.record_offset = rec.offset;
         self.record_index = rec.index;
         self.record_size = 0;
+
+        if (inclusive and std.mem.eql(u8, rec.key_ptr, key)) {
+            return Status.init(.SUCCESS);
+        }
+
+        return self.previous(io);
+    }
+
+    fn jumpUpper(self: *SkipDBMIteratorImpl, io: std.Io, key: []const u8, inclusive: bool) Status {
+        if (self.dbm == null or !self.dbm.?.open) {
+            return Status.initMsg(.PRECONDITION_ERROR, "not opened");
+        }
+
+        var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
+        defer rec.deinit();
+
+        const status = rec.search(io, METADATA_SIZE, self.dbm.?.cache, key, true);
+        if (!status.isOk()) {
+            return status;
+        }
+
+        // Always set iterator position to the found record first.
+        // next() uses self.record_offset / self.record_index to advance.
+        self.record_offset = rec.offset;
+        self.record_index = rec.index;
+        self.record_size = 0;
+
+        if (!inclusive and std.mem.eql(u8, rec.key_ptr, key)) {
+            return self.next(io);
+        }
+
         return Status.init(.SUCCESS);
     }
 
-    fn next(self: *SkipDBMIteratorImpl) Status {
+    fn next(self: *SkipDBMIteratorImpl, io: std.Io) Status {
         if (self.record_offset < 0 or self.record_index < 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
@@ -1364,7 +1371,7 @@ const SkipDBMIteratorImpl = struct {
             var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
             defer rec.deinit();
 
-            const status = rec.readMetadataKey(self.record_offset, self.record_index);
+            const status = rec.readMetadataKey(io, self.record_offset, self.record_index);
             if (!status.isOk()) {
                 return status;
             }
@@ -1385,7 +1392,7 @@ const SkipDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn previous(self: *SkipDBMIteratorImpl) Status {
+    fn previous(self: *SkipDBMIteratorImpl, io: std.Io) Status {
         if (self.record_index <= 0) {
             self.record_offset = -1;
             self.record_index = -1;
@@ -1395,7 +1402,7 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
         defer rec.deinit();
 
-        const status = rec.searchByIndex(METADATA_SIZE, self.dbm.?.cache, self.record_index - 1);
+        const status = rec.searchByIndex(io, METADATA_SIZE, self.dbm.?.cache, self.record_index - 1);
         if (!status.isOk()) {
             return status;
         }
@@ -1407,7 +1414,7 @@ const SkipDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn get(self: *SkipDBMIteratorImpl, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+    fn get(self: *SkipDBMIteratorImpl, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
         if (self.record_offset < 0 or self.record_index < 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
@@ -1415,12 +1422,12 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(self.dbm.?.file, self.dbm.?.offset_width, self.dbm.?.step_unit, self.dbm.?.max_level, self.allocator);
         defer rec.deinit();
 
-        var status = rec.readMetadataKey(self.record_offset, self.record_index);
+        var status = rec.readMetadataKey(io, self.record_offset, self.record_index);
         if (!status.isOk()) {
             return status;
         }
 
-        status = rec.readBody();
+        status = rec.readBody(io);
         if (!status.isOk()) {
             return status;
         }
@@ -1444,7 +1451,7 @@ const SkipDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn process(self: *SkipDBMIteratorImpl, comptime P: type, proc: *P, writable: bool) Status {
+    fn process(self: *SkipDBMIteratorImpl, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
         const dbm = self.dbm.?;
         if (self.record_offset < 0 or self.record_offset >= dbm.file.getSizeSimple()) {
             return Status.init(.NOT_FOUND_ERROR);
@@ -1453,11 +1460,11 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(dbm.file, dbm.offset_width, dbm.step_unit, dbm.max_level, self.allocator);
         defer rec.deinit();
 
-        var status = rec.readMetadataKey(self.record_offset, self.record_index);
+        var status = rec.readMetadataKey(io, self.record_offset, self.record_index);
         if (!status.isOk()) return status;
 
         if (rec.value_ptr == null) {
-            status = rec.readBody();
+            status = rec.readBody(io);
             if (!status.isOk()) return status;
         }
 
@@ -1471,12 +1478,12 @@ const SkipDBMIteratorImpl = struct {
             switch (action) {
                 .noop => {},
                 .set => |new_value| {
-                    const update_status = updateRecordImpl(dbm, key, new_value);
+                    const update_status = updateRecordImpl(dbm, io, key, new_value);
                     if (!update_status.isOk()) return update_status;
                     if (dbm.update_logger) |ul| _ = ul.writeSet(key, new_value);
                 },
                 .remove => {
-                    const update_status = updateRecordImpl(dbm, key, REMOVING_VALUE);
+                    const update_status = updateRecordImpl(dbm, io, key, REMOVING_VALUE);
                     if (!update_status.isOk()) return update_status;
                     if (dbm.update_logger) |ul| _ = ul.writeRemove(key);
                     self.record_offset += @as(i64, @intCast(self.record_size));
@@ -1489,7 +1496,7 @@ const SkipDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn iterSet(self: *SkipDBMIteratorImpl, value: []const u8, old_key_out: ?*std.ArrayList(u8), old_value_out: ?*std.ArrayList(u8)) Status {
+    fn iterSet(self: *SkipDBMIteratorImpl, io: std.Io, value: []const u8, old_key_out: ?*std.ArrayList(u8), old_value_out: ?*std.ArrayList(u8)) Status {
         const dbm = self.dbm.?;
         if (self.record_offset < 0 or self.record_offset >= dbm.file.getSizeSimple()) {
             return Status.init(.NOT_FOUND_ERROR);
@@ -1498,11 +1505,11 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(dbm.file, dbm.offset_width, dbm.step_unit, dbm.max_level, self.allocator);
         defer rec.deinit();
 
-        var status = rec.readMetadataKey(self.record_offset, self.record_index);
+        var status = rec.readMetadataKey(io, self.record_offset, self.record_index);
         if (!status.isOk()) return status;
 
         if (old_key_out != null or old_value_out != null) {
-            status = rec.readBody();
+            status = rec.readBody(io);
             if (!status.isOk()) return status;
         }
 
@@ -1516,18 +1523,18 @@ const SkipDBMIteratorImpl = struct {
         }
 
         const key = if (rec.key_ptr.len > 0) rec.key_ptr else blk: {
-            status = rec.readBody();
+            status = rec.readBody(io);
             if (!status.isOk()) return status;
             break :blk rec.key_ptr;
         };
 
-        const update_status = updateRecordImpl(dbm, key, value);
+        const update_status = updateRecordImpl(dbm, io, key, value);
         if (!update_status.isOk()) return update_status;
         if (dbm.update_logger) |ul| _ = ul.writeSet(key, value);
         return Status.init(.SUCCESS);
     }
 
-    fn iterRemove(self: *SkipDBMIteratorImpl, old_key_out: ?*std.ArrayList(u8), old_value_out: ?*std.ArrayList(u8)) Status {
+    fn iterRemove(self: *SkipDBMIteratorImpl, io: std.Io, old_key_out: ?*std.ArrayList(u8), old_value_out: ?*std.ArrayList(u8)) Status {
         const dbm = self.dbm.?;
         if (self.record_offset < 0 or self.record_offset >= dbm.file.getSizeSimple()) {
             return Status.init(.NOT_FOUND_ERROR);
@@ -1536,11 +1543,11 @@ const SkipDBMIteratorImpl = struct {
         var rec = SkipRecord.init(dbm.file, dbm.offset_width, dbm.step_unit, dbm.max_level, self.allocator);
         defer rec.deinit();
 
-        var status = rec.readMetadataKey(self.record_offset, self.record_index);
+        var status = rec.readMetadataKey(io, self.record_offset, self.record_index);
         if (!status.isOk()) return status;
 
         if (old_key_out != null or old_value_out != null) {
-            status = rec.readBody();
+            status = rec.readBody(io);
             if (!status.isOk()) return status;
         }
 
@@ -1554,14 +1561,14 @@ const SkipDBMIteratorImpl = struct {
         }
 
         const key = if (rec.key_ptr.len > 0) rec.key_ptr else blk: {
-            status = rec.readBody();
+            status = rec.readBody(io);
             if (!status.isOk()) return status;
             break :blk rec.key_ptr;
         };
 
         self.record_size = rec.whole_size;
 
-        const update_status = updateRecordImpl(dbm, key, REMOVING_VALUE);
+        const update_status = updateRecordImpl(dbm, io, key, REMOVING_VALUE);
         if (!update_status.isOk()) return update_status;
         if (dbm.update_logger) |ul| _ = ul.writeRemove(key);
         self.record_offset += @as(i64, @intCast(self.record_size));
@@ -1610,7 +1617,7 @@ const SkipDBMImpl = struct {
     old_num_records: i64,
     old_eff_data_size: i64,
     iterators: std.ArrayListUnmanaged(*SkipDBMIteratorImpl) = .empty,
-    mutex: SpinSharedMutex = .{},
+    mutex: std.Io.RwLock = .init,
     update_logger: ?*UpdateLogger,
     allocator: std.mem.Allocator,
 };
@@ -1619,9 +1626,9 @@ const SkipDBMImpl = struct {
 // SkipDBMImpl Helper Functions (Phases 7-9)
 // ---------------------------------------------------------------------------
 
-fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, options: OpenOptions, params: TuningParameters, io: std.Io) Status {
-    impl.mutex.lock();
-    defer impl.mutex.unlock();
+fn openAdvancedImpl(impl: *SkipDBMImpl, io: std.Io, path: []const u8, writable: bool, options: OpenOptions, params: TuningParameters) Status {
+    impl.mutex.lockUncancelable(io);
+    defer impl.mutex.unlock(io);
 
     if (impl.open) {
         return Status.initMsg(.PRECONDITION_ERROR, "already open");
@@ -1639,7 +1646,7 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
         return Status.init(.SYSTEM_ERROR);
     };
 
-    const open_status = impl.file.open(path, writable, options);
+    const open_status = impl.file.open(io, path, writable, options);
     if (!open_status.isOk()) {
         return open_status;
     }
@@ -1656,22 +1663,22 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
         impl.num_records = 0;
         impl.eff_data_size = 0;
 
-        const truncate_status = impl.file.truncate(@as(i64, METADATA_SIZE));
+        const truncate_status = impl.file.truncate(io, @as(i64, METADATA_SIZE));
         if (!truncate_status.isOk()) {
-            _ = impl.file.close();
+            _ = impl.file.close(io);
             return truncate_status;
         }
 
-        const save_status = saveMetadata(impl, impl.file, true);
+        const save_status = saveMetadata(impl, io, impl.file, true);
         if (!save_status.isOk()) {
-            _ = impl.file.close();
+            _ = impl.file.close(io);
             return save_status;
         }
     }
 
-    const load_status = loadMetadata(impl, impl.file);
+    const load_status = loadMetadata(impl, io, impl.file);
     if (!load_status.isOk()) {
-        _ = impl.file.close();
+        _ = impl.file.close(io);
         return load_status;
     }
 
@@ -1693,7 +1700,7 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
                 impl.healthy = false;
             } else {
                 var padding_buf: [1048576]u8 = undefined;
-                const read_status = impl.file.read(padding_start, padding_buf[0..@as(usize, @intCast(padding_len))]);
+                const read_status = impl.file.read(io, padding_start, padding_buf[0..@as(usize, @intCast(padding_len))]);
                 if (read_status.isOk()) {
                     for (padding_buf[0..@as(usize, @intCast(padding_len))]) |byte| {
                         if (byte != 0) {
@@ -1705,7 +1712,7 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
             }
 
             if (impl.healthy) {
-                const trunc_status = impl.file.truncate(actual_size);
+                const trunc_status = impl.file.truncate(io, actual_size);
                 if (!trunc_status.isOk()) {
                     impl.healthy = false;
                 }
@@ -1716,18 +1723,18 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
     if (!impl.healthy and writable and params.restore_mode != @intFromEnum(RestoreMode.restore_read_only) and params.restore_mode != @intFromEnum(RestoreMode.restore_noop)) {
         var restore_path_buf: [512]u8 = undefined;
         const restore_path = std.fmt.bufPrint(&restore_path_buf, "{s}.tmp.restore", .{path}) catch {
-            _ = impl.file.close();
+            _ = impl.file.close(io);
             return Status.init(.SYSTEM_ERROR);
         };
 
-        const restore_status = restoreDatabaseImpl(path, restore_path, impl.allocator, io);
+        const restore_status = restoreDatabaseImpl( impl.allocator, io,path, restore_path);
         if (restore_status.isOk()) {
             const rename_status = file_mod.renameFile(restore_path, path);
             if (rename_status.isOk()) {
-                _ = impl.file.close();
-                const reopen_status = impl.file.open(path, writable, options);
+                _ = impl.file.close(io);
+                const reopen_status = impl.file.open(io, path, writable, options);
                 if (reopen_status.isOk()) {
-                    const reload_status = loadMetadata(impl, impl.file);
+                    const reload_status = loadMetadata(impl, io, impl.file);
                     if (reload_status.isOk()) {
                         impl.healthy = true;
                         impl.auto_restored = true;
@@ -1738,15 +1745,15 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
     }
 
     if (impl.healthy and writable) {
-        const save_status = saveMetadata(impl, impl.file, false);
+        const save_status = saveMetadata(impl, io, impl.file, false);
         if (!save_status.isOk()) {
             impl.healthy = false;
         }
     }
 
-    const prep_status = prepareStorageImpl(impl);
+    const prep_status = prepareStorageImpl(impl, io);
     if (!prep_status.isOk()) {
-        _ = impl.file.close();
+        _ = impl.file.close(io);
         return prep_status;
     }
 
@@ -1761,8 +1768,8 @@ fn openAdvancedImpl(impl: *SkipDBMImpl, path: []const u8, writable: bool, option
 }
 
 fn closeImplImpl(impl: *SkipDBMImpl, io: std.Io) Status {
-    impl.mutex.lock();
-    defer impl.mutex.unlock();
+    impl.mutex.lockUncancelable(io);
+    defer impl.mutex.unlock(io);
 
     if (!impl.open) {
         return Status.initMsg(.PRECONDITION_ERROR, "not opened");
@@ -1772,22 +1779,22 @@ fn closeImplImpl(impl: *SkipDBMImpl, io: std.Io) Status {
 
     if (impl.writable and impl.healthy) {
         if (impl.updated) {
-            const finish_status = finishStorageImpl(impl, null, io);
+            const finish_status = finishStorageImpl(impl, io, null);
             if (!finish_status.isOk()) {
                 impl.healthy = false;
             }
         } else {
-            discardStorageImpl(impl);
+            discardStorageImpl(impl, io);
             impl.file_size = impl.file.getSizeSimple();
             impl.timestamp = currentTimeMicros(io);
-            const save_status = saveMetadata(impl, impl.file, true);
+            const save_status = saveMetadata(impl, io, impl.file, true);
             if (!save_status.isOk()) {
                 impl.healthy = false;
             }
         }
     }
 
-    _ = impl.file.close();
+    _ = impl.file.close(io);
 
     impl.open = false;
     impl.writable = false;
@@ -1797,7 +1804,7 @@ fn closeImplImpl(impl: *SkipDBMImpl, io: std.Io) Status {
     return Status.init(.SUCCESS);
 }
 
-fn prepareStorageImpl(impl: *SkipDBMImpl) Status {
+fn prepareStorageImpl(impl: *SkipDBMImpl, io: std.Io) Status {
     var sorter_path_buf: [512]u8 = undefined;
     const sorter_path = std.fmt.bufPrint(&sorter_path_buf, "{s}.tmp.sorter_base", .{impl.path.items}) catch {
         return Status.init(.SYSTEM_ERROR);
@@ -1823,16 +1830,16 @@ fn prepareStorageImpl(impl: *SkipDBMImpl) Status {
         };
 
         const sorted_file = std_file_ptr.asFile();
-        const open_status = sorted_file.open(impl.sorted_path.items, true, .{ .truncate = true, .no_lock = true }); // process-private auxiliary sort file
+        const open_status = sorted_file.open(io, impl.sorted_path.items, true, .{ .truncate = true, .no_lock = true }); // process-private auxiliary sort file
         if (!open_status.isOk()) {
-            _ = sorted_file.close();
+            _ = sorted_file.close(io);
             impl.allocator.destroy(std_file_ptr);
             return Status.init(.SYSTEM_ERROR);
         }
 
         impl.sorted_file = sorted_file;
 
-        const trunc_status = impl.sorted_file.?.truncate(METADATA_SIZE);
+        const trunc_status = impl.sorted_file.?.truncate(io, METADATA_SIZE);
         if (!trunc_status.isOk()) {
             return Status.init(.SYSTEM_ERROR);
         }
@@ -1849,16 +1856,16 @@ fn prepareStorageImpl(impl: *SkipDBMImpl) Status {
     return Status.init(.SUCCESS);
 }
 
-fn discardStorageImpl(impl: *SkipDBMImpl) void {
+fn discardStorageImpl(impl: *SkipDBMImpl, io: std.Io) void {
     if (impl.sorted_file) |file| {
-        _ = file.close();
+        _ = file.close(io);
         _ = file_mod.removeFile(impl.sorted_path.items);
         file.deinit(impl.allocator);
         impl.sorted_file = null;
     }
 
     if (impl.sorter) |sorter| {
-        sorter.deinit();
+        sorter.deinit(io);
         impl.sorter = null;
     }
 
@@ -1868,7 +1875,7 @@ fn discardStorageImpl(impl: *SkipDBMImpl) void {
     impl.removed = false;
 }
 
-fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Status {
+fn finishStorageImpl(impl: *SkipDBMImpl, io: std.Io, reducer: ?ReducerType) Status {
     // Build merged_path = path + ".tmp.merged"
     var merged_path_buf: [512]u8 = undefined;
     const merged_path = std.fmt.bufPrint(&merged_path_buf, "{s}.tmp.merged", .{impl.path.items}) catch {
@@ -1889,11 +1896,11 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
         }
 
         // Close the empty main file before reopening (it now points to the renamed sorted_file).
-        _ = impl.file.close();
+        _ = impl.file.close(io);
 
         // Reopen main file. Use no_lock because sorted_file still holds LOCK_EX on this
         // inode (it was renamed here but not yet closed); relocking would deadlock.
-        const reopen_status = impl.file.open(impl.path.items, true, .{ .no_lock = true });
+        const reopen_status = impl.file.open(io, impl.path.items, true, .{ .no_lock = true });
         if (!reopen_status.isOk()) {
             return reopen_status;
         }
@@ -1902,21 +1909,21 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
         impl.file_size = impl.file.getSizeSimple();
         impl.timestamp = currentTimeMicros(io);
 
-        const meta_status = saveMetadata(impl, impl.file, true);
+        const meta_status = saveMetadata(impl, io, impl.file, true);
         if (!meta_status.isOk()) {
             return meta_status;
         }
 
         // Free old sorter before recreating for the next write cycle.
-        if (impl.sorter) |s| { s.deinit(); impl.sorter = null; }
-        _ = prepareStorageImpl(impl);
+        if (impl.sorter) |s| { s.deinit(io); impl.sorter = null; }
+        _ = prepareStorageImpl(impl, io);
         return Status.init(.SUCCESS);
     }
 
     // Add existing file to sorter (if non-empty)
     if (impl.file.getSizeSimple() > METADATA_SIZE) {
         var src_rec = SkipRecord.init(impl.file, impl.offset_width, impl.step_unit, impl.max_level, impl.allocator);
-        impl.sorter.?.addSkipRecord(&src_rec, METADATA_SIZE) catch {
+        impl.sorter.?.addSkipRecord(io, &src_rec, METADATA_SIZE) catch {
             return Status.init(.SYSTEM_ERROR);
         };
     }
@@ -1925,14 +1932,14 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
     if (impl.sorted_file != null and impl.sorted_path.items.len > 0) {
         if (impl.sorted_file.?.getSizeSimple() > METADATA_SIZE) {
             var src_rec = SkipRecord.init(impl.sorted_file.?, impl.offset_width, impl.step_unit, impl.max_level, impl.allocator);
-            impl.sorter.?.addSkipRecord(&src_rec, METADATA_SIZE) catch {
+            impl.sorter.?.addSkipRecord(io, &src_rec, METADATA_SIZE) catch {
                 return Status.init(.SYSTEM_ERROR);
             };
         }
     }
 
     // Call sorter.finish() to build merge heap
-    impl.sorter.?.finish() catch {
+    impl.sorter.?.finish(io) catch {
         return Status.init(.SYSTEM_ERROR);
     };
 
@@ -1943,14 +1950,14 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
     var merged_file = merged_file_ptr.asFile();
     defer merged_file.deinit(impl.allocator);
 
-    const merged_open_status = merged_file.open(merged_path, true, .{ .truncate = true, .no_lock = true }); // process-private merge staging file
+    const merged_open_status = merged_file.open(io, merged_path, true, .{ .truncate = true, .no_lock = true }); // process-private merge staging file
     if (!merged_open_status.isOk()) {
         return merged_open_status;
     }
-    defer _ = merged_file.close();
+    defer _ = merged_file.close(io);
 
     // Truncate merged_file to METADATA_SIZE
-    const truncate_status = merged_file.truncate(METADATA_SIZE);
+    const truncate_status = merged_file.truncate(io, METADATA_SIZE);
     if (!truncate_status.isOk()) {
         return truncate_status;
     }
@@ -1975,7 +1982,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
         var value: []u8 = undefined;
 
         // Try to get next record from sorter
-        impl.sorter.?.get(&key, &value) catch {
+        impl.sorter.?.get(io, &key, &value) catch {
             // No more records; apply final reducer if needed
             if (current_key != null and values.items.len > 0) {
                 if (reducer != null) {
@@ -1988,7 +1995,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
                     }
 
                     for (reduced) |rv| {
-                        const write_status = writeRecordImpl(impl, merged_file, current_key.?, rv);
+                        const write_status = writeRecordImpl(impl, io, merged_file, current_key.?, rv);
                         if (!write_status.isOk()) {
                             return write_status;
                         }
@@ -1998,7 +2005,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
                     if (values.items.len > 0) {
                         const last_val = values.items[values.items.len - 1];
                         if (!std.mem.eql(u8, last_val, REMOVING_VALUE)) {
-                            const write_status = writeRecordImpl(impl, merged_file, current_key.?, last_val);
+                            const write_status = writeRecordImpl(impl, io, merged_file, current_key.?, last_val);
                             if (!write_status.isOk()) {
                                 return write_status;
                             }
@@ -2025,7 +2032,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
                     }
 
                     for (reduced) |rv| {
-                        const write_status = writeRecordImpl(impl, merged_file, current_key.?, rv);
+                        const write_status = writeRecordImpl(impl, io, merged_file, current_key.?, rv);
                         if (!write_status.isOk()) {
                             impl.allocator.free(key);
                             impl.allocator.free(value);
@@ -2037,7 +2044,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
                     if (values.items.len > 0) {
                         const last_val = values.items[values.items.len - 1];
                         if (!std.mem.eql(u8, last_val, REMOVING_VALUE)) {
-                            const write_status = writeRecordImpl(impl, merged_file, current_key.?, last_val);
+                            const write_status = writeRecordImpl(impl, io, merged_file, current_key.?, last_val);
                             if (!write_status.isOk()) {
                                 impl.allocator.free(key);
                                 impl.allocator.free(value);
@@ -2073,7 +2080,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
     // Save metadata to merged_file
     impl.file_size = merged_file.getSizeSimple();
     impl.timestamp = currentTimeMicros(io);
-    const meta_status = saveMetadata(impl, merged_file, true);
+    const meta_status = saveMetadata(impl, io, merged_file, true);
     if (!meta_status.isOk()) {
         return meta_status;
     }
@@ -2085,7 +2092,7 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
     }
 
     // Close the main file before renaming over it and reopening.
-    _ = impl.file.close();
+    _ = impl.file.close(io);
 
     // Rename merged_file → main file
     const rename_status = file_mod.renameFile(merged_path, impl.path.items);
@@ -2100,14 +2107,14 @@ fn finishStorageImpl(impl: *SkipDBMImpl, reducer: ?ReducerType, io: std.Io) Stat
 
     // Reopen main file. Use no_lock: the merge temp file still holds LOCK_EX on
     // the renamed inode (not yet closed); relocking would deadlock.
-    const reopen_status = impl.file.open(impl.path.items, true, .{ .no_lock = true });
+    const reopen_status = impl.file.open(io, impl.path.items, true, .{ .no_lock = true });
     if (!reopen_status.isOk()) {
         return reopen_status;
     }
 
     // Free old sorter before rebuilding for the next write cycle.
-    if (impl.sorter) |s| { s.deinit(); impl.sorter = null; }
-    _ = prepareStorageImpl(impl);
+    if (impl.sorter) |s| { s.deinit(io); impl.sorter = null; }
+    _ = prepareStorageImpl(impl, io);
 
     impl.updated = false;
     impl.removed = false;
@@ -2122,18 +2129,18 @@ fn cancelIteratorsImpl(impl: *SkipDBMImpl) void {
     }
 }
 
-fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: std.mem.Allocator, io: std.Io) Status {
+fn restoreDatabaseImpl( allocator: std.mem.Allocator, io: std.Io,old_path: []const u8, new_path: []const u8) Status {
     const old_file_ptr = StdFile.create(allocator) catch {
         return Status.init(.SYSTEM_ERROR);
     };
     var old_file = old_file_ptr.asFile();
     defer old_file.deinit(allocator);
 
-    const old_open_status = old_file.open(old_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
+    const old_open_status = old_file.open(io, old_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
     if (!old_open_status.isOk()) {
         return old_open_status;
     }
-    defer _ = old_file.close();
+    defer _ = old_file.close(io);
 
     const new_file_ptr = StdFile.create(allocator) catch {
         return Status.init(.SYSTEM_ERROR);
@@ -2141,18 +2148,18 @@ fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: st
     var new_file = new_file_ptr.asFile();
     defer new_file.deinit(allocator);
 
-    const new_open_status = new_file.open(new_path, true, .{ .truncate = true, .no_lock = true }); // fresh restore output file
+    const new_open_status = new_file.open(io, new_path, true, .{ .truncate = true, .no_lock = true }); // fresh restore output file
     if (!new_open_status.isOk()) {
-        _ = new_file.close();
+        _ = new_file.close(io);
         return new_open_status;
     }
-    defer _ = new_file.close();
+    defer _ = new_file.close(io);
 
     // Copy metadata from old to new
     var metadata_buf: [METADATA_SIZE]u8 = undefined;
-    const read_status = old_file.read(0, &metadata_buf);
+    const read_status = old_file.read(io, 0, &metadata_buf);
     if (!read_status.isOk()) return read_status;
-    const write_status = new_file.write(0, &metadata_buf);
+    const write_status = new_file.write(io, 0, &metadata_buf);
     if (!write_status.isOk()) return write_status;
 
     // Read parameters from old file's metadata; fall back to defaults if broken.
@@ -2197,7 +2204,7 @@ fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: st
             .update_logger = null,
             .allocator = allocator,
         };
-        if (loadMetadata(&meta_impl, old_file).isOk()) {
+        if (loadMetadata(&meta_impl, io, old_file).isOk()) {
             scan_offset_width = meta_impl.offset_width;
             scan_step_unit = meta_impl.step_unit;
             scan_max_level = meta_impl.max_level;
@@ -2215,18 +2222,18 @@ fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: st
         var rec = SkipRecord.init(old_file, scan_offset_width, scan_step_unit, scan_max_level, allocator);
         defer rec.deinit();
 
-        const read_status_key = rec.readMetadataKey(offset, record_index);
+        const read_status_key = rec.readMetadataKey(io, offset, record_index);
         if (!read_status_key.isOk()) break;
 
-        const read_status_body = rec.readBody();
+        const read_status_body = rec.readBody(io);
         if (!read_status_body.isOk()) break;
 
         // Write record to new file with new parameters
         rec.file = new_file;
-        const write_status_rec = rec.write();
+        const write_status_rec = rec.write(io);
         if (!write_status_rec.isOk()) break;
 
-        const update_status = rec.updatePastRecords(record_index, rec.offset, &past_offsets);
+        const update_status = rec.updatePastRecords(io, record_index, rec.offset, &past_offsets);
         if (!update_status.isOk()) break;
 
         record_count += 1;
@@ -2252,20 +2259,20 @@ fn restoreDatabaseImpl(old_path: []const u8, new_path: []const u8, allocator: st
     impl.db_type = 0;
     @memset(&impl.opaque_metadata, 0);
 
-    return saveMetadata(&impl, new_file, true);
+    return saveMetadata(&impl, io, new_file, true);
 }
 
 
-fn getImpl(impl: *SkipDBMImpl, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
+fn getImpl(impl: *SkipDBMImpl, io: std.Io, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
     var rec = SkipRecord.init(impl.file, impl.offset_width, impl.step_unit, impl.max_level, impl.allocator);
     defer rec.deinit();
 
-    const status = rec.search(METADATA_SIZE, impl.cache, key, false);
+    const status = rec.search(io, METADATA_SIZE, impl.cache, key, false);
     if (!status.isOk()) {
         return status;
     }
 
-    const body_status = rec.readBody();
+    const body_status = rec.readBody(io);
     if (!body_status.isOk()) {
         return body_status;
     }
@@ -2282,11 +2289,11 @@ fn getImpl(impl: *SkipDBMImpl, key: []const u8, value_out: ?*std.ArrayList(u8)) 
     return Status.init(.SUCCESS);
 }
 
-fn setImpl(impl: *SkipDBMImpl, key: []const u8, value: []const u8, overwrite: bool) Status {
+fn setImpl(impl: *SkipDBMImpl, io: std.Io, key: []const u8, value: []const u8, overwrite: bool) Status {
     var rec = SkipRecord.init(impl.file, impl.offset_width, impl.step_unit, impl.max_level, impl.allocator);
     defer rec.deinit();
 
-    const search_status = rec.search(METADATA_SIZE, impl.cache, key, false);
+    const search_status = rec.search(io, METADATA_SIZE, impl.cache, key, false);
     if (search_status.code == .SUCCESS) {
         if (!overwrite) {
             return Status.init(.DUPLICATION_ERROR);
@@ -2295,7 +2302,7 @@ fn setImpl(impl: *SkipDBMImpl, key: []const u8, value: []const u8, overwrite: bo
         return search_status;
     }
 
-    const status = updateRecordImpl(impl, key, value);
+    const status = updateRecordImpl(impl, io, key, value);
     if (status.isOk()) {
         if (impl.update_logger) |ul| {
             _ = ul.writeSet(key, value);
@@ -2304,8 +2311,8 @@ fn setImpl(impl: *SkipDBMImpl, key: []const u8, value: []const u8, overwrite: bo
     return status;
 }
 
-fn removeImpl(impl: *SkipDBMImpl, key: []const u8) Status {
-    const status = updateRecordImpl(impl, key, REMOVING_VALUE);
+fn removeImpl(impl: *SkipDBMImpl, io: std.Io, key: []const u8) Status {
+    const status = updateRecordImpl(impl, io, key, REMOVING_VALUE);
     if (status.isOk()) {
         if (impl.update_logger) |ul| {
             _ = ul.writeRemove(key);
@@ -2314,15 +2321,15 @@ fn removeImpl(impl: *SkipDBMImpl, key: []const u8) Status {
     return status;
 }
 
-fn updateRecordImpl(impl: *SkipDBMImpl, key: []const u8, value: []const u8) Status {
+fn updateRecordImpl(impl: *SkipDBMImpl, io: std.Io, key: []const u8, value: []const u8) Status {
     const status = blk: {
         if (impl.sorter != null and !impl.insert_in_order) {
-            impl.sorter.?.add(key, value) catch break :blk Status.init(.SYSTEM_ERROR);
+            impl.sorter.?.add(io, key, value) catch break :blk Status.init(.SYSTEM_ERROR);
             break :blk Status.init(.SUCCESS);
         } else if (impl.sorted_file != null) {
-            break :blk writeRecordImpl(impl, impl.sorted_file.?, key, value);
+            break :blk writeRecordImpl(impl, io, impl.sorted_file.?, key, value);
         } else {
-            break :blk writeRecordImpl(impl, impl.file, key, value);
+            break :blk writeRecordImpl(impl, io, impl.file, key, value);
         }
     };
     if (status.isOk()) {
@@ -2332,18 +2339,18 @@ fn updateRecordImpl(impl: *SkipDBMImpl, key: []const u8, value: []const u8) Stat
     return status;
 }
 
-fn writeRecordImpl(impl: *SkipDBMImpl, file: File, key: []const u8, value: []const u8) Status {
+fn writeRecordImpl(impl: *SkipDBMImpl, io: std.Io, file: File, key: []const u8, value: []const u8) Status {
     var rec = SkipRecord.init(file, impl.offset_width, impl.step_unit, impl.max_level, impl.allocator);
     defer rec.deinit();
 
     rec.setData(impl.record_index, key, value);
 
-    const write_status = rec.write();
+    const write_status = rec.write(io);
     if (!write_status.isOk()) {
         return write_status;
     }
 
-    const update_status = rec.updatePastRecords(impl.record_index, rec.offset, &impl.past_offsets);
+    const update_status = rec.updatePastRecords(io, impl.record_index, rec.offset, &impl.past_offsets);
     if (!update_status.isOk()) {
         return update_status;
     }
@@ -2486,92 +2493,92 @@ pub const SkipDBM = struct {
         impl: *SkipDBMIteratorImpl,
         allocator: std.mem.Allocator,
 
-        pub fn deinit(self: *Cursor) void {
+        pub fn deinit(self: *Cursor, io: std.Io) void {
             // impl.deinit() acquires the exclusive mutex and uses orderedRemove,
             // matching C++ ~SkipDBMIteratorImpl lock_guard behavior.
-            self.impl.deinit();
+            self.impl.deinit(io);
         }
 
         // C++ SkipDBMIteratorImpl methods take shared_lock. The lock is provided here at
         // the public Cursor boundary rather than inside impl methods, because the impl
         // methods are also called from processFirst/processEach which already
         // hold the outer mutex.
-        pub fn first(self: *Cursor) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.first(); }
+        pub fn first(self: *Cursor, io: std.Io) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.first(); }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn last(self: *Cursor) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.last(); }
+        pub fn last(self: *Cursor, io: std.Io) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.last(io); }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn jump(self: *Cursor, key: []const u8) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.jump(key); }
+        pub fn jump(self: *Cursor, io: std.Io, key: []const u8) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.jump( io,key); }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn jumpLower(self: *Cursor, key: []const u8, inclusive: bool) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.jumpLower(key, inclusive); }
+        pub fn jumpLower(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.jumpLower( io,key, inclusive); }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn jumpUpper(self: *Cursor, key: []const u8, inclusive: bool) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.jumpUpper(key, inclusive); }
+        pub fn jumpUpper(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.jumpUpper( io,key, inclusive); }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn next(self: *Cursor) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.next(); }
+        pub fn next(self: *Cursor, io: std.Io) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.next(io); }
             return Status.init(.NOT_FOUND_ERROR);
         }
 
-        pub fn previous(self: *Cursor) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.previous(); }
+        pub fn previous(self: *Cursor, io: std.Io) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.previous(io); }
             return Status.init(.NOT_FOUND_ERROR);
         }
 
-        pub fn get(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            if (self.impl.dbm) |dbm| { dbm.mutex.lockShared(); defer dbm.mutex.unlockShared(); return self.impl.get(key_out, value_out); }
+        pub fn get(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            if (self.impl.dbm) |dbm| { dbm.mutex.lockSharedUncancelable(io); defer dbm.mutex.unlockShared(io); return self.impl.get( io,key_out, value_out); }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn process(self: *Cursor, comptime P: type, proc: *P, writable: bool) Status {
+        pub fn process(self: *Cursor, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
             if (self.impl.dbm) |dbm| {
                 if (writable) {
-                    dbm.mutex.lock();
-                    defer dbm.mutex.unlock();
+                    dbm.mutex.lockUncancelable(io);
+                    defer dbm.mutex.unlock(io);
                 } else {
-                    dbm.mutex.lockShared();
-                    defer dbm.mutex.unlockShared();
+                    dbm.mutex.lockSharedUncancelable(io);
+                    defer dbm.mutex.unlockShared(io);
                 }
-                return self.impl.process(P, proc, writable);
+                return self.impl.process( io,P, proc, writable);
             }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn set(self: *Cursor, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn set(self: *Cursor, io: std.Io, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             if (self.impl.dbm) |dbm| {
-                dbm.mutex.lock();
-                defer dbm.mutex.unlock();
-                return self.impl.iterSet(value, old_key, old_value);
+                dbm.mutex.lockUncancelable(io);
+                defer dbm.mutex.unlock(io);
+                return self.impl.iterSet(io, value, old_key, old_value);
             }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn remove(self: *Cursor, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn remove(self: *Cursor, io: std.Io, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             if (self.impl.dbm) |dbm| {
-                dbm.mutex.lock();
-                defer dbm.mutex.unlock();
-                return self.impl.iterRemove(old_key, old_value);
+                dbm.mutex.lockUncancelable(io);
+                defer dbm.mutex.unlock(io);
+                return self.impl.iterRemove(io, old_key, old_value);
             }
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned cursor");
         }
 
-        pub fn step(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            const st = self.get(key_out, value_out);
+        pub fn step(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            const st = self.get( io,key_out, value_out);
             if (!st.isOk()) return st;
-            _ = self.next();
+            _ = self.next(io);
             return Status.init(.SUCCESS);
         }
     };
@@ -2601,7 +2608,7 @@ pub const SkipDBM = struct {
         /// The returned slices point into internal buffers and are invalidated
         /// on the next call to next() or deinit(). Copy them if you need the
         /// data to outlive this call.
-        pub fn next(self: *Iterator) !?Entry {
+        pub fn next(self: *Iterator, io: std.Io) !?Entry {
             if (self.done) return null;
 
             // Fill internal buffers from the current cursor position.
@@ -2627,7 +2634,7 @@ pub const SkipDBM = struct {
                 .val_buf = &self.value_buf,
                 .alloc = self.alloc,
             };
-            if (self.cursor.process(Proc, &proc, false).isOk() and !proc.oom) filled = true;
+            if (self.cursor.process( io,Proc, &proc, false).isOk() and !proc.oom) filled = true;
             if (proc.oom) return error.OutOfMemory;
 
             if (!filled) {
@@ -2637,7 +2644,7 @@ pub const SkipDBM = struct {
 
             // Advance cursor. If it reaches the end, mark done so the next
             // call returns null rather than re-reading the last record.
-            if (!self.cursor.next().isOk()) self.done = true;
+            if (!self.cursor.next(io).isOk()) self.done = true;
 
             return Entry{
                 .key = self.key_buf.items,
@@ -2646,10 +2653,10 @@ pub const SkipDBM = struct {
         }
 
         /// Release internal buffers and the underlying cursor.
-        pub fn deinit(self: *Iterator) void {
+        pub fn deinit(self: *Iterator, io: std.Io) void {
             self.key_buf.deinit(self.alloc);
             self.value_buf.deinit(self.alloc);
-            self.cursor.deinit();
+            self.cursor.deinit(io);
         }
     };
 
@@ -2666,7 +2673,7 @@ pub const SkipDBM = struct {
         impl.updated = false;
         impl.removed = false;
         impl.auto_restored = false;
-        impl.mutex = .{};
+        impl.mutex = .init;
 
         impl.offset_width = @intCast(std.math.clamp(params.offset_width, @as(i32, MIN_OFFSET_WIDTH), @as(i32, MAX_OFFSET_WIDTH)));
         impl.step_unit = @intCast(std.math.clamp(params.step_unit, @as(i32, MIN_STEP_UNIT), @as(i32, MAX_STEP_UNIT)));
@@ -2705,15 +2712,15 @@ pub const SkipDBM = struct {
         return SkipDBM{ .impl = impl, .allocator = allocator };
     }
 
-    pub fn deinit(self: *SkipDBM) void {
-        self.impl.mutex.lock();
-
+    pub fn deinit(self: *SkipDBM, io: std.Io) void {
+        // No mutex acquisition: deinit destroys the object; any concurrent access
+        // would be UB regardless.
         if (self.impl.cache) |cache| {
             cache.deinit();
         }
 
         if (self.impl.sorter) |sorter| {
-            sorter.deinit();
+            sorter.deinit(io);
         }
 
         if (self.impl.sorted_file) |sf| {
@@ -2729,52 +2736,49 @@ pub const SkipDBM = struct {
         self.impl.path.deinit(self.allocator);
         self.impl.sorted_path.deinit(self.allocator);
 
-        _ = self.impl.file.close();
+        _ = self.impl.file.close(io);
 
-        // Unlock before destroying impl — defer would be a use-after-free.
-        self.impl.mutex.unlock();
         // deinit closes the file (if still open) and frees the File implementation.
         self.impl.file.deinit(self.allocator);
         self.allocator.destroy(self.impl);
         // SkipDBM is a stack value; do not destroy(self).
     }
 
-    pub fn open(self: *SkipDBM, path: []const u8, writable: bool, options: OpenOptions, io: std.Io) Status {
+    pub fn open(self: *SkipDBM, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status {
         const default_params = TuningParameters{};
-        return openAdvancedImpl(self.impl, path, writable, options, default_params, io);
+        return openAdvancedImpl(self.impl, io, path, writable, options, default_params);
     }
 
-    pub fn openAdvanced(self: *SkipDBM, path: []const u8, writable: bool, options: OpenOptions, params: TuningParameters, io: std.Io) Status {
-        return openAdvancedImpl(self.impl, path, writable, options, params, io);
+    pub fn openAdvanced(self: *SkipDBM, io: std.Io, path: []const u8, writable: bool, options: OpenOptions, params: TuningParameters) Status {
+        return openAdvancedImpl(self.impl, io, path, writable, options, params);
     }
 
     pub fn close(self: *SkipDBM, io: std.Io) Status {
         return closeImplImpl(self.impl, io);
     }
 
-    pub fn get(self: *SkipDBM, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
-        return getImpl(self.impl, key, value_out);
+    pub fn get(self: *SkipDBM, io: std.Io, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
+        return getImpl(self.impl, io, key, value_out);
     }
 
-    pub fn set(self: *SkipDBM, key: []const u8, value: []const u8, overwrite: bool,
-               old_value: ?*std.ArrayList(u8)) Status {
-        if (old_value != null) _ = getImpl(self.impl, key, old_value);
-        return setImpl(self.impl, key, value, overwrite);
+    pub fn set(self: *SkipDBM, io: std.Io, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*std.ArrayList(u8)) Status {
+        if (old_value != null) _ = getImpl(self.impl, io, key, old_value);
+        return setImpl(self.impl, io, key, value, overwrite);
     }
 
-    pub fn remove(self: *SkipDBM, key: []const u8, old_value: ?*std.ArrayList(u8)) Status {
-        if (old_value != null) _ = getImpl(self.impl, key, old_value);
-        return removeImpl(self.impl, key);
+    pub fn remove(self: *SkipDBM, io: std.Io, key: []const u8, old_value: ?*std.ArrayList(u8)) Status {
+        if (old_value != null) _ = getImpl(self.impl, io, key, old_value);
+        return removeImpl(self.impl, io, key);
     }
 
-    pub fn append(self: *SkipDBM, key: []const u8, value: []const u8, delim: []const u8) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn append(self: *SkipDBM, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         var existing_buf: std.ArrayList(u8) = .empty;
         defer existing_buf.deinit(self.impl.allocator);
 
-        const get_status = getImpl(self.impl, key, &existing_buf);
+        const get_status = getImpl(self.impl, io, key, &existing_buf);
 
         var new_value: std.ArrayList(u8) = .empty;
         defer new_value.deinit(self.impl.allocator);
@@ -2793,7 +2797,7 @@ pub const SkipDBM = struct {
             return get_status;
         }
 
-        const status = updateRecordImpl(self.impl, key, new_value.items);
+        const status = updateRecordImpl(self.impl, io, key, new_value.items);
         if (status.isOk()) {
             if (self.impl.update_logger) |ul| {
                 _ = ul.writeSet(key, new_value.items);
@@ -2810,6 +2814,7 @@ pub const SkipDBM = struct {
     /// never stopped early — the C++ `|=` semantics are preserved via Status.mergeFrom.
     pub fn getMulti(
         self: *SkipDBM,
+        io: std.Io,
         keys: []const []const u8,
         records: *std.StringHashMap([]u8),
     ) Status {
@@ -2817,7 +2822,7 @@ pub const SkipDBM = struct {
         for (keys) |key| {
             var val_buf: std.ArrayList(u8) = .empty;
             defer val_buf.deinit(self.impl.allocator);
-            const st = self.get(key, &val_buf);
+            const st = self.get( io,key, &val_buf);
             if (st.isOk()) {
                 const duped_key = records.allocator.dupe(u8, key) catch
                     return Status.init(.SYSTEM_ERROR);
@@ -2842,12 +2847,13 @@ pub const SkipDBM = struct {
     /// Stops early on any error other than DUPLICATION_ERROR (matching C++ SetMulti semantics).
     pub fn setMulti(
         self: *SkipDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         overwrite: bool,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.set(r[0], r[1], overwrite, null);
+            const st = self.set( io,r[0], r[1], overwrite, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .DUPLICATION_ERROR) break;
         }
@@ -2857,10 +2863,10 @@ pub const SkipDBM = struct {
     /// Removes each key in `keys`.
     ///
     /// Stops early on any error other than NOT_FOUND_ERROR (matching C++ RemoveMulti semantics).
-    pub fn removeMulti(self: *SkipDBM, keys: []const []const u8) Status {
+    pub fn removeMulti(self: *SkipDBM, io: std.Io, keys: []const []const u8) Status {
         var status = Status.init(.SUCCESS);
         for (keys) |key| {
-            const st = self.remove(key, null);
+            const st = self.remove( io,key, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .NOT_FOUND_ERROR) break;
         }
@@ -2872,12 +2878,13 @@ pub const SkipDBM = struct {
     /// Stops on the first error (matching C++ AppendMulti semantics).
     pub fn appendMulti(
         self: *SkipDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         delim: []const u8,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.append(r[0], r[1], delim);
+            const st = self.append( io,r[0], r[1], delim);
             status.mergeFrom(st);
             if (!status.isOk()) break;
         }
@@ -2941,9 +2948,9 @@ pub const SkipDBM = struct {
         return self.impl.db_type;
     }
 
-    pub fn setDatabaseType(self: *SkipDBM, db_type: u32) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn setDatabaseType(self: *SkipDBM, io: std.Io, db_type: u32) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.impl.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
         self.impl.db_type = db_type;
@@ -2988,9 +2995,9 @@ pub const SkipDBM = struct {
     /// Scans all skip records from the beginning of the record area to the end of file,
     /// verifying each record's magic byte, size fields, and that no record extends
     /// past the end of file. Matches C++ SkipDBM::ValidateRecords().
-    pub fn validateRecords(self: *SkipDBM) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn validateRecords(self: *SkipDBM, io: std.Io) Status {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         const file_sz = self.impl.file.getSizeSimple();
         var offset: i64 = METADATA_SIZE;
@@ -2998,7 +3005,7 @@ pub const SkipDBM = struct {
         while (offset < file_sz) {
             var rec = SkipRecord.init(self.impl.file, self.impl.offset_width, self.impl.step_unit, self.impl.max_level, self.impl.allocator);
             defer rec.deinit();
-            const st = rec.readMetadataKey(offset, record_count);
+            const st = rec.readMetadataKey(io, offset, record_count);
             if (!st.isOk()) return Status.initMsg(.BROKEN_DATA_ERROR, "skip record header unreadable");
             if (rec.whole_size == 0) return Status.initMsg(.BROKEN_DATA_ERROR, "skip record size zero");
             offset += @as(i64, @intCast(rec.whole_size));
@@ -3012,8 +3019,8 @@ pub const SkipDBM = struct {
     }
 
     pub fn clear(self: *SkipDBM, io: std.Io) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.impl.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
@@ -3026,19 +3033,19 @@ pub const SkipDBM = struct {
 
         // Commit any in-progress sort before wiping the file.
         if (self.impl.updated) {
-            const finish_status = finishStorageImpl(self.impl, null, io);
+            const finish_status = finishStorageImpl(self.impl, io, null);
             if (!finish_status.isOk()) return finish_status;
         }
 
         // Discard residual sorter/sorted_file (finishStorageImpl resets updated but may
         // leave sorter allocated in the fast-path; discard cleans up unconditionally).
         if (self.impl.sorter != null or self.impl.sorted_file != null) {
-            discardStorageImpl(self.impl);
+            discardStorageImpl(self.impl, io);
         }
 
         cancelIteratorsImpl(self.impl);
 
-        const truncate_status = self.impl.file.truncate(METADATA_SIZE);
+        const truncate_status = self.impl.file.truncate(io, METADATA_SIZE);
         if (!truncate_status.isOk()) return truncate_status;
 
         self.impl.num_records = 0;
@@ -3049,10 +3056,10 @@ pub const SkipDBM = struct {
         self.impl.removed = false;
         @memset(&self.impl.past_offsets, 0);
 
-        const save_status = saveMetadata(self.impl, self.impl.file, false);
+        const save_status = saveMetadata(self.impl, io, self.impl.file, false);
         if (!save_status.isOk()) return save_status;
 
-        const prep_status = prepareStorageImpl(self.impl);
+        const prep_status = prepareStorageImpl(self.impl, io);
         if (!prep_status.isOk()) return prep_status;
 
         if (self.impl.cache) |old_cache| old_cache.deinit();
@@ -3065,14 +3072,14 @@ pub const SkipDBM = struct {
 
     pub fn rebuild(self: *SkipDBM, io: std.Io) Status {
         const default_params = TuningParameters{};
-        return self.rebuildAdvanced(default_params, false, false, io);
+        return self.rebuildAdvanced( io,default_params, false, false);
     }
 
-    pub fn rebuildAdvanced(self: *SkipDBM, params: TuningParameters, skip_broken: bool, sync_hard: bool, io: std.Io) Status {
+    pub fn rebuildAdvanced(self: *SkipDBM, io: std.Io, params: TuningParameters, skip_broken: bool, sync_hard: bool) Status {
         _ = skip_broken;
         {
-            self.impl.mutex.lock();
-            defer self.impl.mutex.unlock();
+            self.impl.mutex.lockUncancelable(io);
+            defer self.impl.mutex.unlock(io);
 
             if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
 
@@ -3088,7 +3095,7 @@ pub const SkipDBM = struct {
             self.impl.sort_mem_size = params.sort_mem_size;
 
             // Rebuild = sync with no reducer (keeps all records, restructures)
-            const rebuild_status = finishStorageImpl(self.impl, null, io);
+            const rebuild_status = finishStorageImpl(self.impl, io, null);
 
             if (!rebuild_status.isOk()) {
                 // Restore old params on failure
@@ -3098,14 +3105,12 @@ pub const SkipDBM = struct {
                 return rebuild_status;
             }
         }
-        if (sync_hard) return self.synchronize(true, io);
+        if (sync_hard) return self.synchronize( io,true);
         return Status.init(.SUCCESS);
     }
 
+    /// Lock-free: reads only integer fields that are stable during normal operation.
     fn shouldBeRebuiltInternal(self: *SkipDBM) bool {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
-
         const pow_threshold = powI64(@as(i64, self.impl.step_unit), self.impl.max_level + 1);
         if (self.impl.num_records > pow_threshold) {
             return true;
@@ -3129,13 +3134,13 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn synchronize(self: *SkipDBM, hard: bool, io: std.Io) Status {
-        return self.synchronizeAdvanced(hard, null, io);
+    pub fn synchronize(self: *SkipDBM, io: std.Io, hard: bool) Status {
+        return self.synchronizeAdvanced( io,hard, null);
     }
 
-    pub fn synchronizeAdvanced(self: *SkipDBM, hard: bool, reducer: ?ReducerType, io: std.Io) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn synchronizeAdvanced(self: *SkipDBM, io: std.Io, hard: bool, reducer: ?ReducerType) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.impl.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
@@ -3149,20 +3154,20 @@ pub const SkipDBM = struct {
         }
 
         if (self.impl.updated) {
-            const finish_status = finishStorageImpl(self.impl, reducer, io);
+            const finish_status = finishStorageImpl(self.impl, io, reducer);
             if (!finish_status.isOk()) return finish_status;
         }
 
         if (hard) {
-            const file_status = self.impl.file.synchronize(true);
+            const file_status = self.impl.file.synchronize(io, true);
             if (!file_status.isOk()) return file_status;
         }
 
         // Write open-state metadata header and reinitialize sorter for the next write cycle.
-        const save_status = saveMetadata(self.impl, self.impl.file, false);
+        const save_status = saveMetadata(self.impl, io, self.impl.file, false);
         if (!save_status.isOk()) return save_status;
 
-        const prep_status = prepareStorageImpl(self.impl);
+        const prep_status = prepareStorageImpl(self.impl, io);
         if (!prep_status.isOk()) return prep_status;
 
         if (self.impl.cache) |old_cache| old_cache.deinit();
@@ -3173,20 +3178,20 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn revert(self: *SkipDBM) Status {
+    pub fn revert(self: *SkipDBM, io: std.Io) Status {
         if (!self.impl.writable) {
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
         }
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
-        discardStorageImpl(self.impl);
+        discardStorageImpl(self.impl, io);
         return Status.init(.SUCCESS);
     }
 
-    pub fn getByIndex(self: *SkipDBM, index: i64, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn getByIndex(self: *SkipDBM, io: std.Io, index: i64, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         if (index < 0 or index >= self.impl.num_records) {
             return Status.init(.NOT_FOUND_ERROR);
@@ -3195,12 +3200,12 @@ pub const SkipDBM = struct {
         var rec = SkipRecord.init(self.impl.file, self.impl.offset_width, self.impl.step_unit, self.impl.max_level, self.impl.allocator);
         defer rec.deinit();
 
-        const search_status = rec.searchByIndex(METADATA_SIZE, self.impl.cache, index);
+        const search_status = rec.searchByIndex(io, METADATA_SIZE, self.impl.cache, index);
         if (!search_status.isOk()) {
             return search_status;
         }
 
-        const body_status = rec.readBody();
+        const body_status = rec.readBody(io);
         if (!body_status.isOk()) {
             return body_status;
         }
@@ -3224,17 +3229,17 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn processFirst(self: *SkipDBM, comptime P: type, proc: *P, writable: bool) Status {
+    pub fn processFirst(self: *SkipDBM, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
         if (writable) {
-            self.impl.mutex.lock();
+            self.impl.mutex.lockUncancelable(io);
         } else {
-            self.impl.mutex.lockShared();
+            self.impl.mutex.lockSharedUncancelable(io);
         }
         defer {
             if (writable) {
-                self.impl.mutex.unlock();
+                self.impl.mutex.unlock(io);
             } else {
-                self.impl.mutex.unlockShared();
+                self.impl.mutex.unlockShared(io);
             }
         }
 
@@ -3248,10 +3253,10 @@ pub const SkipDBM = struct {
         var rec = SkipRecord.init(self.impl.file, self.impl.offset_width, self.impl.step_unit, self.impl.max_level, self.impl.allocator);
         defer rec.deinit();
 
-        var status = rec.readMetadataKey(METADATA_SIZE, 0);
+        var status = rec.readMetadataKey(io, METADATA_SIZE, 0);
         if (!status.isOk()) return status;
         if (rec.value_ptr == null) {
-            status = rec.readBody();
+            status = rec.readBody(io);
             if (!status.isOk()) return status;
         }
 
@@ -3259,23 +3264,23 @@ pub const SkipDBM = struct {
         if (!writable) return Status.init(.SUCCESS);
         switch (action) {
             .noop => {},
-            .remove => return removeImpl(self.impl, rec.key_ptr),
-            .set => |new_value| return updateRecordImpl(self.impl, rec.key_ptr, new_value),
+            .remove => return removeImpl(self.impl, io, rec.key_ptr),
+            .set => |new_value| return updateRecordImpl(self.impl, io, rec.key_ptr, new_value),
         }
         return Status.init(.SUCCESS);
     }
 
-    pub fn processEach(self: *SkipDBM, comptime P: type, proc: *P, writable: bool) Status {
+    pub fn processEach(self: *SkipDBM, io: std.Io, comptime P: type, proc: *P, writable: bool) Status {
         if (writable) {
-            self.impl.mutex.lock();
+            self.impl.mutex.lockUncancelable(io);
         } else {
-            self.impl.mutex.lockShared();
+            self.impl.mutex.lockSharedUncancelable(io);
         }
         defer {
             if (writable) {
-                self.impl.mutex.unlock();
+                self.impl.mutex.unlock(io);
             } else {
-                self.impl.mutex.unlockShared();
+                self.impl.mutex.unlockShared(io);
             }
         }
 
@@ -3294,10 +3299,10 @@ pub const SkipDBM = struct {
         defer rec.deinit();
 
         while (offset < end_offset) {
-            var status = rec.readMetadataKey(offset, index);
+            var status = rec.readMetadataKey(io, offset, index);
             if (!status.isOk()) return status;
             if (rec.value_ptr == null) {
-                status = rec.readBody();
+                status = rec.readBody(io);
                 if (!status.isOk()) return status;
             }
 
@@ -3306,11 +3311,11 @@ pub const SkipDBM = struct {
                 switch (action) {
                     .noop => {},
                     .remove => {
-                        status = removeImpl(self.impl, rec.key_ptr);
+                        status = removeImpl(self.impl, io, rec.key_ptr);
                         if (!status.isOk()) return status;
                     },
                     .set => |new_value| {
-                        status = updateRecordImpl(self.impl, rec.key_ptr, new_value);
+                        status = updateRecordImpl(self.impl, io, rec.key_ptr, new_value);
                         if (!status.isOk()) return status;
                     },
                 }
@@ -3323,17 +3328,17 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn processMulti(self: *SkipDBM, comptime P: type, keys: []const []const u8, procs: []const *P, writable: bool) Status {
+    pub fn processMulti(self: *SkipDBM, io: std.Io, comptime P: type, keys: []const []const u8, procs: []const *P, writable: bool) Status {
         if (writable) {
-            self.impl.mutex.lock();
+            self.impl.mutex.lockUncancelable(io);
         } else {
-            self.impl.mutex.lockShared();
+            self.impl.mutex.lockSharedUncancelable(io);
         }
         defer {
             if (writable) {
-                self.impl.mutex.unlock();
+                self.impl.mutex.unlock(io);
             } else {
-                self.impl.mutex.unlockShared();
+                self.impl.mutex.unlockShared(io);
             }
         }
 
@@ -3341,7 +3346,7 @@ pub const SkipDBM = struct {
             var rec = SkipRecord.init(self.impl.file, self.impl.offset_width, self.impl.step_unit, self.impl.max_level, self.impl.allocator);
             defer rec.deinit();
 
-            const search_status = rec.search(METADATA_SIZE, self.impl.cache, key, false);
+            const search_status = rec.search(io, METADATA_SIZE, self.impl.cache, key, false);
             if (!search_status.isOk()) {
                 if (search_status.code == .NOT_FOUND_ERROR) {
                     const action = proc.processEmpty(key);
@@ -3350,7 +3355,7 @@ pub const SkipDBM = struct {
                             .noop => {},
                             .remove => {},
                             .set => |new_value| {
-                                const set_status = updateRecordImpl(self.impl, key, new_value);
+                                const set_status = updateRecordImpl(self.impl, io, key, new_value);
                                 if (!set_status.isOk()) return set_status;
                             },
                         }
@@ -3361,7 +3366,7 @@ pub const SkipDBM = struct {
                 continue;
             }
 
-            const body_status = rec.readBody();
+            const body_status = rec.readBody(io);
             if (!body_status.isOk()) {
                 return body_status;
             }
@@ -3376,11 +3381,11 @@ pub const SkipDBM = struct {
                 switch (action) {
                     .noop => {},
                     .remove => {
-                        const rm_status = removeImpl(self.impl, key);
+                        const rm_status = removeImpl(self.impl, io, key);
                         if (!rm_status.isOk()) return rm_status;
                     },
                     .set => |new_value| {
-                        const set_status = updateRecordImpl(self.impl, key, new_value);
+                        const set_status = updateRecordImpl(self.impl, io, key, new_value);
                         if (!set_status.isOk()) return set_status;
                     },
                 }
@@ -3390,9 +3395,9 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn inspect(self: *SkipDBM, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn inspect(self: *SkipDBM, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
 
         var result: std.ArrayList([2][]u8) = .empty;
         errdefer {
@@ -3494,9 +3499,9 @@ pub const SkipDBM = struct {
         return result;
     }
 
-    pub fn mergeSkipDatabase(self: *SkipDBM, src_path: []const u8) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn mergeSkipDatabase(self: *SkipDBM, io: std.Io, src_path: []const u8) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.impl.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
@@ -3507,11 +3512,11 @@ pub const SkipDBM = struct {
         };
         var src_file = src_file_ptr.asFile();
 
-        const open_status = src_file.open(src_path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
+        const open_status = src_file.open(io, src_path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
         if (!open_status.isOk()) {
             return open_status;
         }
-        defer _ = src_file.close();
+        defer _ = src_file.close(io);
 
         // Iterate through source records and insert into self
         var offset: i64 = METADATA_SIZE;
@@ -3521,15 +3526,15 @@ pub const SkipDBM = struct {
             var rec = SkipRecord.init(src_file, self.impl.offset_width, self.impl.step_unit, self.impl.max_level, self.allocator);
             defer rec.deinit();
 
-            const meta_status = rec.readMetadataKey(offset, index);
+            const meta_status = rec.readMetadataKey(io, offset, index);
             if (!meta_status.isOk()) break;
 
-            const body_status = rec.readBody();
+            const body_status = rec.readBody(io);
             if (!body_status.isOk()) break;
 
             // Insert record if not a REMOVING_VALUE
             if (!std.mem.eql(u8, rec.value_ptr orelse "", REMOVING_VALUE)) {
-                const set_status = setImpl(self.impl, rec.key_ptr, rec.value_ptr orelse "", true);
+                const set_status = setImpl(self.impl, io, rec.key_ptr, rec.value_ptr orelse "", true);
                 if (!set_status.isOk()) break;
             }
 
@@ -3540,9 +3545,9 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn iterate(self: *SkipDBM, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterate(self: *SkipDBM, alloc: std.mem.Allocator, io: std.Io) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -3550,13 +3555,13 @@ pub const SkipDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
-    pub fn iterateFrom(self: *SkipDBM, key: []const u8, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *SkipDBM, alloc: std.mem.Allocator, io: std.Io, key: []const u8) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -3564,19 +3569,17 @@ pub const SkipDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump( io,key).isOk()) iter.done = true;
         return iter;
     }
 
-    pub fn makeCursor(self: *SkipDBM) !Cursor {
+    pub fn makeCursor(self: *SkipDBM, io: std.Io) !Cursor {
         // SkipDBMIteratorImpl.init registers self in dbm.iterators under the mutex;
         // no second append here.
-        const iter_impl = try SkipDBMIteratorImpl.init(self.impl, self.allocator);
+        const iter_impl = try SkipDBMIteratorImpl.init(self.impl, io, self.allocator);
         return Cursor{ .impl = iter_impl, .allocator = self.allocator };
     }
 
-    /// Deprecated: use makeCursor instead.
-    pub const makeIterator = makeCursor;
 
     pub fn getUpdateLogger(_self: *SkipDBM) ?*UpdateLogger {
         _ = _self;
@@ -3592,11 +3595,11 @@ pub const SkipDBM = struct {
         return _self.impl.file;
     }
 
-    pub fn readMetadata(file: File, allocator: std.mem.Allocator) Status {
+    pub fn readMetadata(file: File, allocator: std.mem.Allocator, io: std.Io) Status {
         _ = allocator;
         // Read and validate metadata from a closed file
         var metadata_buf: [METADATA_SIZE]u8 = undefined;
-        const read_status = file.read(0, &metadata_buf);
+        const read_status = file.read(io, 0, &metadata_buf);
         if (!read_status.isOk()) return read_status;
 
         // Check magic
@@ -3607,13 +3610,14 @@ pub const SkipDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn restoreDatabase(_old_path: []const u8, _new_path: []const u8, _allocator: std.mem.Allocator, io: std.Io) Status {
-        return restoreDatabaseImpl(_old_path, _new_path, _allocator, io);
+    pub fn restoreDatabase( _allocator: std.mem.Allocator, io: std.Io,_old_path: []const u8, _new_path: []const u8) Status {
+        return restoreDatabaseImpl( _allocator, io,_old_path, _new_path);
     }
 
     /// Atomically compare and conditionally exchange the value for a key.
     pub fn compareExchange(
         self: *SkipDBM,
+        io: std.Io,
         key: []const u8,
         expected: dbm_mod.CompareExpected,
         desired: dbm_mod.CompareDesired,
@@ -3629,7 +3633,7 @@ pub const SkipDBM = struct {
             .found_out = found_out,
             .allocator = self.allocator,
         };
-        const multi_status = self.processMulti(ProcessorCompareExchange, &[_][]const u8{key}, &[_]*ProcessorCompareExchange{&proc}, true);
+        const multi_status = self.processMulti( io,ProcessorCompareExchange, &[_][]const u8{key}, &[_]*ProcessorCompareExchange{&proc}, true);
         if (!multi_status.isOk()) return multi_status;
         return status;
     }
@@ -3637,6 +3641,7 @@ pub const SkipDBM = struct {
     /// Atomically increment a stored i64 value by delta, returning the new value.
     pub fn increment(
         self: *SkipDBM,
+        io: std.Io,
         key: []const u8,
         delta: i64,
         current_out: ?*i64,
@@ -3649,21 +3654,21 @@ pub const SkipDBM = struct {
             .current_out = current_out,
             .initial = initial,
         };
-        const multi_status = self.processMulti(ProcessorIncrement, &[_][]const u8{key}, &[_]*ProcessorIncrement{&proc}, true);
+        const multi_status = self.processMulti( io,ProcessorIncrement, &[_][]const u8{key}, &[_]*ProcessorIncrement{&proc}, true);
         if (!multi_status.isOk()) return multi_status;
         return status;
     }
 
-    pub fn incrementSimple(self: *SkipDBM, key: []const u8, delta: i64, initial: i64) i64 {
+    pub fn incrementSimple(self: *SkipDBM, io: std.Io, key: []const u8, delta: i64, initial: i64) i64 {
         var result: i64 = initial;
-        _ = self.increment(key, delta, &result, initial);
+        _ = self.increment( io,key, delta, &result, initial);
         return result;
     }
 
-    pub fn getSimple(self: *SkipDBM, key: []const u8, default_value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn getSimple(self: *SkipDBM, allocator: std.mem.Allocator, io: std.Io, key: []const u8, default_value: []const u8) ![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        const st = self.get(key, &buf);
+        const st = self.get( io,key, &buf);
         if (st.isOk()) return try allocator.dupe(u8, buf.items);
         return try allocator.dupe(u8, default_value);
     }
@@ -3671,6 +3676,7 @@ pub const SkipDBM = struct {
     /// Remove and return the first record in the database (lexicographic first on ordered SkipDBM).
     pub fn popFirst(
         self: *SkipDBM,
+        io: std.Io,
         key_out: ?*std.ArrayList(u8),
         value_out: ?*std.ArrayList(u8),
     ) Status {
@@ -3679,7 +3685,7 @@ pub const SkipDBM = struct {
             .value_out = value_out,
             .allocator = self.allocator,
         };
-        return self.processFirst(ProcessorPopFirst, &proc, true);
+        return self.processFirst( io,ProcessorPopFirst, &proc, true);
     }
 
     /// Push a value at the lexicographic end using a timestamp-based key.
@@ -3687,10 +3693,10 @@ pub const SkipDBM = struct {
     /// Key is returned in key_out if non-null.
     pub fn pushLast(
         self: *SkipDBM,
+        io: std.Io,
         value: []const u8,
         wtime: f64,
         key_out: ?*std.ArrayList(u8),
-        io: std.Io,
     ) Status {
         const base: u64 = time_util.pushLastKeyBase(wtime, io);
         var seq: u64 = 0;
@@ -3698,7 +3704,7 @@ pub const SkipDBM = struct {
             const ts: u64 = base +% seq;
             var key_buf: [8]u8 = undefined;
             const key = str_util.intToStrBigEndian(ts, 8, &key_buf);
-            const st = self.set(key, value, false, null);
+            const st = self.set( io,key, value, false, null);
             if (st.code != .DUPLICATION_ERROR) {
                 if (key_out) |ko| {
                     ko.clearRetainingCapacity();
@@ -3758,10 +3764,10 @@ pub const SkipDBM = struct {
     }
 
     /// Copies the database file to dest_path, optionally syncing first.
-    pub fn copyFileData(self: *SkipDBM, dest_path: []const u8, sync_hard: bool, io: std.Io) Status {
+    pub fn copyFileData(self: *SkipDBM, io: std.Io, dest_path: []const u8, sync_hard: bool) Status {
         if (!self.isOpen()) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (sync_hard) {
-            const st = self.synchronize(true, io);
+            const st = self.synchronize( io,true);
             if (!st.isOk()) return st;
         }
         const src_path = self.getFilePathInternal();
@@ -3772,30 +3778,30 @@ pub const SkipDBM = struct {
     }
 
     /// Renames a key. Reads old value, sets under new_key, removes old_key unless copying=true.
-    pub fn rekey(self: *SkipDBM, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+    pub fn rekey(self: *SkipDBM, io: std.Io, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
         if (!self.isOpen() or !self.isWritable())
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(self.allocator);
 
-        const st_get = self.get(old_key, &value_list);
+        const st_get = self.get( io,old_key, &value_list);
         if (!st_get.isOk()) return st_get;
 
-        const st_set = self.set(new_key, value_list.items, overwrite, null);
+        const st_set = self.set( io,new_key, value_list.items, overwrite, null);
         if (!st_set.isOk()) return st_set;
 
         if (!copying) {
-            _ = self.remove(old_key, null);
+            _ = self.remove( io,old_key, null);
         }
         return Status.init(.SUCCESS);
     }
 
     /// Exports all records from this DBM to dest (any DBM with a set() method).
-    pub fn export_(self: *SkipDBM, dest: anytype) Status {
-        var iter = self.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        var st = iter.first();
+    pub fn export_(self: *SkipDBM, io: std.Io, dest: anytype) Status {
+        var iter = self.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        var st = iter.first(io);
         if (st.code == .NOT_FOUND_ERROR) return Status.init(.SUCCESS);
         if (!st.isOk()) return st;
         while (true) {
@@ -3803,11 +3809,11 @@ pub const SkipDBM = struct {
             defer key_list.deinit(self.allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get( io,&key_list, &val_list);
             if (!st_get.isOk()) break;
-            const st_set = dest.set(key_list.items, val_list.items, true, null);
+            const st_set = dest.set( io,key_list.items, val_list.items, true, null);
             if (!st_set.isOk()) return st_set;
-            st = iter.next();
+            st = iter.next(io);
             if (!st.isOk()) break;
         }
         return Status.init(.SUCCESS);
@@ -3816,13 +3822,14 @@ pub const SkipDBM = struct {
     /// Atomically checks multiple expected conditions then applies multiple desired changes.
     pub fn compareExchangeMulti(
         self: *SkipDBM,
+        io: std.Io,
         expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
         desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const get_st = self.get(cond.key, &val_list);
+            const get_st = self.get( io,cond.key, &val_list);
             switch (cond.value) {
                 .absent => {
                     if (get_st.isOk()) return Status.init(.DUPLICATION_ERROR);
@@ -3839,11 +3846,11 @@ pub const SkipDBM = struct {
         for (desired) |change| {
             switch (change.value) {
                 .remove => {
-                    const st = self.remove(change.key, null);
+                    const st = self.remove( io,change.key, null);
                     if (!st.isOk() and st.code != .NOT_FOUND_ERROR) return st;
                 },
                 .set => |new_val| {
-                    const st = self.set(change.key, new_val, true, null);
+                    const st = self.set( io,change.key, new_val, true, null);
                     if (!st.isOk()) return st;
                 },
                 .noop => {},
@@ -4029,9 +4036,9 @@ test "SkipDBM Phase 2: REMOVING_VALUE constant" {
 fn openSkipDB(alloc: std.mem.Allocator, path: []const u8) !SkipDBM {
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try SkipDBM.init(std_file.asFile(), alloc, .{});
-    const st = db.openAdvanced(path, true, .{}, .{ .insert_in_order = true }, std.testing.io);
+    const st = db.openAdvanced( std.testing.io,path, true, .{}, .{ .insert_in_order = true });
     if (!st.isOk()) {
-        db.deinit();
+        db.deinit(std.testing.io);
         return error.OpenFailed;
     }
     return db;
@@ -4044,7 +4051,7 @@ fn openSkipDB(alloc: std.mem.Allocator, path: []const u8) !SkipDBM {
 test "SkipDBM init with NullFile and deinit" {
     const alloc = std.testing.allocator;
     var db = try SkipDBM.init(file_mod.NullFile, alloc, .{});
-    db.deinit();
+    db.deinit(std.testing.io);
 }
 
 test "SkipDBM set and get basic round-trip" {
@@ -4060,26 +4067,26 @@ test "SkipDBM set and get basic round-trip" {
     // Write phase: inserts go to sorted_file; num_records is updated in-memory.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("alpha", "one", true, null).isOk());
-        try std.testing.expect(db.set("beta", "two", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"alpha", "one", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"beta", "two", true, null).isOk());
         try std.testing.expectEqual(@as(i64, 2), db.countSimple());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: reopen after close flushes sorted_file → main file.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
 
-        try std.testing.expect(db.get("alpha", &buf).isOk());
+        try std.testing.expect(db.get( std.testing.io,"alpha", &buf).isOk());
         try std.testing.expectEqualStrings("one", buf.items);
 
         buf.clearRetainingCapacity();
-        try std.testing.expect(db.get("beta", &buf).isOk());
+        try std.testing.expect(db.get( std.testing.io,"beta", &buf).isOk());
         try std.testing.expectEqualStrings("two", buf.items);
 
         _ = db.close(std.testing.io);
@@ -4099,27 +4106,27 @@ test "SkipDBM.append concatenation with delimiter" {
     // Write phase 1: set initial value and flush to disk.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("key1", "hello", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key1", "hello", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Write phase 2: append reads "hello" from main file, writes "hello world" to sorted_file.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.append("key1", "world", " ").isOk());
+        try std.testing.expect(db.append( std.testing.io,"key1", "world", " ").isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: verify concatenated value.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
-        try std.testing.expect(db.get("key1", &buf).isOk());
+        try std.testing.expect(db.get( std.testing.io,"key1", &buf).isOk());
         try std.testing.expectEqualStrings("hello world", buf.items);
 
         _ = db.close(std.testing.io);
@@ -4139,19 +4146,19 @@ test "SkipDBM.append creates new record when missing" {
     // Write phase: append to a key that doesn't exist yet.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.append("newkey", "first", "-").isOk());
+        try std.testing.expect(db.append( std.testing.io,"newkey", "first", "-").isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: verify the record was created.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(alloc);
-        try std.testing.expect(db.get("newkey", &buf).isOk());
+        try std.testing.expect(db.get( std.testing.io,"newkey", &buf).isOk());
         try std.testing.expectEqualStrings("first", buf.items);
 
         _ = db.close(std.testing.io);
@@ -4171,17 +4178,17 @@ test "SkipDBM.processFirst invokes processor on first record" {
     // Write phase: insert records in sorted order so first = "aaa".
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("aaa", "val_a", true, null).isOk());
-        try std.testing.expect(db.set("bbb", "val_b", true, null).isOk());
-        try std.testing.expect(db.set("ccc", "val_c", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"aaa", "val_a", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"bbb", "val_b", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"ccc", "val_c", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Process phase: reopen and invoke processFirst.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var visited_key: [32]u8 = undefined;
         var visited_key_len: usize = 0;
@@ -4207,7 +4214,7 @@ test "SkipDBM.processFirst invokes processor on first record" {
         };
 
         var proc: Proc = .{ .key_buf = &visited_key, .key_len = &visited_key_len, .count = &call_count };
-        const st = db.processFirst(Proc, &proc, false);
+        const st = db.processFirst( std.testing.io,Proc, &proc, false);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i32, 1), call_count);
         // insert_in_order=true + sorted insertion → first record = "aaa"
@@ -4230,17 +4237,17 @@ test "SkipDBM.processEach visits all records" {
     // Write phase.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("k1", "v1", true, null).isOk());
-        try std.testing.expect(db.set("k2", "v2", true, null).isOk());
-        try std.testing.expect(db.set("k3", "v3", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"k1", "v1", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"k2", "v2", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"k3", "v3", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Process phase.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var call_count: i32 = 0;
 
@@ -4258,7 +4265,7 @@ test "SkipDBM.processEach visits all records" {
         };
 
         var proc: Proc = .{ .count = &call_count };
-        const st = db.processEach(Proc, &proc, false);
+        const st = db.processEach( std.testing.io,Proc, &proc, false);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i32, 3), call_count);
 
@@ -4279,16 +4286,16 @@ test "SkipDBM.processMulti processes multiple keys" {
     // Write phase.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("x1", "val1", true, null).isOk());
-        try std.testing.expect(db.set("x2", "val2", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"x1", "val1", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"x2", "val2", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Process phase.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var call_count: i32 = 0;
 
@@ -4308,7 +4315,7 @@ test "SkipDBM.processMulti processes multiple keys" {
         var proc: Proc = .{ .count = &call_count };
         const keys = [_][]const u8{ "x1", "x2" };
         const procs = [_]*Proc{ &proc, &proc };
-        const st = db.processMulti(Proc, &keys, &procs, false);
+        const st = db.processMulti( std.testing.io,Proc, &keys, &procs, false);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i32, 2), call_count);
 
@@ -4327,20 +4334,20 @@ test "SkipDBM.get: null value buffer returns SUCCESS on found key" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        _ = db.set("exists", "hello", true, null);
+        _ = db.set( std.testing.io,"exists", "hello", true, null);
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         // null value = existence check only
-        const present = db.get("exists", null);
+        const present = db.get( std.testing.io,"exists", null);
         try std.testing.expect(present.isOk());
 
-        const absent = db.get("missing", null);
+        const absent = db.get( std.testing.io,"missing", null);
         try std.testing.expect(absent.code == .NOT_FOUND_ERROR);
 
         _ = db.close(std.testing.io);
@@ -4362,20 +4369,20 @@ test "SkipDBM.compareExchange: match and exchange" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("key", "foo", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key", "foo", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var actual_buf: std.ArrayList(u8) = .empty;
         defer actual_buf.deinit(alloc);
         var found: bool = false;
 
-        const st = db.compareExchange("key", .{ .exact = "foo" }, .{ .set = "bar" }, &actual_buf, &found);
+        const st = db.compareExchange( std.testing.io,"key", .{ .exact = "foo" }, .{ .set = "bar" }, &actual_buf, &found);
         try std.testing.expect(st.isOk());
         try std.testing.expect(found == true);
         try std.testing.expectEqualStrings("foo", actual_buf.items);
@@ -4385,10 +4392,10 @@ test "SkipDBM.compareExchange: match and exchange" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("key", &val_buf);
+        const st = db.get( std.testing.io,"key", &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("bar", val_buf.items);
         _ = db.close(std.testing.io);
@@ -4406,20 +4413,20 @@ test "SkipDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("key", "old", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key", "old", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var actual_buf: std.ArrayList(u8) = .empty;
         defer actual_buf.deinit(alloc);
         var found: bool = false;
 
-        const st = db.compareExchange("key", .{ .exact = "wrong" }, .{ .set = "new" }, &actual_buf, &found);
+        const st = db.compareExchange( std.testing.io,"key", .{ .exact = "wrong" }, .{ .set = "new" }, &actual_buf, &found);
         try std.testing.expectEqual(Code.INFEASIBLE_ERROR, st.code);
         try std.testing.expect(found == true);
         try std.testing.expectEqualStrings("old", actual_buf.items);
@@ -4429,10 +4436,10 @@ test "SkipDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("key", &val_buf);
+        const st = db.get( std.testing.io,"key", &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("old", val_buf.items);
         _ = db.close(std.testing.io);
@@ -4451,19 +4458,19 @@ test "SkipDBM.compareExchange: absent creates record" {
     {
         var db = try openSkipDB(alloc, full_path);
         var found: bool = false;
-        const st = db.compareExchange("newkey", .absent, .{ .set = "v" }, null, &found);
+        const st = db.compareExchange( std.testing.io,"newkey", .absent, .{ .set = "v" }, null, &found);
         try std.testing.expect(st.isOk());
         try std.testing.expect(found == false);
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("newkey", &val_buf);
+        const st = db.get( std.testing.io,"newkey", &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("v", val_buf.items);
         _ = db.close(std.testing.io);
@@ -4482,17 +4489,17 @@ test "SkipDBM.compareExchange: absent noop on missing key" {
     {
         var db = try openSkipDB(alloc, full_path);
         var found: bool = false;
-        const st = db.compareExchange("missing", .absent, .noop, null, &found);
+        const st = db.compareExchange( std.testing.io,"missing", .absent, .noop, null, &found);
         try std.testing.expect(st.isOk());
         try std.testing.expect(found == false);
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
-        const st = db.get("missing", null);
+        defer db.deinit(std.testing.io);
+        const st = db.get( std.testing.io,"missing", null);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
         _ = db.close(std.testing.io);
     }
@@ -4509,20 +4516,20 @@ test "SkipDBM.compareExchange: any probe reads without writing" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("key", "val", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key", "val", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var actual_buf: std.ArrayList(u8) = .empty;
         defer actual_buf.deinit(alloc);
         var found: bool = false;
 
-        const st = db.compareExchange("key", .any, .noop, &actual_buf, &found);
+        const st = db.compareExchange( std.testing.io,"key", .any, .noop, &actual_buf, &found);
         try std.testing.expect(st.isOk());
         try std.testing.expect(found == true);
         try std.testing.expectEqualStrings("val", actual_buf.items);
@@ -4532,10 +4539,10 @@ test "SkipDBM.compareExchange: any probe reads without writing" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("key", &val_buf);
+        const st = db.get( std.testing.io,"key", &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("val", val_buf.items);
         _ = db.close(std.testing.io);
@@ -4553,23 +4560,23 @@ test "SkipDBM.compareExchange: desired remove deletes record" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("key", "foo", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key", "foo", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        const st = db.compareExchange("key", .{ .exact = "foo" }, .remove, null, null);
+        const st = db.compareExchange( std.testing.io,"key", .{ .exact = "foo" }, .remove, null, null);
         try std.testing.expect(st.isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
-        const st = db.get("key", null);
+        defer db.deinit(std.testing.io);
+        const st = db.get( std.testing.io,"key", null);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
         _ = db.close(std.testing.io);
     }
@@ -4586,20 +4593,20 @@ test "SkipDBM.compareExchange: absent fails when key exists" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("key", "x", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key", "x", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var actual_buf: std.ArrayList(u8) = .empty;
         defer actual_buf.deinit(alloc);
         var found: bool = false;
 
-        const st = db.compareExchange("key", .absent, .{ .set = "y" }, &actual_buf, &found);
+        const st = db.compareExchange( std.testing.io,"key", .absent, .{ .set = "y" }, &actual_buf, &found);
         try std.testing.expectEqual(Code.INFEASIBLE_ERROR, st.code);
         try std.testing.expect(found == true);
         try std.testing.expectEqualStrings("x", actual_buf.items);
@@ -4620,19 +4627,19 @@ test "SkipDBM.increment: fresh key uses initial+delta" {
     {
         var db = try openSkipDB(alloc, full_path);
         var current: i64 = 0;
-        const st = db.increment("counter", 3, &current, 10);
+        const st = db.increment( std.testing.io,"counter", 3, &current, 10);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i64, 13), current);
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("counter", &val_buf);
+        const st = db.get( std.testing.io,"counter", &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(usize, 8), val_buf.items.len);
         const decoded = @as(i64, @bitCast(str_util.strToIntBigEndian(val_buf.items)));
@@ -4654,17 +4661,17 @@ test "SkipDBM.increment: existing key adds delta" {
         var db = try openSkipDB(alloc, full_path);
         var buf: [8]u8 = undefined;
         const enc = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 10))), 8, &buf);
-        try std.testing.expect(db.set("counter", enc, true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"counter", enc, true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var current: i64 = 0;
-        const st = db.increment("counter", 5, &current, 0);
+        const st = db.increment( std.testing.io,"counter", 5, &current, 0);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i64, 15), current);
 
@@ -4673,10 +4680,10 @@ test "SkipDBM.increment: existing key adds delta" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("counter", &val_buf);
+        const st = db.get( std.testing.io,"counter", &val_buf);
         try std.testing.expect(st.isOk());
         const decoded = @as(i64, @bitCast(str_util.strToIntBigEndian(val_buf.items)));
         try std.testing.expectEqual(@as(i64, 15), decoded);
@@ -4697,17 +4704,17 @@ test "SkipDBM.increment: INT64MIN probe reads without writing" {
         var db = try openSkipDB(alloc, full_path);
         var buf: [8]u8 = undefined;
         const enc = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 7))), 8, &buf);
-        try std.testing.expect(db.set("counter", enc, true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"counter", enc, true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var current: i64 = 0;
-        const st = db.increment("counter", lib_common.INT64MIN, &current, 0);
+        const st = db.increment( std.testing.io,"counter", lib_common.INT64MIN, &current, 0);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i64, 7), current);
 
@@ -4716,10 +4723,10 @@ test "SkipDBM.increment: INT64MIN probe reads without writing" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get("counter", &val_buf);
+        const st = db.get( std.testing.io,"counter", &val_buf);
         try std.testing.expect(st.isOk());
         const decoded = @as(i64, @bitCast(str_util.strToIntBigEndian(val_buf.items)));
         try std.testing.expectEqual(@as(i64, 7), decoded);
@@ -4739,17 +4746,17 @@ test "SkipDBM.increment: INT64MIN probe on missing key returns initial" {
     {
         var db = try openSkipDB(alloc, full_path);
         var current: i64 = 0;
-        const st = db.increment("missing", lib_common.INT64MIN, &current, 42);
+        const st = db.increment( std.testing.io,"missing", lib_common.INT64MIN, &current, 42);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(i64, 42), current);
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
-        const st = db.get("missing", null);
+        defer db.deinit(std.testing.io);
+        const st = db.get( std.testing.io,"missing", null);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
         _ = db.close(std.testing.io);
     }
@@ -4766,23 +4773,23 @@ test "SkipDBM.popFirst: returns and removes first record" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("a", "val_a", true, null).isOk());
-        try std.testing.expect(db.set("b", "val_b", true, null).isOk());
-        try std.testing.expect(db.set("c", "val_c", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"a", "val_a", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"b", "val_b", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"c", "val_c", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(alloc);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
 
-        const st = db.popFirst(&key_buf, &val_buf);
+        const st = db.popFirst( std.testing.io,&key_buf, &val_buf);
         try std.testing.expect(st.isOk());
         // After opening existing DB, first should be lexicographically first
         try std.testing.expectEqualStrings("a", key_buf.items);
@@ -4793,9 +4800,9 @@ test "SkipDBM.popFirst: returns and removes first record" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         // Verify that "a" was actually removed (doesn't exist anymore)
-        const st = db.get("a", null);
+        const st = db.get( std.testing.io,"a", null);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
         _ = db.close(std.testing.io);
     }
@@ -4812,10 +4819,10 @@ test "SkipDBM.popFirst: empty returns NOT_FOUND_ERROR" {
 
     {
         var db = try openSkipDB(alloc, full_path);
-        const st = db.popFirst(null, null);
+        const st = db.popFirst( std.testing.io,null, null);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, st.code);
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 }
 
@@ -4831,21 +4838,21 @@ test "SkipDBM.popFirst: returns lexicographic first" {
     // insert_in_order=true requires keys in sorted order; "a" < "b" < "c"
     {
         var db = try openSkipDB(alloc, full_path);
-        try std.testing.expect(db.set("a", "val_a", true, null).isOk());
-        try std.testing.expect(db.set("b", "val_b", true, null).isOk());
-        try std.testing.expect(db.set("c", "val_c", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"a", "val_a", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"b", "val_b", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"c", "val_c", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(alloc);
 
-        const st = db.popFirst(&key_buf, null);
+        const st = db.popFirst( std.testing.io,&key_buf, null);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("a", key_buf.items);
 
@@ -4869,21 +4876,21 @@ test "SkipDBM.pushLast: creates record with key_out" {
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(alloc);
 
-        const st = db.pushLast("hello", -1, &key_buf, std.testing.io);
+        const st = db.pushLast( std.testing.io,"hello", -1, &key_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqual(@as(usize, 8), key_buf.items.len);
         @memcpy(generated_key[0..8], key_buf.items[0..8]);
 
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        const st = db.get(&generated_key, &val_buf);
+        const st = db.get( std.testing.io,&generated_key, &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("hello", val_buf.items);
         _ = db.close(std.testing.io);
@@ -4909,8 +4916,8 @@ test "SkipDBM.pushLast: two pushes generate different keys" {
         var key2: std.ArrayList(u8) = .empty;
         defer key2.deinit(alloc);
 
-        const st1 = db.pushLast("a", 1000.0, &key1, std.testing.io);
-        const st2 = db.pushLast("b", 2000.0, &key2, std.testing.io);
+        const st1 = db.pushLast( std.testing.io,"a", 1000.0, &key1);
+        const st2 = db.pushLast( std.testing.io,"b", 2000.0, &key2);
 
         try std.testing.expect(st1.isOk());
         try std.testing.expect(st2.isOk());
@@ -4921,20 +4928,20 @@ test "SkipDBM.pushLast: two pushes generate different keys" {
         @memcpy(key2_data[0..8], key2.items[0..8]);
 
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var val1: std.ArrayList(u8) = .empty;
         defer val1.deinit(alloc);
         var val2: std.ArrayList(u8) = .empty;
         defer val2.deinit(alloc);
 
-        const st1 = db.get(&key1_data, &val1);
-        const st2 = db.get(&key2_data, &val2);
+        const st1 = db.get( std.testing.io,&key1_data, &val1);
+        const st2 = db.get( std.testing.io,&key2_data, &val2);
 
         try std.testing.expect(st1.isOk());
         try std.testing.expect(st2.isOk());
@@ -4959,23 +4966,23 @@ test "SkipDBM.pushLast: pop-after-push round-trips value" {
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(alloc);
 
-        const st = db.pushLast("round-trip", -1, &key_buf, std.testing.io);
+        const st = db.pushLast( std.testing.io,"round-trip", -1, &key_buf);
         try std.testing.expect(st.isOk());
 
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     {
         var db = try openSkipDB(alloc, full_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var key_buf: std.ArrayList(u8) = .empty;
         defer key_buf.deinit(alloc);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
 
-        const st = db.popFirst(&key_buf, &val_buf);
+        const st = db.popFirst( std.testing.io,&key_buf, &val_buf);
         try std.testing.expect(st.isOk());
         try std.testing.expectEqualStrings("round-trip", val_buf.items);
 
@@ -4999,10 +5006,10 @@ test "SkipDBM: open/close lifecycle and isOpen" {
 
     const sf = try file_mod.StdFile.create(alloc);
     var db = try SkipDBM.init(sf.asFile(), alloc, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     try std.testing.expect(!db.isOpen());
-    try std.testing.expect(db.open(file_path, true, .{}, std.testing.io).isOk());
+    try std.testing.expect(db.open( std.testing.io,file_path, true, .{}).isOk());
     try std.testing.expect(db.isOpen());
     try std.testing.expect(db.close(std.testing.io).isOk());
     try std.testing.expect(!db.isOpen());
@@ -5026,31 +5033,31 @@ test "SkipDBM: set, get, remove, countSimple" {
     // Write phase: insert two records and verify in-memory count.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("alpha", "one", true, null).isOk());
-        try std.testing.expect(db.set("beta", "two", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"alpha", "one", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"beta", "two", true, null).isOk());
         try std.testing.expectEqual(@as(i64, 2), db.countSimple());
         // missing key is not found even before the merge.
-        try std.testing.expect(db.get("missing", null).code == .NOT_FOUND_ERROR);
+        try std.testing.expect(db.get( std.testing.io,"missing", null).code == .NOT_FOUND_ERROR);
         // remove appends a tombstone and succeeds.
-        try std.testing.expect(db.remove("alpha", null).isOk());
+        try std.testing.expect(db.remove( std.testing.io,"alpha", null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: reopen after close to verify the merge result.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var val: std.ArrayList(u8) = .empty;
         defer val.deinit(alloc);
 
         // beta was set and should be readable after merge.
-        try std.testing.expect(db.get("beta", &val).isOk());
+        try std.testing.expect(db.get( std.testing.io,"beta", &val).isOk());
         try std.testing.expectEqualStrings("two", val.items);
 
         // missing key still returns NOT_FOUND_ERROR.
-        try std.testing.expect(db.get("missing", null).code == .NOT_FOUND_ERROR);
+        try std.testing.expect(db.get( std.testing.io,"missing", null).code == .NOT_FOUND_ERROR);
 
         _ = db.close(std.testing.io);
     }
@@ -5069,21 +5076,21 @@ test "SkipDBM: iterator forward traversal" {
     // Write phase: insert three records in lexicographic order, then close to flush.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("aaa", "v1", true, null).isOk());
-        try std.testing.expect(db.set("bbb", "v2", true, null).isOk());
-        try std.testing.expect(db.set("ccc", "v3", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"ccc", "v3", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: reopen and iterate.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
-        var iter = try db.makeCursor();
-        defer iter.deinit();
-        try std.testing.expect(iter.first().isOk());
+        var iter = try db.makeCursor(std.testing.io);
+        defer iter.deinit(std.testing.io);
+        try std.testing.expect(iter.first(std.testing.io).isOk());
 
         var seen: usize = 0;
         while (true) {
@@ -5092,13 +5099,13 @@ test "SkipDBM: iterator forward traversal" {
             var value: std.ArrayList(u8) = .empty;
             defer value.deinit(alloc);
 
-            const st = iter.get(&key, &value);
+            const st = iter.get( std.testing.io,&key, &value);
             if (st.code == .NOT_FOUND_ERROR) break;
             try std.testing.expect(st.isOk());
             try std.testing.expect(key.items.len > 0);
             try std.testing.expect(value.items.len > 0);
             seen += 1;
-            _ = iter.next();
+            _ = iter.next(std.testing.io);
         }
         try std.testing.expectEqual(@as(usize, 3), seen);
 
@@ -5119,23 +5126,23 @@ test "SkipDBM: Zig-style Iterator iterate()" {
     // Write phase: insert records and flush.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("aaa", "v1", true, null).isOk());
-        try std.testing.expect(db.set("bbb", "v2", true, null).isOk());
-        try std.testing.expect(db.set("ccc", "v3", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"ccc", "v3", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: use Zig-style iterator.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
-        var iter = try db.iterate(alloc);
-        defer iter.deinit();
+        var iter = try db.iterate(alloc, std.testing.io);
+        defer iter.deinit(std.testing.io);
 
         var count: usize = 0;
-        while (try iter.next()) |entry| {
+        while (try iter.next(std.testing.io)) |entry| {
             try std.testing.expect(entry.key.len > 0);
             try std.testing.expect(entry.value.len > 0);
             count += 1;
@@ -5146,7 +5153,7 @@ test "SkipDBM: Zig-style Iterator iterate()" {
     }
 }
 
-test "SkipDBM: Zig-style Iterator iterateFrom() with lifetime contract" {
+test "SkipDBM: Zig-style Iterator iterateFrom(std.testing.io) with lifetime contract" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5159,22 +5166,22 @@ test "SkipDBM: Zig-style Iterator iterateFrom() with lifetime contract" {
     // Write phase: insert records and flush.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.set("aaa", "v1", true, null).isOk());
-        try std.testing.expect(db.set("bbb", "v2", true, null).isOk());
-        try std.testing.expect(db.set("ccc", "v3", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"ccc", "v3", true, null).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: iterateFrom "bbb" and demonstrate lifetime contract.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
-        var iter = try db.iterateFrom("bbb", alloc);
-        defer iter.deinit();
+        var iter = try db.iterateFrom( alloc, std.testing.io,"bbb");
+        defer iter.deinit(std.testing.io);
 
-        const first = try iter.next();
+        const first = try iter.next(std.testing.io);
         try std.testing.expect(first != null);
         try std.testing.expect(std.mem.startsWith(u8, first.?.key, "b"));
 
@@ -5183,7 +5190,7 @@ test "SkipDBM: Zig-style Iterator iterateFrom() with lifetime contract" {
         defer alloc.free(key_copy);
 
         // Second next() — first.?.key is now invalid, but key_copy is safe.
-        const second = try iter.next();
+        const second = try iter.next(std.testing.io);
         try std.testing.expect(second != null);
         try std.testing.expect(std.mem.startsWith(u8, second.?.key, "c"));
 
@@ -5239,7 +5246,7 @@ test "SkipDBM: UpdateLogger integration" {
     // Phase 1: verify writeSet and writeRemove.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var mock_ctx: SkipMockLoggerCtx = .{};
         var mock_logger: UpdateLogger = .{
@@ -5253,10 +5260,10 @@ test "SkipDBM: UpdateLogger integration" {
         // setUpdateLogger is a no-op stub; wire directly to impl.
         db.impl.update_logger = &mock_logger;
 
-        try std.testing.expect(db.set("key1", "val1", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key1", "val1", true, null).isOk());
         try std.testing.expect(mock_ctx.writeSet_count > 0);
 
-        try std.testing.expect(db.remove("key1", null).isOk());
+        try std.testing.expect(db.remove( std.testing.io,"key1", null).isOk());
         try std.testing.expect(mock_ctx.writeRemove_count > 0);
 
         _ = db.close(std.testing.io);
@@ -5267,7 +5274,7 @@ test "SkipDBM: UpdateLogger integration" {
         var db = try openSkipDB(alloc, file_path);
         // Do NOT call close() after clear() — clear() discards the sorter and
         // close() would panic trying to finish a null sorter. deinit() is safe.
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var mock_ctx: SkipMockLoggerCtx = .{};
         var mock_logger: UpdateLogger = .{
@@ -5280,7 +5287,7 @@ test "SkipDBM: UpdateLogger integration" {
         };
         db.impl.update_logger = &mock_logger;
 
-        try std.testing.expect(db.set("key2", "val2", true, null).isOk());
+        try std.testing.expect(db.set( std.testing.io,"key2", "val2", true, null).isOk());
         const pre_clear = mock_ctx.writeClear_count;
         try std.testing.expect(db.clear(std.testing.io).isOk());
         try std.testing.expect(mock_ctx.writeClear_count > pre_clear);
@@ -5306,9 +5313,9 @@ test "SkipDBM.*Multi: bulk set/get/remove/append" {
     // Write phase: setMulti then close to flush to main file.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.setMulti(&pairs, true).isOk());
+        try std.testing.expect(db.setMulti( std.testing.io,&pairs, true).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Read phase: getMulti — two found, one missing.
@@ -5324,40 +5331,216 @@ test "SkipDBM.*Multi: bulk set/get/remove/append" {
             }
             records.deinit();
         }
-        const get_st = db.getMulti(&.{ "key1", "key2", "missing" }, &records);
+        const get_st = db.getMulti( std.testing.io,&.{ "key1", "key2", "missing" }, &records);
         try std.testing.expectEqual(Code.NOT_FOUND_ERROR, get_st.code);
         try std.testing.expectEqual(@as(usize, 2), records.count());
 
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Remove phase: removeMulti then close to flush tombstones.
     {
         var db = try openSkipDB(alloc, file_path);
-        try std.testing.expect(db.removeMulti(&.{ "key1", "key2" }).isOk());
+        try std.testing.expect(db.removeMulti( std.testing.io,&.{ "key1", "key2" }).isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Append phase: appendMulti then close to flush.
     {
         var db = try openSkipDB(alloc, file_path);
         const app = [_][2][]const u8{.{ "key3", "_appended" }};
-        try std.testing.expect(db.appendMulti(&app, "").isOk());
+        try std.testing.expect(db.appendMulti( std.testing.io,&app, "").isOk());
         _ = db.close(std.testing.io);
-        db.deinit();
+        db.deinit(std.testing.io);
     }
 
     // Verify phase: reopen and read back key3.
     {
         var db = try openSkipDB(alloc, file_path);
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
 
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(alloc);
-        try std.testing.expect(db.get("key3", &val_buf).isOk());
+        try std.testing.expect(db.get( std.testing.io,"key3", &val_buf).isOk());
         try std.testing.expectEqualStrings("val3_appended", val_buf.items);
+
+        _ = db.close(std.testing.io);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Cursor navigation tests (file-backed) — exercise io threading through
+// SkipRecord.search / readMetadataKey / readBody on real file I/O.
+// --------------------------------------------------------------------------
+
+test "SkipDBM.Cursor: jump to specific key" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf)];
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/cur_jump.tks", .{dir_path});
+    defer alloc.free(file_path);
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        try std.testing.expect(db.set(std.testing.io, "aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "ccc", "v3", true, null).isOk());
+        _ = db.close(std.testing.io);
+        db.deinit(std.testing.io);
+    }
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        defer db.deinit(std.testing.io);
+
+        var cur = try db.makeCursor(std.testing.io);
+        defer cur.deinit(std.testing.io);
+
+        try std.testing.expect(cur.jump(std.testing.io, "bbb").isOk());
+
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(alloc);
+        var value: std.ArrayList(u8) = .empty;
+        defer value.deinit(alloc);
+        try std.testing.expect(cur.get(std.testing.io, &key, &value).isOk());
+        try std.testing.expectEqualStrings("bbb", key.items);
+        try std.testing.expectEqualStrings("v2", value.items);
+
+        _ = db.close(std.testing.io);
+    }
+}
+
+test "SkipDBM.Cursor: jumpLower inclusive and exclusive" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf)];
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/cur_jl.tks", .{dir_path});
+    defer alloc.free(file_path);
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        try std.testing.expect(db.set(std.testing.io, "aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "ccc", "v3", true, null).isOk());
+        _ = db.close(std.testing.io);
+        db.deinit(std.testing.io);
+    }
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        defer db.deinit(std.testing.io);
+
+        // inclusive=true on existing key returns that key
+        var cur = try db.makeCursor(std.testing.io);
+        defer cur.deinit(std.testing.io);
+        try std.testing.expect(cur.jumpLower(std.testing.io, "bbb", true).isOk());
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(alloc);
+        try std.testing.expect(cur.get(std.testing.io, &key, null).isOk());
+        try std.testing.expectEqualStrings("bbb", key.items);
+
+        // inclusive=false on existing key returns the previous key
+        var cur2 = try db.makeCursor(std.testing.io);
+        defer cur2.deinit(std.testing.io);
+        try std.testing.expect(cur2.jumpLower(std.testing.io, "bbb", false).isOk());
+        var key2: std.ArrayList(u8) = .empty;
+        defer key2.deinit(alloc);
+        try std.testing.expect(cur2.get(std.testing.io, &key2, null).isOk());
+        try std.testing.expectEqualStrings("aaa", key2.items);
+
+        _ = db.close(std.testing.io);
+    }
+}
+
+test "SkipDBM.Cursor: jumpUpper inclusive and exclusive" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf)];
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/cur_ju.tks", .{dir_path});
+    defer alloc.free(file_path);
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        try std.testing.expect(db.set(std.testing.io, "aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "ccc", "v3", true, null).isOk());
+        _ = db.close(std.testing.io);
+        db.deinit(std.testing.io);
+    }
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        defer db.deinit(std.testing.io);
+
+        // inclusive=true on existing key returns that key
+        var cur = try db.makeCursor(std.testing.io);
+        defer cur.deinit(std.testing.io);
+        try std.testing.expect(cur.jumpUpper(std.testing.io, "bbb", true).isOk());
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(alloc);
+        try std.testing.expect(cur.get(std.testing.io, &key, null).isOk());
+        try std.testing.expectEqualStrings("bbb", key.items);
+
+        // inclusive=false on existing key returns the next key
+        var cur2 = try db.makeCursor(std.testing.io);
+        defer cur2.deinit(std.testing.io);
+        try std.testing.expect(cur2.jumpUpper(std.testing.io, "bbb", false).isOk());
+        var key2: std.ArrayList(u8) = .empty;
+        defer key2.deinit(alloc);
+        try std.testing.expect(cur2.get(std.testing.io, &key2, null).isOk());
+        try std.testing.expectEqualStrings("ccc", key2.items);
+
+        _ = db.close(std.testing.io);
+    }
+}
+
+test "SkipDBM.Cursor: previous traversal" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try std.Io.Dir.realPathFile(tmp.dir, std.testing.io, ".", &path_buf)];
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/cur_prev.tks", .{dir_path});
+    defer alloc.free(file_path);
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        try std.testing.expect(db.set(std.testing.io, "aaa", "v1", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "bbb", "v2", true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, "ccc", "v3", true, null).isOk());
+        _ = db.close(std.testing.io);
+        db.deinit(std.testing.io);
+    }
+
+    {
+        var db = try openSkipDB(alloc, file_path);
+        defer db.deinit(std.testing.io);
+
+        var cur = try db.makeCursor(std.testing.io);
+        defer cur.deinit(std.testing.io);
+
+        try std.testing.expect(cur.last(std.testing.io).isOk());
+
+        const expected = [_][]const u8{ "ccc", "bbb", "aaa" };
+        for (expected) |expect_key| {
+            var key: std.ArrayList(u8) = .empty;
+            defer key.deinit(alloc);
+            try std.testing.expect(cur.get(std.testing.io, &key, null).isOk());
+            try std.testing.expectEqualStrings(expect_key, key.items);
+            _ = cur.previous(std.testing.io);
+        }
 
         _ = db.close(std.testing.io);
     }

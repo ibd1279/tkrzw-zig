@@ -6,7 +6,7 @@
 //   - Records use a chained hash (linked list per bucket via child_offset field).
 //   - On write, new records are always appended (FBP is skipped — always append).
 //   - Overwritten records are voided in place; the chain is repaired.
-//   - Thread safety: SpinSharedMutex (impl.mutex) guards open/close/clear/rebuild.
+//   - Thread safety: std.Io.RwLock (impl.mutex) guards open/close/clear/rebuild.
 //     Per-bucket locking via HashMutex (impl.record_mutex) for processImpl.
 
 const std = @import("std");
@@ -156,6 +156,7 @@ fn encodeOffset(offset: i64, align_pow: i32) i64 {
 // ---------------------------------------------------------------------------
 
 fn saveMetadata(
+    io: std.Io,
     file: File,
     cyclic_magic: *u8,
     static_flags: u8,
@@ -200,10 +201,11 @@ fn saveMetadata(
     // cyclic_magic_back at offset 127
     buf[127] = cyclic_magic.*;
 
-    return file.write(0, &buf);
+    return file.write(io, 0, &buf);
 }
 
 fn loadMetadata(
+    io: std.Io,
     file: File,
     static_flags: *u8,
     offset_width: *i32,
@@ -220,7 +222,7 @@ fn loadMetadata(
     auto_restored: *bool,
 ) Status {
     var buf: [METADATA_SIZE]u8 = undefined;
-    const st = file.read(0, &buf);
+    const st = file.read(io, 0, &buf);
     if (!st.isOk()) return st;
 
     if (!std.mem.eql(u8, buf[0..9], META_MAGIC)) {
@@ -285,7 +287,7 @@ const HashDBMImpl = struct {
     record_base: i64 = 0,
     update_logger: ?*dbm_mod.UpdateLogger = null,
     iterators: std.ArrayListUnmanaged(*HashDBMIteratorImpl) = .empty,
-    mutex: thread_util.SpinSharedMutex = .{},
+    mutex: std.Io.RwLock = .init,
     record_mutex: thread_util.HashMutex,
     cyclic_magic: u8 = 0,
     closure_flags: u8 = 0,
@@ -313,9 +315,9 @@ const HashDBMImpl = struct {
         return self;
     }
 
-    fn deinit(self: *HashDBMImpl) void {
+    fn deinit(self: *HashDBMImpl, io: std.Io) void {
         if (self.open) {
-            _ = self.closeImpl();
+            _ = self.closeImpl(io);
         }
         // Orphan iterators.
         for (self.iterators.items) |iter| {
@@ -328,22 +330,22 @@ const HashDBMImpl = struct {
         self.allocator.destroy(self);
     }
 
-    fn openImpl(self: *HashDBMImpl, path: []const u8, writable: bool, options: file_mod.OpenOptions, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn openImpl(self: *HashDBMImpl, io: std.Io, path: []const u8, writable: bool, options: file_mod.OpenOptions) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "already open");
         }
 
-        const st_open = self.file.open(path, writable, options);
+        const st_open = self.file.open(io, path, writable, options);
         if (!st_open.isOk()) return st_open;
 
         const file_sz = self.file.getSizeSimple();
         if (file_sz < METADATA_SIZE) {
             // New file — write initial metadata + FBP + bucket array.
             if (!writable) {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return Status.initMsg(.BROKEN_DATA_ERROR, "new file opened read-only");
             }
             const ts_i64: i64 = std.Io.Clock.real.now(io).toMicroseconds();
@@ -357,6 +359,7 @@ const HashDBMImpl = struct {
             // Write header.
             var cm: u8 = 0;
             const st_meta = saveMetadata(
+                io,
                 self.file,
                 &cm,
                 self.static_flags,
@@ -372,16 +375,16 @@ const HashDBMImpl = struct {
                 false,
             );
             if (!st_meta.isOk()) {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return st_meta;
             }
             self.cyclic_magic = cm;
 
             // Write FBP section (zeros).
             var fbp_buf: [FBP_SECTION_SIZE]u8 = [_]u8{0} ** FBP_SECTION_SIZE;
-            const st_fbp = self.file.write(METADATA_SIZE, &fbp_buf);
+            const st_fbp = self.file.write(io, METADATA_SIZE, &fbp_buf);
             if (!st_fbp.isOk()) {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return st_fbp;
             }
 
@@ -389,21 +392,21 @@ const HashDBMImpl = struct {
             const bucket_bytes: i64 = self.num_buckets * @as(i64, self.offset_width);
             const total_zero: usize = @intCast(rb - BUCKET_BASE_OFFSET);
             const zero_buf = self.allocator.alloc(u8, total_zero) catch {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return Status.init(.SYSTEM_ERROR);
             };
             defer self.allocator.free(zero_buf);
             @memset(zero_buf, 0);
-            const st_zero = self.file.write(BUCKET_BASE_OFFSET, zero_buf);
+            const st_zero = self.file.write(io, BUCKET_BASE_OFFSET, zero_buf);
             if (!st_zero.isOk()) {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return st_zero;
             }
             _ = bucket_bytes;
             // Truncate to record_base to set logical_size so appends start at the right offset.
-            const st_trunc_init = self.file.truncate(rb);
+            const st_trunc_init = self.file.truncate(io, rb);
             if (!st_trunc_init.isOk()) {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return st_trunc_init;
             }
         } else {
@@ -414,6 +417,7 @@ const HashDBMImpl = struct {
             var fsz: i64 = 0;
             var ts: i64 = 0;
             const st_load = loadMetadata(
+                io,
                 self.file,
                 &self.static_flags,
                 &self.offset_width,
@@ -430,7 +434,7 @@ const HashDBMImpl = struct {
                 &auto_restored_flag,
             );
             if (!st_load.isOk()) {
-                _ = self.file.close();
+                _ = self.file.close(io);
                 return st_load;
             }
             self.auto_restored = auto_restored_flag;
@@ -446,7 +450,7 @@ const HashDBMImpl = struct {
 
         self.path.clearRetainingCapacity();
         self.path.appendSlice(self.allocator, path) catch {
-            _ = self.file.close();
+            _ = self.file.close(io);
             return Status.init(.SYSTEM_ERROR);
         };
         self.open = true;
@@ -456,9 +460,9 @@ const HashDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn closeImpl(self: *HashDBMImpl) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn closeImpl(self: *HashDBMImpl, io: std.Io) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
@@ -470,6 +474,7 @@ const HashDBMImpl = struct {
             self.file_size = self.file.getSizeSimple();
             var cm = self.cyclic_magic;
             const st_meta = saveMetadata(
+                io,
                 self.file,
                 &cm,
                 self.static_flags,
@@ -488,7 +493,7 @@ const HashDBMImpl = struct {
             status.mergeFrom(st_meta);
         }
 
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
 
         // Orphan iterators.
         for (self.iterators.items) |iter| {
@@ -504,46 +509,46 @@ const HashDBMImpl = struct {
     }
 
     // Read a bucket value (raw encoded offset; 0 = empty).
-    fn readBucket(self: *HashDBMImpl, bucket_index: i64) !i64 {
+    fn readBucket(self: *HashDBMImpl, io: std.Io, bucket_index: i64) !i64 {
         const off = bucketFileOffset(bucket_index, self.offset_width);
         var buf: [8]u8 = undefined;
         const ow: usize = @intCast(self.offset_width);
-        const st = self.file.read(off, buf[0..ow]);
+        const st = self.file.read(io, off, buf[0..ow]);
         if (!st.isOk()) return error.IOError;
         return readOffsetWidth(buf[0..ow], self.offset_width);
     }
 
     // Write a bucket value.
-    fn writeBucket(self: *HashDBMImpl, bucket_index: i64, raw_offset: i64) !void {
+    fn writeBucket(self: *HashDBMImpl, io: std.Io, bucket_index: i64, raw_offset: i64) !void {
         const off = bucketFileOffset(bucket_index, self.offset_width);
         var buf: [8]u8 = [_]u8{0} ** 8;
         writeOffsetWidth(buf[0..@intCast(self.offset_width)], raw_offset, self.offset_width);
-        const st = self.file.write(off, buf[0..@intCast(self.offset_width)]);
+        const st = self.file.write(io, off, buf[0..@intCast(self.offset_width)]);
         if (!st.isOk()) return error.IOError;
     }
 
     // Read child offset field from an existing record.
-    fn readChildOffset(self: *HashDBMImpl, record_offset: i64) !i64 {
+    fn readChildOffset(self: *HashDBMImpl, io: std.Io, record_offset: i64) !i64 {
         var buf: [8]u8 = undefined;
         const ow: usize = @intCast(self.offset_width);
-        const st = self.file.read(record_offset + 1, buf[0..ow]);
+        const st = self.file.read(io, record_offset + 1, buf[0..ow]);
         if (!st.isOk()) return error.IOError;
         const raw = readOffsetWidth(buf[0..ow], self.offset_width);
         return decodeChildOffset(raw, self.align_pow);
     }
 
     // Write child offset field in an existing record.
-    fn writeChildOffset(self: *HashDBMImpl, record_offset: i64, child_offset: i64) !void {
+    fn writeChildOffset(self: *HashDBMImpl, io: std.Io, record_offset: i64, child_offset: i64) !void {
         var buf: [8]u8 = [_]u8{0} ** 8;
         const raw = encodeOffset(child_offset, self.align_pow);
         writeOffsetWidth(buf[0..@intCast(self.offset_width)], raw, self.offset_width);
-        const st = self.file.write(record_offset + 1, buf[0..@intCast(self.offset_width)]);
+        const st = self.file.write(io, record_offset + 1, buf[0..@intCast(self.offset_width)]);
         if (!st.isOk()) return error.IOError;
     }
 
     // Void a record in place (overwrite magic byte with RECORD_MAGIC_VOID).
-    fn voidRecord(self: *HashDBMImpl, record_offset: i64) !void {
-        const st = self.file.write(record_offset, &[_]u8{RECORD_MAGIC_VOID});
+    fn voidRecord(self: *HashDBMImpl, io: std.Io, record_offset: i64) !void {
+        const st = self.file.write(io, record_offset, &[_]u8{RECORD_MAGIC_VOID});
         if (!st.isOk()) return error.IOError;
     }
 
@@ -564,18 +569,18 @@ const HashDBMImpl = struct {
     // Read just the record header from file at record_offset without allocating key/value.
     // Reads the fixed prefix (magic + child) first, then varint bytes one-at-a-time until
     // the header parses successfully.  Uses an on-stack buffer; safe for small records.
-    fn readRecordHeaderFromFile(self: *HashDBMImpl, record_offset: i64) !RecordHeader {
+    fn readRecordHeaderFromFile(self: *HashDBMImpl, io: std.Io, record_offset: i64) !RecordHeader {
         var hdr_buf: [64]u8 = undefined;
         const fixed_hdr_size: usize = 1 + @as(usize, @intCast(self.offset_width));
         {
-            const st = self.file.read(record_offset, hdr_buf[0..fixed_hdr_size]);
+            const st = self.file.read(io, record_offset, hdr_buf[0..fixed_hdr_size]);
             if (!st.isOk()) return error.IOError;
         }
         var varint_read: usize = 0;
         const max_varint_bytes: usize = 30; // 3 varints × max 10 bytes each
         while (varint_read < max_varint_bytes) : (varint_read += 1) {
             const byte_off: i64 = record_offset + @as(i64, @intCast(fixed_hdr_size + varint_read));
-            const st = self.file.read(byte_off, hdr_buf[fixed_hdr_size + varint_read .. fixed_hdr_size + varint_read + 1]);
+            const st = self.file.read(io, byte_off, hdr_buf[fixed_hdr_size + varint_read .. fixed_hdr_size + varint_read + 1]);
             if (!st.isOk()) break;
             const tentative = readRecordHeader(hdr_buf[0 .. fixed_hdr_size + varint_read + 1], self.offset_width);
             if (tentative != null) {
@@ -586,9 +591,9 @@ const HashDBMImpl = struct {
         return readRecordHeader(hdr_buf[0 .. fixed_hdr_size + varint_read], self.offset_width) orelse error.BrokenData;
     }
 
-    fn readFullRecord(self: *HashDBMImpl, record_offset: i64, allocator: std.mem.Allocator) !FullRecord {
+    fn readFullRecord(self: *HashDBMImpl, allocator: std.mem.Allocator, io: std.Io, record_offset: i64) !FullRecord {
         const hdr = blk: {
-            const hdr_raw = try self.readRecordHeaderFromFile(record_offset);
+            const hdr_raw = try self.readRecordHeaderFromFile(io, record_offset);
             var h = hdr_raw;
             h.child_offset = decodeChildOffset(hdr_raw.child_offset, self.align_pow);
             break :blk h;
@@ -609,7 +614,7 @@ const HashDBMImpl = struct {
             // Read key and value together for efficiency if sizes are small.
             const data_buf = try allocator.alloc(u8, total_data);
             defer allocator.free(data_buf);
-            const st = self.file.read(data_start, data_buf);
+            const st = self.file.read(io, data_start, data_buf);
             if (!st.isOk()) return error.IOError;
             @memcpy(key, data_buf[0..key_size]);
             if (value_size > 0) @memcpy(value, data_buf[key_size..]);
@@ -640,6 +645,7 @@ const HashDBMImpl = struct {
     // Write a new record to file (appended). Returns the file offset of the new record.
     fn appendRecord(
         self: *HashDBMImpl,
+        io: std.Io,
         op_type: u8,
         child_offset: i64,
         key: []const u8,
@@ -692,7 +698,7 @@ const HashDBMImpl = struct {
 
         // Append to file and get offset.
         var new_off: i64 = 0;
-        const st = self.file.append(buf, &new_off);
+        const st = self.file.append(io, buf, &new_off);
         if (!st.isOk()) return error.IOError;
         return new_off;
     }
@@ -700,6 +706,7 @@ const HashDBMImpl = struct {
     // Update a record's value in-place (only valid when value_size + varint width is same).
     fn updateRecordValueInPlace(
         self: *HashDBMImpl,
+        io: std.Io,
         record_offset: i64,
         hdr: RecordHeader,
         key: []const u8,
@@ -721,12 +728,12 @@ const HashDBMImpl = struct {
         _ = new_val_vsize;
 
         // Write magic byte.
-        const st1 = self.file.write(record_offset, &[_]u8{new_magic});
+        const st1 = self.file.write(io, record_offset, &[_]u8{new_magic});
         if (!st1.isOk()) return error.IOError;
 
         // Write new value at key_data_end.
         const value_start: i64 = record_offset + @as(i64, @intCast(header_bytes)) + @as(i64, @intCast(hdr.key_size));
-        const st2 = self.file.write(value_start, new_value);
+        const st2 = self.file.write(io, value_start, new_value);
         if (!st2.isOk()) return error.IOError;
 
         // If new_value is shorter, zero out the remainder (part of old value that's now padding).
@@ -735,22 +742,22 @@ const HashDBMImpl = struct {
             const zero_buf = try self.allocator.alloc(u8, leftover);
             defer self.allocator.free(zero_buf);
             @memset(zero_buf, 0);
-            const st3 = self.file.write(value_start + @as(i64, @intCast(new_value.len)), zero_buf);
+            const st3 = self.file.write(io, value_start + @as(i64, @intCast(new_value.len)), zero_buf);
             if (!st3.isOk()) return error.IOError;
         }
     }
 
     // Core process implementation — called with bucket mutex already held.
-    fn processImpl(self: *HashDBMImpl, key: []const u8, proc: anytype, writable: bool, bucket_index: i64) Status {
+    fn processImpl(self: *HashDBMImpl, io: std.Io, key: []const u8, proc: anytype, writable: bool, bucket_index: i64) Status {
         // Read first_offset from bucket.
-        const first_raw = self.readBucket(bucket_index) catch return Status.init(.SYSTEM_ERROR);
+        const first_raw = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
         const first_offset: i64 = if (first_raw == 0) 0 else decodeChildOffset(first_raw, self.align_pow);
 
         var prev_offset: i64 = 0; // 0 = no prev (head of chain)
         var cur_offset: i64 = first_offset;
 
         while (cur_offset != 0) {
-            var rec = self.readFullRecord(cur_offset, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+            var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
             defer rec.deinit();
 
             if (rec.header.op_type == RECORD_MAGIC_VOID) {
@@ -778,15 +785,15 @@ const HashDBMImpl = struct {
                 .noop => return Status.init(.SUCCESS),
                 .remove => {
                     // Void record and unlink from chain.
-                    self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                    self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                     // Unlink: point prev (or bucket) to child.
                     const child = rec.header.child_offset;
                     if (prev_offset == 0) {
                         // Update bucket to point to child.
                         const raw_child = if (child == 0) @as(i64, 0) else encodeOffset(child, self.align_pow);
-                        self.writeBucket(bucket_index, raw_child) catch return Status.init(.SYSTEM_ERROR);
+                        self.writeBucket(io, bucket_index, raw_child) catch return Status.init(.SYSTEM_ERROR);
                     } else {
-                        self.writeChildOffset(prev_offset, child) catch return Status.init(.SYSTEM_ERROR);
+                        self.writeChildOffset(io, prev_offset, child) catch return Status.init(.SYSTEM_ERROR);
                     }
                     _ = self.num_records.fetchSub(1, .monotonic);
                     const eds_delta: i64 = -@as(i64, @intCast(key.len + rec.value.len));
@@ -803,22 +810,22 @@ const HashDBMImpl = struct {
                     // In-place update: new value fits within old value size (no varint growth needed
                     // if varint width is same and new value <= old value size).
                     if (new_val_vsize == old_val_vsize and new_v.len <= @as(usize, @intCast(rec.header.value_size))) {
-                        self.updateRecordValueInPlace(cur_offset, rec.header, key, new_v) catch
+                        self.updateRecordValueInPlace(io, cur_offset, rec.header, key, new_v) catch
                             return Status.init(.SYSTEM_ERROR);
                         const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.header.value_size));
                         _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
                     } else {
                         // Append new record with child = rec.child_offset.
-                        const new_off = self.appendRecord(RECORD_MAGIC_SET, rec.header.child_offset, key, new_v, 0) catch
+                        const new_off = self.appendRecord(io, RECORD_MAGIC_SET, rec.header.child_offset, key, new_v, 0) catch
                             return Status.init(.SYSTEM_ERROR);
                         // Void the old record.
-                        self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                         // Update chain link.
                         if (prev_offset == 0) {
                             const raw_new = encodeOffset(new_off, self.align_pow);
-                            self.writeBucket(bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
+                            self.writeBucket(io, bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
                         } else {
-                            self.writeChildOffset(prev_offset, new_off) catch return Status.init(.SYSTEM_ERROR);
+                            self.writeChildOffset(io, prev_offset, new_off) catch return Status.init(.SYSTEM_ERROR);
                         }
                         const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.header.value_size));
                         _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
@@ -845,11 +852,11 @@ const HashDBMImpl = struct {
                 // Append ADD record with child = old first_offset.
                 const raw_first = if (first_offset == 0) @as(i64, 0) else first_raw;
                 _ = raw_first;
-                const new_off = self.appendRecord(RECORD_MAGIC_ADD, first_offset, key, new_v, 0) catch
+                const new_off = self.appendRecord(io, RECORD_MAGIC_ADD, first_offset, key, new_v, 0) catch
                     return Status.init(.SYSTEM_ERROR);
                 // Update bucket to point to new record.
                 const raw_new = encodeOffset(new_off, self.align_pow);
-                self.writeBucket(bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
+                self.writeBucket(io, bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
                 _ = self.num_records.fetchAdd(1, .monotonic);
                 _ = self.eff_data_size.fetchAdd(@as(i64, @intCast(key.len + new_v.len)), .monotonic);
                 if (self.update_logger) |ul| {
@@ -860,7 +867,7 @@ const HashDBMImpl = struct {
         }
     }
 
-    fn process(self: *HashDBMImpl, key: []const u8, proc: anytype, writable: bool) Status {
+    fn process(self: *HashDBMImpl, io: std.Io, key: []const u8, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (writable and !self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
         const bucket_index = if (writable)
@@ -871,11 +878,12 @@ const HashDBMImpl = struct {
             self.record_mutex.unlockOne(bucket_index)
         else
             self.record_mutex.unlockOneShared(bucket_index);
-        return self.processImpl(key, proc, writable, bucket_index);
+        return self.processImpl(io, key, proc, writable, bucket_index);
     }
 
     fn processMulti(
         self: *HashDBMImpl,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
@@ -896,26 +904,26 @@ const HashDBMImpl = struct {
 
         var status = Status.init(.SUCCESS);
         for (keys, procs, bucket_indices) |key, proc, bucket_index| {
-            const st = self.processImpl(key, proc, writable, bucket_index);
+            const st = self.processImpl(io, key, proc, writable, bucket_index);
             status.mergeFrom(st);
         }
         return status;
     }
 
-    fn processFirst(self: *HashDBMImpl, proc: anytype, writable: bool) Status {
+    fn processFirst(self: *HashDBMImpl, io: std.Io, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (writable and !self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         var bucket_index: i64 = 0;
         while (bucket_index < self.num_buckets) : (bucket_index += 1) {
-            const first_raw = self.readBucket(bucket_index) catch return Status.init(.SYSTEM_ERROR);
+            const first_raw = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
             if (first_raw == 0) continue;
             var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
             while (cur_offset != 0) {
-                var rec = self.readFullRecord(cur_offset, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+                var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                 defer rec.deinit();
                 if (rec.header.op_type == RECORD_MAGIC_VOID) {
                     cur_offset = rec.header.child_offset;
@@ -930,20 +938,20 @@ const HashDBMImpl = struct {
                 switch (action) {
                     .noop => return Status.init(.SUCCESS),
                     .remove => {
-                        self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                         const raw_child = if (rec.header.child_offset == 0) @as(i64, 0) else encodeOffset(rec.header.child_offset, self.align_pow);
-                        self.writeBucket(bucket_index, raw_child) catch return Status.init(.SYSTEM_ERROR);
+                        self.writeBucket(io, bucket_index, raw_child) catch return Status.init(.SYSTEM_ERROR);
                         _ = self.num_records.fetchSub(1, .monotonic);
                         _ = self.eff_data_size.fetchAdd(-@as(i64, @intCast(rec.key.len + rec.value.len)), .monotonic);
                         if (self.update_logger) |ul| _ = ul.writeRemove(rec.key);
                         return Status.init(.SUCCESS);
                     },
                     .set => |new_v| {
-                        const new_off = self.appendRecord(RECORD_MAGIC_SET, rec.header.child_offset, rec.key, new_v, 0) catch
+                        const new_off = self.appendRecord(io, RECORD_MAGIC_SET, rec.header.child_offset, rec.key, new_v, 0) catch
                             return Status.init(.SYSTEM_ERROR);
-                        self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                         const raw_new = encodeOffset(new_off, self.align_pow);
-                        self.writeBucket(bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
+                        self.writeBucket(io, bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
                         const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.value.len));
                         _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
                         if (self.update_logger) |ul| _ = ul.writeSet(rec.key, new_v);
@@ -955,22 +963,22 @@ const HashDBMImpl = struct {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
-    fn processEach(self: *HashDBMImpl, proc: anytype, writable: bool) Status {
+    fn processEach(self: *HashDBMImpl, io: std.Io, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (writable and !self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         _ = proc.processEmpty("");
 
         var bucket_index: i64 = 0;
         while (bucket_index < self.num_buckets) : (bucket_index += 1) {
-            const first_raw = self.readBucket(bucket_index) catch return Status.init(.SYSTEM_ERROR);
+            const first_raw = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
             if (first_raw == 0) continue;
             var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
             while (cur_offset != 0) {
-                var rec = self.readFullRecord(cur_offset, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+                var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                 defer rec.deinit();
                 const next_offset = rec.header.child_offset;
                 if (rec.header.op_type == RECORD_MAGIC_VOID) {
@@ -986,49 +994,47 @@ const HashDBMImpl = struct {
                 switch (action) {
                     .noop => {},
                     .remove => {
-                        self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                         // We need to unlink — scan chain for prev.
-                        const br = self.readBucket(bucket_index) catch return Status.init(.SYSTEM_ERROR);
+                        const br = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
                         const head_off: i64 = if (br == 0) 0 else decodeChildOffset(br, self.align_pow);
                         var prev_off2: i64 = 0;
                         var scan_off = head_off;
                         while (scan_off != 0 and scan_off != cur_offset) {
-                            const scan_rec = self.readFullRecord(scan_off, self.allocator) catch break;
+                            var scan_rec = self.readFullRecord(self.allocator, io, scan_off) catch break;
+                            defer scan_rec.deinit();
                             prev_off2 = scan_off;
                             scan_off = scan_rec.header.child_offset;
-                            scan_rec.allocator.free(scan_rec.key);
-                            scan_rec.allocator.free(scan_rec.value);
                         }
                         if (prev_off2 == 0) {
                             const raw_c = if (next_offset == 0) @as(i64, 0) else encodeOffset(next_offset, self.align_pow);
-                            self.writeBucket(bucket_index, raw_c) catch return Status.init(.SYSTEM_ERROR);
+                            self.writeBucket(io, bucket_index, raw_c) catch return Status.init(.SYSTEM_ERROR);
                         } else {
-                            self.writeChildOffset(prev_off2, next_offset) catch return Status.init(.SYSTEM_ERROR);
+                            self.writeChildOffset(io, prev_off2, next_offset) catch return Status.init(.SYSTEM_ERROR);
                         }
                         _ = self.num_records.fetchSub(1, .monotonic);
                         _ = self.eff_data_size.fetchAdd(-@as(i64, @intCast(rec.key.len + rec.value.len)), .monotonic);
                         if (self.update_logger) |ul| _ = ul.writeRemove(rec.key);
                     },
                     .set => |new_v| {
-                        const new_off = self.appendRecord(RECORD_MAGIC_SET, next_offset, rec.key, new_v, 0) catch
+                        const new_off = self.appendRecord(io, RECORD_MAGIC_SET, next_offset, rec.key, new_v, 0) catch
                             return Status.init(.SYSTEM_ERROR);
-                        self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                        const br = self.readBucket(bucket_index) catch return Status.init(.SYSTEM_ERROR);
+                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                        const br = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
                         const head_off: i64 = if (br == 0) 0 else decodeChildOffset(br, self.align_pow);
                         var prev_off2: i64 = 0;
                         var scan_off = head_off;
                         while (scan_off != 0 and scan_off != cur_offset) {
-                            const scan_rec = self.readFullRecord(scan_off, self.allocator) catch break;
+                            var scan_rec = self.readFullRecord(self.allocator, io, scan_off) catch break;
+                            defer scan_rec.deinit();
                             prev_off2 = scan_off;
                             scan_off = scan_rec.header.child_offset;
-                            scan_rec.allocator.free(scan_rec.key);
-                            scan_rec.allocator.free(scan_rec.value);
                         }
                         if (prev_off2 == 0) {
                             const raw_new = encodeOffset(new_off, self.align_pow);
-                            self.writeBucket(bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
+                            self.writeBucket(io, bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
                         } else {
-                            self.writeChildOffset(prev_off2, new_off) catch return Status.init(.SYSTEM_ERROR);
+                            self.writeChildOffset(io, prev_off2, new_off) catch return Status.init(.SYSTEM_ERROR);
                         }
                         const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.value.len));
                         _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
@@ -1043,9 +1049,9 @@ const HashDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn clearImpl(self: *HashDBMImpl) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn clearImpl(self: *HashDBMImpl, io: std.Io) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
@@ -1063,11 +1069,11 @@ const HashDBMImpl = struct {
         const zero_buf = self.allocator.alloc(u8, bucket_bytes) catch return Status.init(.SYSTEM_ERROR);
         defer self.allocator.free(zero_buf);
         @memset(zero_buf, 0);
-        const st = self.file.write(BUCKET_BASE_OFFSET, zero_buf);
+        const st = self.file.write(io, BUCKET_BASE_OFFSET, zero_buf);
         if (!st.isOk()) return st;
 
         // Truncate file to record_base.
-        const st_trunc = self.file.truncate(self.record_base);
+        const st_trunc = self.file.truncate(io, self.record_base);
         if (!st_trunc.isOk()) return st_trunc;
 
         self.num_records.store(0, .release);
@@ -1076,10 +1082,9 @@ const HashDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn synchronizeImpl(self: *HashDBMImpl, hard: bool, io: std.Io) Status {
-        _ = io;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn synchronizeImpl(self: *HashDBMImpl, io: std.Io, hard: bool) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
 
@@ -1089,6 +1094,7 @@ const HashDBMImpl = struct {
             self.file_size = self.file.getSizeSimple();
             var cm = self.cyclic_magic;
             const st_meta = saveMetadata(
+                io,
                 self.file,
                 &cm,
                 self.static_flags,
@@ -1106,16 +1112,15 @@ const HashDBMImpl = struct {
             self.cyclic_magic = cm;
             status.mergeFrom(st_meta);
             if (hard) {
-                status.mergeFrom(self.file.synchronize(true));
+                status.mergeFrom(self.file.synchronize(io, true));
             }
         }
         return status;
     }
 
-    fn rebuildImpl(self: *HashDBMImpl, skip_broken_records: bool, io: std.Io) Status {
-        _ = io;
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn rebuildImpl(self: *HashDBMImpl, io: std.Io, skip_broken_records: bool) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
@@ -1133,14 +1138,14 @@ const HashDBMImpl = struct {
 
         var bucket_index: i64 = 0;
         while (bucket_index < self.num_buckets) : (bucket_index += 1) {
-            const first_raw = self.readBucket(bucket_index) catch {
+            const first_raw = self.readBucket(io, bucket_index) catch {
                 if (skip_broken_records) continue;
                 return Status.init(.SYSTEM_ERROR);
             };
             if (first_raw == 0) continue;
             var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
             while (cur_offset != 0) {
-                var rec = self.readFullRecord(cur_offset, self.allocator) catch {
+                var rec = self.readFullRecord(self.allocator, io, cur_offset) catch {
                     if (skip_broken_records) break;
                     return Status.init(.SYSTEM_ERROR);
                 };
@@ -1171,11 +1176,11 @@ const HashDBMImpl = struct {
         const zero_buf = self.allocator.alloc(u8, bucket_bytes) catch return Status.init(.SYSTEM_ERROR);
         defer self.allocator.free(zero_buf);
         @memset(zero_buf, 0);
-        const st_zero = self.file.write(BUCKET_BASE_OFFSET, zero_buf);
+        const st_zero = self.file.write(io, BUCKET_BASE_OFFSET, zero_buf);
         if (!st_zero.isOk()) return st_zero;
 
         // Truncate to record_base and re-insert all records.
-        const st_trunc = self.file.truncate(self.record_base);
+        const st_trunc = self.file.truncate(io, self.record_base);
         if (!st_trunc.isOk()) return st_trunc;
 
         self.num_records.store(0, .release);
@@ -1183,12 +1188,12 @@ const HashDBMImpl = struct {
 
         for (records.items) |kv| {
             const bucket_idx2 = hash_util.primaryHash(kv.key, @intCast(self.num_buckets));
-            const first_raw2 = self.readBucket(@intCast(bucket_idx2)) catch return Status.init(.SYSTEM_ERROR);
+            const first_raw2 = self.readBucket(io, @intCast(bucket_idx2)) catch return Status.init(.SYSTEM_ERROR);
             const first_off2: i64 = if (first_raw2 == 0) 0 else decodeChildOffset(first_raw2, self.align_pow);
-            const new_off = self.appendRecord(RECORD_MAGIC_ADD, first_off2, kv.key, kv.value, 0) catch
+            const new_off = self.appendRecord(io, RECORD_MAGIC_ADD, first_off2, kv.key, kv.value, 0) catch
                 return Status.init(.SYSTEM_ERROR);
             const raw_new = encodeOffset(new_off, self.align_pow);
-            self.writeBucket(@intCast(bucket_idx2), raw_new) catch return Status.init(.SYSTEM_ERROR);
+            self.writeBucket(io, @intCast(bucket_idx2), raw_new) catch return Status.init(.SYSTEM_ERROR);
             _ = self.num_records.fetchAdd(1, .monotonic);
             _ = self.eff_data_size.fetchAdd(@as(i64, @intCast(kv.key.len + kv.value.len)), .monotonic);
         }
@@ -1202,11 +1207,11 @@ const HashDBMImpl = struct {
     // ---------------------------------------------------------------------------
 
     // Advance iterator to the next live record.
-    fn advanceToLiveRecord(self: *HashDBMImpl, iter: *HashDBMIteratorImpl) void {
+    fn advanceToLiveRecord(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) void {
         while (iter.bucket_index < self.num_buckets) {
             if (iter.record_offset == 0) {
                 // Need to start from bucket head.
-                const first_raw = self.readBucket(iter.bucket_index) catch {
+                const first_raw = self.readBucket(io, iter.bucket_index) catch {
                     iter.bucket_index += 1;
                     continue;
                 };
@@ -1219,7 +1224,7 @@ const HashDBMImpl = struct {
 
             // Scan from current record_offset for a live record.
             while (iter.record_offset != 0) {
-                const hdr = self.readRecordHeaderFromFile(iter.record_offset) catch {
+                const hdr = self.readRecordHeaderFromFile(io, iter.record_offset) catch {
                     iter.bucket_index = self.num_buckets; // invalidate
                     return;
                 };
@@ -1238,19 +1243,19 @@ const HashDBMImpl = struct {
         }
     }
 
-    fn iterFirst(self: *HashDBMImpl, iter: *HashDBMIteratorImpl) Status {
+    fn iterFirst(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         iter.bucket_index = 0;
         iter.record_offset = 0;
-        self.advanceToLiveRecord(iter);
+        self.advanceToLiveRecord(io, iter);
         return Status.init(.SUCCESS);
     }
 
-    fn iterJump(self: *HashDBMImpl, iter: *HashDBMIteratorImpl, key: []const u8) Status {
+    fn iterJump(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl, key: []const u8) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
 
         const bucket_idx: i64 = @intCast(hash_util.primaryHash(key, @intCast(self.num_buckets)));
-        const first_raw = self.readBucket(bucket_idx) catch return Status.init(.SYSTEM_ERROR);
+        const first_raw = self.readBucket(io, bucket_idx) catch return Status.init(.SYSTEM_ERROR);
         if (first_raw == 0) {
             iter.bucket_index = self.num_buckets; // not found
             iter.record_offset = 0;
@@ -1259,7 +1264,7 @@ const HashDBMImpl = struct {
 
         var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
         while (cur_offset != 0) {
-            var rec = self.readFullRecord(cur_offset, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+            var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
             defer rec.deinit();
             const next_off = rec.header.child_offset;
             if (rec.header.op_type != RECORD_MAGIC_VOID and std.mem.eql(u8, rec.key, key)) {
@@ -1275,7 +1280,7 @@ const HashDBMImpl = struct {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
-    fn iterNext(self: *HashDBMImpl, iter: *HashDBMIteratorImpl) Status {
+    fn iterNext(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (iter.bucket_index >= self.num_buckets) {
             return Status.init(.NOT_FOUND_ERROR);
@@ -1283,7 +1288,7 @@ const HashDBMImpl = struct {
 
         // Advance past current record.
         if (iter.record_offset != 0) {
-            const hdr = self.readRecordHeaderFromFile(iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
+            const hdr = self.readRecordHeaderFromFile(io, iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
             const child = decodeChildOffset(hdr.child_offset, self.align_pow);
             iter.record_offset = child;
         }
@@ -1292,21 +1297,21 @@ const HashDBMImpl = struct {
             iter.bucket_index += 1;
         }
 
-        self.advanceToLiveRecord(iter);
+        self.advanceToLiveRecord(io, iter);
         if (iter.bucket_index >= self.num_buckets) {
             return Status.init(.NOT_FOUND_ERROR);
         }
         return Status.init(.SUCCESS);
     }
 
-    fn iterProcess(self: *HashDBMImpl, iter: *HashDBMIteratorImpl, proc: anytype, writable: bool) Status {
+    fn iterProcess(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (iter.bucket_index >= self.num_buckets or iter.record_offset == 0) {
             return Status.init(.NOT_FOUND_ERROR);
         }
         if (writable and !self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
-        var rec = self.readFullRecord(iter.record_offset, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+        var rec = self.readFullRecord(self.allocator, io, iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
         defer rec.deinit();
 
         if (!writable) {
@@ -1319,24 +1324,23 @@ const HashDBMImpl = struct {
         switch (action) {
             .noop => return Status.init(.SUCCESS),
             .remove => {
-                self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
                 const child = rec.header.child_offset;
-                const first_raw = self.readBucket(iter.bucket_index) catch return Status.init(.SYSTEM_ERROR);
+                const first_raw = self.readBucket(io, iter.bucket_index) catch return Status.init(.SYSTEM_ERROR);
                 const head_off: i64 = if (first_raw == 0) 0 else decodeChildOffset(first_raw, self.align_pow);
                 var prev_off: i64 = 0;
                 var scan = head_off;
                 while (scan != 0 and scan != cur_offset) {
-                    const scan_rec = self.readFullRecord(scan, self.allocator) catch break;
+                    var scan_rec = self.readFullRecord(self.allocator, io, scan) catch break;
+                    defer scan_rec.deinit();
                     prev_off = scan;
                     scan = scan_rec.header.child_offset;
-                    scan_rec.allocator.free(scan_rec.key);
-                    scan_rec.allocator.free(scan_rec.value);
                 }
                 if (prev_off == 0) {
                     const raw_c = if (child == 0) @as(i64, 0) else encodeOffset(child, self.align_pow);
-                    self.writeBucket(iter.bucket_index, raw_c) catch return Status.init(.SYSTEM_ERROR);
+                    self.writeBucket(io, iter.bucket_index, raw_c) catch return Status.init(.SYSTEM_ERROR);
                 } else {
-                    self.writeChildOffset(prev_off, child) catch return Status.init(.SYSTEM_ERROR);
+                    self.writeChildOffset(io, prev_off, child) catch return Status.init(.SYSTEM_ERROR);
                 }
                 _ = self.num_records.fetchSub(1, .monotonic);
                 _ = self.eff_data_size.fetchAdd(-@as(i64, @intCast(rec.key.len + rec.value.len)), .monotonic);
@@ -1345,31 +1349,30 @@ const HashDBMImpl = struct {
                 iter.record_offset = child;
                 if (child == 0) {
                     iter.bucket_index += 1;
-                    self.advanceToLiveRecord(iter);
+                    self.advanceToLiveRecord(io, iter);
                 }
                 return Status.init(.SUCCESS);
             },
             .set => |new_v| {
                 const child = rec.header.child_offset;
-                const new_off = self.appendRecord(RECORD_MAGIC_SET, child, rec.key, new_v, 0) catch
+                const new_off = self.appendRecord(io, RECORD_MAGIC_SET, child, rec.key, new_v, 0) catch
                     return Status.init(.SYSTEM_ERROR);
-                self.voidRecord(cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                const first_raw2 = self.readBucket(iter.bucket_index) catch return Status.init(.SYSTEM_ERROR);
+                self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                const first_raw2 = self.readBucket(io, iter.bucket_index) catch return Status.init(.SYSTEM_ERROR);
                 const head_off2: i64 = if (first_raw2 == 0) 0 else decodeChildOffset(first_raw2, self.align_pow);
                 var prev_off: i64 = 0;
                 var scan = head_off2;
                 while (scan != 0 and scan != cur_offset) {
-                    const scan_rec = self.readFullRecord(scan, self.allocator) catch break;
+                    var scan_rec = self.readFullRecord(self.allocator, io, scan) catch break;
+                    defer scan_rec.deinit();
                     prev_off = scan;
                     scan = scan_rec.header.child_offset;
-                    scan_rec.allocator.free(scan_rec.key);
-                    scan_rec.allocator.free(scan_rec.value);
                 }
                 if (prev_off == 0) {
                     const raw_new = encodeOffset(new_off, self.align_pow);
-                    self.writeBucket(iter.bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
+                    self.writeBucket(io, iter.bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
                 } else {
-                    self.writeChildOffset(prev_off, new_off) catch return Status.init(.SYSTEM_ERROR);
+                    self.writeChildOffset(io, prev_off, new_off) catch return Status.init(.SYSTEM_ERROR);
                 }
                 const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.value.len));
                 _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
@@ -1382,6 +1385,7 @@ const HashDBMImpl = struct {
 
     fn iterGet(
         self: *HashDBMImpl,
+        io: std.Io,
         iter: *HashDBMIteratorImpl,
         key_out: ?*std.ArrayList(u8),
         value_out: ?*std.ArrayList(u8),
@@ -1391,7 +1395,7 @@ const HashDBMImpl = struct {
             return Status.init(.NOT_FOUND_ERROR);
         }
 
-        var rec = self.readFullRecord(iter.record_offset, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+        var rec = self.readFullRecord(self.allocator, io, iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
         defer rec.deinit();
 
         if (key_out) |ko| {
@@ -1643,48 +1647,47 @@ pub const HashDBM = struct {
         cipher_key:       []const u8             = "",
     };
 
-    pub fn openAdvanced(self: *HashDBM, path: []const u8, writable: bool, options: file_mod.OpenOptions, params: TuningParameters, io: std.Io) Status {
+    pub fn openAdvanced(self: *HashDBM, io: std.Io, path: []const u8, writable: bool, options: file_mod.OpenOptions, params: TuningParameters) Status {
         if (params.num_buckets > 0) self.impl.num_buckets = params.num_buckets;
         if (params.align_pow >= 0) self.impl.align_pow = params.align_pow;
         if (params.offset_width > 0) self.impl.offset_width = params.offset_width;
-        return self.impl.openImpl(path, writable, options, io);
+        return self.impl.openImpl(io, path, writable, options);
     }
 
-    pub fn deinit(self: *HashDBM) void {
-        self.impl.deinit();
+    pub fn deinit(self: *HashDBM, io: std.Io) void {
+        self.impl.deinit(io);
     }
 
-    pub fn open(self: *HashDBM, path: []const u8, writable: bool, options: file_mod.OpenOptions, io: std.Io) Status {
-        return self.impl.openImpl(path, writable, options, io);
+    pub fn open(self: *HashDBM, io: std.Io, path: []const u8, writable: bool, options: file_mod.OpenOptions) Status {
+        return self.impl.openImpl(io, path, writable, options);
     }
 
     pub fn close(self: *HashDBM, io: std.Io) Status {
-        _ = io;
-        return self.impl.closeImpl();
+        return self.impl.closeImpl(io);
     }
 
-    pub fn get(self: *HashDBM, key: []const u8, value: ?*std.ArrayList(u8)) Status {
+    pub fn get(self: *HashDBM, io: std.Io, key: []const u8, value: ?*std.ArrayList(u8)) Status {
         var status = Status.init(.SUCCESS);
         var proc = ProcessorGet{
             .status = &status,
             .value = value,
             .allocator = self.allocator,
         };
-        const st = self.impl.process(key, &proc, false);
+        const st = self.impl.process(io, key, &proc, false);
         if (!st.isOk()) return st;
         return status;
     }
 
-    pub fn getSimple(self: *HashDBM, key: []const u8, default_value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn getSimple(self: *HashDBM, allocator: std.mem.Allocator, io: std.Io, key: []const u8, default_value: []const u8) ![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         // get() appends into buf using self.allocator (the DB allocator), so deinit with it.
         defer buf.deinit(self.allocator);
-        const st = self.get(key, &buf);
+        const st = self.get(io, key, &buf);
         if (st.isOk()) return try allocator.dupe(u8, buf.items);
         return try allocator.dupe(u8, default_value);
     }
 
-    pub fn set(self: *HashDBM, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*std.ArrayList(u8)) Status {
+    pub fn set(self: *HashDBM, io: std.Io, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*std.ArrayList(u8)) Status {
         var status = Status.init(.SUCCESS);
         var proc = ProcessorSet{
             .status = &status,
@@ -1693,20 +1696,20 @@ pub const HashDBM = struct {
             .old_value = old_value,
             .allocator = self.allocator,
         };
-        const st = self.impl.process(key, &proc, true);
+        const st = self.impl.process(io, key, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
 
-    pub fn remove(self: *HashDBM, key: []const u8) Status {
+    pub fn remove(self: *HashDBM, io: std.Io, key: []const u8) Status {
         var status = Status.init(.SUCCESS);
         var proc = ProcessorRemove{ .status = &status };
-        const st = self.impl.process(key, &proc, true);
+        const st = self.impl.process(io, key, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
 
-    pub fn append(self: *HashDBM, key: []const u8, value: []const u8, delim: []const u8) Status {
+    pub fn append(self: *HashDBM, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
         const AppendProc = struct {
             value: []const u8,
             delim: []const u8,
@@ -1741,19 +1744,19 @@ pub const HashDBM = struct {
             .allocator = self.allocator,
         };
         defer if (proc.combined) |buf| self.allocator.free(buf);
-        const st = self.impl.process(key, &proc, true);
+        const st = self.impl.process(io, key, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
 
-    pub fn getMulti(self: *HashDBM, keys: []const []const u8, records: *std.StringHashMap([]u8)) Status {
+    pub fn getMulti(self: *HashDBM, io: std.Io, keys: []const []const u8, records: *std.StringHashMap([]u8)) Status {
         const map_alloc = records.allocator;
         var status = Status.init(.SUCCESS);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(self.allocator);
         for (keys) |key| {
             val_buf.clearRetainingCapacity();
-            const st = self.get(key, &val_buf);
+            const st = self.get(io, key, &val_buf);
             if (st.isOk()) {
                 const duped_key = map_alloc.dupe(u8, key) catch {
                     status.mergeFrom(Status.init(.SYSTEM_ERROR));
@@ -1777,30 +1780,30 @@ pub const HashDBM = struct {
         return status;
     }
 
-    pub fn setMulti(self: *HashDBM, records: []const [2][]const u8, overwrite: bool) Status {
+    pub fn setMulti(self: *HashDBM, io: std.Io, records: []const [2][]const u8, overwrite: bool) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.set(r[0], r[1], overwrite, null);
+            const st = self.set(io, r[0], r[1], overwrite, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .DUPLICATION_ERROR) break;
         }
         return status;
     }
 
-    pub fn removeMulti(self: *HashDBM, keys: []const []const u8) Status {
+    pub fn removeMulti(self: *HashDBM, io: std.Io, keys: []const []const u8) Status {
         var status = Status.init(.SUCCESS);
         for (keys) |key| {
-            const st = self.remove(key);
+            const st = self.remove(io, key);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .NOT_FOUND_ERROR) break;
         }
         return status;
     }
 
-    pub fn appendMulti(self: *HashDBM, records: []const [2][]const u8, delim: []const u8) Status {
+    pub fn appendMulti(self: *HashDBM, io: std.Io, records: []const [2][]const u8, delim: []const u8) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.append(r[0], r[1], delim);
+            const st = self.append(io, r[0], r[1], delim);
             status.mergeFrom(st);
             if (!status.isOk()) break;
         }
@@ -1854,14 +1857,15 @@ pub const HashDBM = struct {
 
     /// Returns the number of non-empty hash buckets by scanning the bucket array.
     /// Matches C++ HashDBM::CountUsedBuckets().
-    pub fn countUsedBuckets(self: *HashDBM) i64 {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn countUsedBuckets(self: *HashDBM, io: std.Io) i64 {
         if (!self.impl.open) return 0;
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
+        if (!self.impl.open) return 0; // re-check under lock
         var used: i64 = 0;
         var i: i64 = 0;
         while (i < self.impl.num_buckets) : (i += 1) {
-            const raw = self.impl.readBucket(i) catch continue;
+            const raw = self.impl.readBucket(io, i) catch continue;
             if (raw != 0) used += 1;
         }
         return used;
@@ -1878,14 +1882,15 @@ pub const HashDBM = struct {
 
     /// Switches the open database to appending update mode, updating the on-disk header.
     /// Matches C++ HashDBM::SetUpdateModeAppending().
-    pub fn setUpdateModeAppending(self: *HashDBM) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn setUpdateModeAppending(self: *HashDBM, io: std.Io) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (!self.impl.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
         self.impl.static_flags &= ~@as(u8, STATIC_FLAG_UPDATE_IN_PLACE);
         self.impl.static_flags |= STATIC_FLAG_UPDATE_APPENDING;
         return saveMetadata(
+            io,
             self.impl.file,
             &self.impl.cyclic_magic,
             self.impl.static_flags,
@@ -1904,14 +1909,15 @@ pub const HashDBM = struct {
 
     /// Validates every hash-bucket chain, checking that all record offsets lie within
     /// the valid record area. Matches C++ HashDBM::ValidateHashBuckets().
-    pub fn validateHashBuckets(self: *HashDBM) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn validateHashBuckets(self: *HashDBM, io: std.Io) Status {
+        if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         const max_chain_len = self.impl.num_records.load(.acquire) + 1;
         var i: i64 = 0;
         while (i < self.impl.num_buckets) : (i += 1) {
-            const first_raw = self.impl.readBucket(i) catch
+            const first_raw = self.impl.readBucket(io, i) catch
                 return Status.initMsg(.BROKEN_DATA_ERROR, "bucket read error");
             if (first_raw == 0) continue;
             var cur_offset = decodeChildOffset(first_raw, self.impl.align_pow);
@@ -1924,7 +1930,7 @@ pub const HashDBM = struct {
                 if (chain_len > max_chain_len) {
                     return Status.initMsg(.BROKEN_DATA_ERROR, "bucket chain cycle detected");
                 }
-                const hdr = self.impl.readRecordHeaderFromFile(cur_offset) catch
+                const hdr = self.impl.readRecordHeaderFromFile(io, cur_offset) catch
                     return Status.initMsg(.BROKEN_DATA_ERROR, "record header read error");
                 cur_offset = decodeChildOffset(hdr.child_offset, self.impl.align_pow);
             }
@@ -1935,9 +1941,10 @@ pub const HashDBM = struct {
     /// Scans all records between record_base and end_offset, verifying each record's
     /// magic byte and size fields. Pass end_offset=0 to scan to end of file.
     /// Matches C++ HashDBM::ValidateRecords().
-    pub fn validateRecords(self: *HashDBM, record_base_arg: i64, end_offset_arg: i64) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn validateRecords(self: *HashDBM, io: std.Io, record_base_arg: i64, end_offset_arg: i64) Status {
+        if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         const file_sz = self.impl.file.getSizeSimple();
         const base: i64 = if (record_base_arg > 0) record_base_arg else self.impl.record_base;
@@ -1945,7 +1952,7 @@ pub const HashDBM = struct {
         var offset: i64 = base;
         while (offset < end) {
             var hdr_buf: [1]u8 = undefined;
-            const st_peek = self.impl.file.read(offset, &hdr_buf);
+            const st_peek = self.impl.file.read(io, offset, &hdr_buf);
             if (!st_peek.isOk()) break;
             const magic = hdr_buf[0];
             // Padding record — advance one alignment unit.
@@ -1960,7 +1967,7 @@ pub const HashDBM = struct {
             {
                 return Status.initMsg(.BROKEN_DATA_ERROR, "invalid record magic");
             }
-            const hdr = self.impl.readRecordHeaderFromFile(offset) catch
+            const hdr = self.impl.readRecordHeaderFromFile(io, offset) catch
                 return Status.initMsg(.BROKEN_DATA_ERROR, "record header parse error");
             const align_size: i64 = @as(i64, 1) << @intCast(self.impl.align_pow);
             const raw_size: i64 = @as(i64, @intCast(hdr.header_size)) +
@@ -2055,41 +2062,41 @@ pub const HashDBM = struct {
         return self.impl.update_logger;
     }
 
-    pub fn process(self: *HashDBM, key: []const u8, proc: anytype, writable: bool) Status {
-        return self.impl.process(key, proc, writable);
+    pub fn process(self: *HashDBM, io: std.Io, key: []const u8, proc: anytype, writable: bool) Status {
+        return self.impl.process(io, key, proc, writable);
     }
 
-    pub fn processMulti(self: *HashDBM, comptime P: type, keys: []const []const u8, procs: []const *P, writable: bool) Status {
-        return self.impl.processMulti(P, keys, procs, writable);
+    pub fn processMulti(self: *HashDBM, io: std.Io, comptime P: type, keys: []const []const u8, procs: []const *P, writable: bool) Status {
+        return self.impl.processMulti(io, P, keys, procs, writable);
     }
 
-    pub fn processFirst(self: *HashDBM, proc: anytype, writable: bool) Status {
-        return self.impl.processFirst(proc, writable);
+    pub fn processFirst(self: *HashDBM, io: std.Io, proc: anytype, writable: bool) Status {
+        return self.impl.processFirst(io, proc, writable);
     }
 
-    pub fn processEach(self: *HashDBM, proc: anytype, writable: bool) Status {
-        return self.impl.processEach(proc, writable);
+    pub fn processEach(self: *HashDBM, io: std.Io, proc: anytype, writable: bool) Status {
+        return self.impl.processEach(io, proc, writable);
     }
 
-    pub fn synchronize(self: *HashDBM, hard: bool, io: std.Io) Status {
-        return self.impl.synchronizeImpl(hard, io);
+    pub fn synchronize(self: *HashDBM, io: std.Io, hard: bool) Status {
+        return self.impl.synchronizeImpl(io, hard);
     }
 
-    pub fn clear(self: *HashDBM) Status {
-        return self.impl.clearImpl();
+    pub fn clear(self: *HashDBM, io: std.Io) Status {
+        return self.impl.clearImpl(io);
     }
 
     pub fn rebuild(self: *HashDBM, io: std.Io) Status {
-        return self.impl.rebuildImpl(false, io);
+        return self.impl.rebuildImpl(io, false);
     }
 
-    pub fn rebuildAdvanced(self: *HashDBM, params: TuningParameters, skip_broken_records: bool, sync_hard: bool, io: std.Io) Status {
+    pub fn rebuildAdvanced(self: *HashDBM, io: std.Io, params: TuningParameters, skip_broken_records: bool, sync_hard: bool) Status {
         if (params.num_buckets > 0) self.impl.num_buckets = params.num_buckets;
         if (params.align_pow >= 0) self.impl.align_pow = params.align_pow;
         if (params.offset_width > 0) self.impl.offset_width = params.offset_width;
-        const st = self.impl.rebuildImpl(skip_broken_records, io);
+        const st = self.impl.rebuildImpl(io, skip_broken_records);
         if (!st.isOk()) return st;
-        if (sync_hard) return self.synchronize(true, io);
+        if (sync_hard) return self.synchronize(io, true);
         return st;
     }
 
@@ -2114,13 +2121,13 @@ pub const HashDBM = struct {
         /// The returned slices point into internal buffers and are invalidated
         /// on the next call to next() or deinit(). Copy them if you need the
         /// data to outlive this call.
-        pub fn next(self: *Iterator) !?Entry {
+        pub fn next(self: *Iterator, io: std.Io) !?Entry {
             if (self.done) return null;
 
             // Fill internal buffers from the current cursor position.
             self.key_buf.clearRetainingCapacity();
             self.value_buf.clearRetainingCapacity();
-            const st = self.cursor.get(&self.key_buf, &self.value_buf);
+            const st = self.cursor.get(io, &self.key_buf, &self.value_buf);
             if (!st.isOk()) {
                 self.done = true;
                 return null;
@@ -2128,7 +2135,7 @@ pub const HashDBM = struct {
 
             // Advance cursor. If it reaches the end, mark done so the next
             // call returns null rather than re-reading the last record.
-            if (!self.cursor.next().isOk()) self.done = true;
+            if (!self.cursor.next(io).isOk()) self.done = true;
 
             return Entry{
                 .key = self.key_buf.items,
@@ -2137,10 +2144,10 @@ pub const HashDBM = struct {
         }
 
         /// Release internal buffers and the underlying cursor.
-        pub fn deinit(self: *Iterator) void {
+        pub fn deinit(self: *Iterator, io: std.Io) void {
             self.key_buf.deinit(self.alloc);
             self.value_buf.deinit(self.alloc);
-            self.cursor.deinit();
+            self.cursor.deinit(io);
         }
     };
 
@@ -2148,10 +2155,10 @@ pub const HashDBM = struct {
         impl: *HashDBMIteratorImpl,
         allocator: std.mem.Allocator,
 
-        pub fn deinit(self: *Cursor) void {
+        pub fn deinit(self: *Cursor, io: std.Io) void {
             if (self.impl.dbm) |dbm| {
-                dbm.mutex.lock();
-                defer dbm.mutex.unlock();
+                dbm.mutex.lockUncancelable(io);
+                defer dbm.mutex.unlock(io);
                 for (0..dbm.iterators.items.len) |i| {
                     if (dbm.iterators.items[i] == self.impl) {
                         _ = dbm.iterators.orderedRemove(i);
@@ -2162,56 +2169,66 @@ pub const HashDBM = struct {
             self.allocator.destroy(self.impl);
         }
 
-        pub fn first(self: *Cursor) Status {
+        pub fn first(self: *Cursor, io: std.Io) Status {
+            // TODO: iterFirst/Jump/Next do file I/O without holding the DBM mutex.
+            // Deferred locking fix.
             const dbm = self.impl.dbm orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-            return dbm.iterFirst(self.impl);
+            return dbm.iterFirst(io, self.impl);
         }
 
-        pub fn jump(self: *Cursor, key: []const u8) Status {
+        pub fn jump(self: *Cursor, io: std.Io, key: []const u8) Status {
+            // TODO: iterFirst/Jump/Next do file I/O without holding the DBM mutex.
+            // Deferred locking fix.
             const dbm = self.impl.dbm orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-            return dbm.iterJump(self.impl, key);
+            return dbm.iterJump(io, self.impl, key);
         }
 
-        pub fn next(self: *Cursor) Status {
+        pub fn next(self: *Cursor, io: std.Io) Status {
+            // TODO: iterFirst/Jump/Next do file I/O without holding the DBM mutex.
+            // Deferred locking fix.
             const dbm = self.impl.dbm orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-            return dbm.iterNext(self.impl);
+            return dbm.iterNext(io, self.impl);
         }
 
-        pub fn last(self: *Cursor) Status {
+        pub fn last(self: *Cursor, io: std.Io) Status {
+            _ = io;
             _ = self;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
-        pub fn previous(self: *Cursor) Status {
+        pub fn previous(self: *Cursor, io: std.Io) Status {
+            _ = io;
             _ = self;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
-        pub fn jumpLower(self: *Cursor, key: []const u8, inclusive: bool) Status {
+        pub fn jumpLower(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            _ = io;
             _ = self;
             _ = key;
             _ = inclusive;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
-        pub fn jumpUpper(self: *Cursor, key: []const u8, inclusive: bool) Status {
+        pub fn jumpUpper(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            _ = io;
             _ = self;
             _ = key;
             _ = inclusive;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
-        pub fn process(self: *Cursor, proc: anytype, writable: bool) Status {
+        pub fn process(self: *Cursor, io: std.Io, proc: anytype, writable: bool) Status {
             const dbm = self.impl.dbm orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-            return dbm.iterProcess(self.impl, proc, writable);
+            return dbm.iterProcess(io, self.impl, proc, writable);
         }
 
-        pub fn get(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+        pub fn get(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
             const dbm = self.impl.dbm orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-            return dbm.iterGet(self.impl, key_out, value_out);
+            return dbm.iterGet(io, self.impl, key_out, value_out);
         }
 
-        pub fn set(self: *Cursor, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn set(self: *Cursor, io: std.Io, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             const SetProc = struct {
                 value: []const u8,
                 old_key: ?*std.ArrayList(u8),
@@ -2232,12 +2249,12 @@ pub const HashDBM = struct {
                 pub fn processEmpty(_: *@This(), _: []const u8) RecordAction { return .noop; }
             };
             var proc = SetProc{ .value = value, .old_key = old_key, .old_value = old_value, .allocator = self.allocator };
-            const st = self.process(&proc, true);
+            const st = self.process(io, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn remove(self: *Cursor, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn remove(self: *Cursor, io: std.Io, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             const RemoveProc = struct {
                 old_key: ?*std.ArrayList(u8),
                 old_value: ?*std.ArrayList(u8),
@@ -2257,24 +2274,24 @@ pub const HashDBM = struct {
                 pub fn processEmpty(p: *@This(), _: []const u8) RecordAction { p.status = Status.init(.NOT_FOUND_ERROR); return .noop; }
             };
             var proc = RemoveProc{ .old_key = old_key, .old_value = old_value, .allocator = self.allocator };
-            const st = self.process(&proc, true);
+            const st = self.process(io, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn step(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            const st = self.get(key_out, value_out);
+        pub fn step(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            const st = self.get(io, key_out, value_out);
             if (!st.isOk()) return st;
-            _ = self.next();
+            _ = self.next(io);
             return Status.init(.SUCCESS);
         }
     };
 
     /// Return a Zig-style iterator positioned at the first record.
     /// The caller must call deinit() when done.
-    pub fn iterate(self: *HashDBM, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterate(self: *HashDBM, alloc: std.mem.Allocator, io: std.Io) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -2282,15 +2299,15 @@ pub const HashDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
     /// Return a Zig-style iterator positioned at the first record >= key.
     /// The caller must call deinit() when done.
-    pub fn iterateFrom(self: *HashDBM, key: []const u8, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *HashDBM, alloc: std.mem.Allocator, io: std.Io, key: []const u8) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -2298,32 +2315,30 @@ pub const HashDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump(io, key).isOk()) iter.done = true;
         return iter;
     }
 
-    /// Deprecated: use makeCursor instead.
-    pub const makeIterator = makeCursor;
 
-    pub fn makeCursor(self: *HashDBM) !Cursor {
+    pub fn makeCursor(self: *HashDBM, io: std.Io) !Cursor {
         const iter_impl = try self.allocator.create(HashDBMIteratorImpl);
         iter_impl.* = HashDBMIteratorImpl{
             .dbm = self.impl,
-            .bucket_index = self.impl.num_buckets, // exhausted until first() called
+            .bucket_index = self.impl.num_buckets, // exhausted until first(io) called
             .record_offset = 0,
             .allocator = self.allocator,
         };
-        self.impl.mutex.lock();
+        self.impl.mutex.lockUncancelable(io);
         self.impl.iterators.append(self.allocator, iter_impl) catch {
-            self.impl.mutex.unlock();
+            self.impl.mutex.unlock(io);
             self.allocator.destroy(iter_impl);
             return error.OutOfMemory;
         };
-        self.impl.mutex.unlock();
+        self.impl.mutex.unlock(io);
         return Cursor{ .impl = iter_impl, .allocator = self.allocator };
     }
 
-    pub fn compareExchange(self: *HashDBM, key: []const u8, expected: dbm_mod.CompareExpected, desired: dbm_mod.CompareDesired, actual_out: ?*std.ArrayList(u8), found_out: ?*bool) Status {
+    pub fn compareExchange(self: *HashDBM, io: std.Io, key: []const u8, expected: dbm_mod.CompareExpected, desired: dbm_mod.CompareDesired, actual_out: ?*std.ArrayList(u8), found_out: ?*bool) Status {
         var status = Status.init(.SUCCESS);
         var proc = ProcessorCompareExchange{
             .status = &status,
@@ -2333,12 +2348,12 @@ pub const HashDBM = struct {
             .actual_out = actual_out,
             .found_out = found_out,
         };
-        const st = self.impl.process(key, &proc, true);
+        const st = self.impl.process(io, key, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
 
-    pub fn increment(self: *HashDBM, key: []const u8, delta: i64, current_out: ?*i64, initial: i64) Status {
+    pub fn increment(self: *HashDBM, io: std.Io, key: []const u8, delta: i64, current_out: ?*i64, initial: i64) Status {
         var status = Status.init(.SUCCESS);
         var proc = ProcessorIncrement{
             .status = &status,
@@ -2346,18 +2361,18 @@ pub const HashDBM = struct {
             .current_out = current_out,
             .initial = initial,
         };
-        const st = self.impl.process(key, &proc, true);
+        const st = self.impl.process(io, key, &proc, true);
         if (!st.isOk()) return st;
         return status;
     }
 
-    pub fn incrementSimple(self: *HashDBM, key: []const u8, delta: i64, initial: i64) i64 {
+    pub fn incrementSimple(self: *HashDBM, io: std.Io, key: []const u8, delta: i64, initial: i64) i64 {
         var result: i64 = initial;
-        _ = self.increment(key, delta, &result, initial);
+        _ = self.increment(io, key, delta, &result, initial);
         return result;
     }
 
-    pub fn popFirst(self: *HashDBM, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+    pub fn popFirst(self: *HashDBM, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
         const PopFirstProc = struct {
             status: *Status,
             key_out: ?*std.ArrayList(u8),
@@ -2395,17 +2410,17 @@ pub const HashDBM = struct {
             .value_out = value_out,
             .allocator = self.allocator,
         };
-        return self.impl.processFirst(&proc, true);
+        return self.impl.processFirst(io, &proc, true);
     }
 
-    pub fn pushLast(self: *HashDBM, value: []const u8, wtime: f64, key_out: ?*std.ArrayList(u8), io: std.Io) Status {
+    pub fn pushLast(self: *HashDBM, io: std.Io, value: []const u8, wtime: f64, key_out: ?*std.ArrayList(u8)) Status {
         const base: u64 = time_util.pushLastKeyBase(wtime, io);
         var seq: u64 = 0;
         while (true) : (seq += 1) {
             const ts: u64 = base +% seq;
             var key_buf: [8]u8 = undefined;
             const key = str_util.intToStrBigEndian(ts, 8, &key_buf);
-            const st = self.set(key, value, false, null);
+            const st = self.set(io, key, value, false, null);
             if (st.code != .DUPLICATION_ERROR) {
                 if (key_out) |ko| {
                     ko.clearRetainingCapacity();
@@ -2418,9 +2433,9 @@ pub const HashDBM = struct {
 
     /// Returns a list of property name/value pairs describing the database.
     /// Caller owns the returned list and all strings within it.
-    pub fn inspect(self: *HashDBM, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn inspect(self: *HashDBM, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         var list: std.ArrayList([2][]u8) = .empty;
         errdefer {
             for (list.items) |pair| {
@@ -2520,9 +2535,9 @@ pub const HashDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn getInternalFile(self: *HashDBM) file_mod.File {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn getInternalFile(self: *HashDBM, io: std.Io) file_mod.File {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         return self.impl.file;
     }
 
@@ -2549,6 +2564,7 @@ pub const HashDBM = struct {
     /// If cyclic magic front != back, sets cyclic_magic_out to -1 but still returns SUCCESS.
     /// Matches C++ HashDBM::ReadMetadata().
     pub fn readMetadata(
+        io: std.Io,
         file: File,
         cyclic_magic_out: *i32,
         pkg_major_version_out: *i32,
@@ -2568,7 +2584,7 @@ pub const HashDBM = struct {
         const file_sz = file.getSizeSimple();
         if (file_sz < METADATA_SIZE) return Status.initMsg(.BROKEN_DATA_ERROR, "too small metadata");
         var buf: [METADATA_SIZE]u8 = undefined;
-        const st = file.read(0, &buf);
+        const st = file.read(io, 0, &buf);
         if (!st.isOk()) return st;
         if (!std.mem.eql(u8, buf[0..9], META_MAGIC)) return Status.initMsg(.BROKEN_DATA_ERROR, "bad magic data");
         const cm_front: i32 = buf[9];
@@ -2594,6 +2610,7 @@ pub const HashDBM = struct {
     /// Finds the record base offset and format parameters from a HashDBM file header.
     /// Matches C++ HashDBM::FindRecordBase().
     pub fn findRecordBase(
+        io: std.Io,
         file: File,
         record_base_out: *i64,
         static_flags_out: *i32,
@@ -2604,7 +2621,7 @@ pub const HashDBM = struct {
         const file_sz = file.getSizeSimple();
         if (file_sz < METADATA_SIZE) return Status.initMsg(.BROKEN_DATA_ERROR, "too small file");
         var buf: [METADATA_SIZE]u8 = undefined;
-        const st = file.read(0, &buf);
+        const st = file.read(io, 0, &buf);
         if (!st.isOk()) return st;
         if (!std.mem.eql(u8, buf[0..9], META_MAGIC)) return Status.initMsg(.BROKEN_DATA_ERROR, "bad magic data");
         const sf: i32 = buf[12];
@@ -2630,6 +2647,7 @@ pub const HashDBM = struct {
     /// Matches C++ HashDBM::ImportFromFileForward(File*, ...).
     pub fn importFromFileForwardFile(
         self: *HashDBM,
+        io: std.Io,
         file: File,
         skip_broken_records: bool,
         record_base: i64,
@@ -2644,7 +2662,7 @@ pub const HashDBM = struct {
         var src_ap: i32 = DEFAULT_ALIGN_POW;
         var last_sync: i64 = 0;
         {
-            const st = HashDBM.findRecordBase(file, &src_rb, &src_sf, &src_ow, &src_ap, &last_sync);
+            const st = HashDBM.findRecordBase(io, file, &src_rb, &src_sf, &src_ow, &src_ap, &last_sync);
             if (!st.isOk()) return st;
         }
 
@@ -2662,7 +2680,7 @@ pub const HashDBM = struct {
             var hdr_buf: [64]u8 = undefined;
             const avail: i64 = eff_end - offset;
             const read_n: usize = @intCast(@min(64, avail));
-            const st_r = file.read(offset, hdr_buf[0..read_n]);
+            const st_r = file.read(io, offset, hdr_buf[0..read_n]);
             if (!st_r.isOk()) {
                 if (skip_broken_records) { offset += align_size; continue; }
                 return st_r;
@@ -2697,14 +2715,14 @@ pub const HashDBM = struct {
                 const kv_buf = self.allocator.alloc(u8, kv_size) catch return Status.init(.SYSTEM_ERROR);
                 defer self.allocator.free(kv_buf);
                 const kv_off = offset + @as(i64, @intCast(hdr.header_size));
-                const st_kv = file.read(kv_off, kv_buf);
+                const st_kv = file.read(io, kv_off, kv_buf);
                 if (!st_kv.isOk()) {
                     if (skip_broken_records) { offset += whole_size; continue; }
                     return st_kv;
                 }
                 const key = kv_buf[0..hdr.key_size];
                 const value = kv_buf[hdr.key_size..kv_size];
-                const st_set = self.set(key, value, true, null);
+                const st_set = self.set(io, key, value, true, null);
                 if (!st_set.isOk()) {
                     if (skip_broken_records) { offset += whole_size; continue; }
                     return st_set;
@@ -2714,12 +2732,12 @@ pub const HashDBM = struct {
                     const key_buf = self.allocator.alloc(u8, hdr.key_size) catch return Status.init(.SYSTEM_ERROR);
                     defer self.allocator.free(key_buf);
                     const key_off = offset + @as(i64, @intCast(hdr.header_size));
-                    const st_k = file.read(key_off, key_buf);
+                    const st_k = file.read(io, key_off, key_buf);
                     if (!st_k.isOk()) {
                         if (skip_broken_records) { offset += whole_size; continue; }
                         return st_k;
                     }
-                    _ = self.remove(key_buf);
+                    _ = self.remove(io, key_buf);
                 }
             }
             // VOID records: skip
@@ -2733,6 +2751,7 @@ pub const HashDBM = struct {
     /// Matches C++ HashDBM::ImportFromFileForward(const std::string&, ...).
     pub fn importFromFileForward(
         self: *HashDBM,
+        io: std.Io,
         path: []const u8,
         skip_broken_records: bool,
         record_base: i64,
@@ -2742,11 +2761,11 @@ pub const HashDBM = struct {
         var file = sf.asFile();
         defer file.deinit(self.allocator);
         {
-            const st = file.open(path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
+            const st = file.open(io, path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
             if (!st.isOk()) return st;
         }
-        defer _ = file.close();
-        return self.importFromFileForwardFile(file, skip_broken_records, record_base, end_offset);
+        defer _ = file.close(io);
+        return self.importFromFileForwardFile(io, file, skip_broken_records, record_base, end_offset);
     }
 
     /// Imports records from a HashDBM File object in backward order (last-to-first).
@@ -2755,6 +2774,7 @@ pub const HashDBM = struct {
     /// Matches C++ HashDBM::ImportFromFileBackward(File*, ...).
     pub fn importFromFileBackwardFile(
         self: *HashDBM,
+        io: std.Io,
         file: File,
         skip_broken_records: bool,
         record_base: i64,
@@ -2769,7 +2789,7 @@ pub const HashDBM = struct {
         var src_ap: i32 = DEFAULT_ALIGN_POW;
         var last_sync: i64 = 0;
         {
-            const st = HashDBM.findRecordBase(file, &src_rb, &src_sf, &src_ow, &src_ap, &last_sync);
+            const st = HashDBM.findRecordBase(io, file, &src_rb, &src_sf, &src_ow, &src_ap, &last_sync);
             if (!st.isOk()) return st;
         }
 
@@ -2792,7 +2812,7 @@ pub const HashDBM = struct {
                 var hdr_buf: [64]u8 = undefined;
                 const avail: i64 = eff_end - offset;
                 const read_n: usize = @intCast(@min(64, avail));
-                const st_r = file.read(offset, hdr_buf[0..read_n]);
+                const st_r = file.read(io, offset, hdr_buf[0..read_n]);
                 if (!st_r.isOk()) {
                     if (skip_broken_records) { offset += align_size; continue; }
                     return st_r;
@@ -2828,7 +2848,7 @@ pub const HashDBM = struct {
         var dead_set: std.StringHashMapUnmanaged(void) = .{};
         defer {
             var it = dead_set.iterator();
-            while (it.next()) |entry| {
+            while (it.next(io)) |entry| {
                 self.allocator.free(entry.key_ptr.*);
             }
             dead_set.deinit(self.allocator);
@@ -2842,7 +2862,7 @@ pub const HashDBM = struct {
             var hdr_buf: [64]u8 = undefined;
             const avail: i64 = eff_end - offset;
             const read_n: usize = @intCast(@min(64, avail));
-            _ = file.read(offset, hdr_buf[0..read_n]);
+            _ = file.read(io, offset, hdr_buf[0..read_n]);
 
             const magic = hdr_buf[0];
             const op = magic & 0xC0;
@@ -2854,7 +2874,7 @@ pub const HashDBM = struct {
             defer self.allocator.free(key_buf);
             const key_off = offset + @as(i64, @intCast(hdr.header_size));
             {
-                const st_k = file.read(key_off, key_buf);
+                const st_k = file.read(io, key_off, key_buf);
                 if (!st_k.isOk()) {
                     if (skip_broken_records) continue;
                     return st_k;
@@ -2871,7 +2891,7 @@ pub const HashDBM = struct {
                 defer self.allocator.free(val_buf);
                 const val_off = key_off + @as(i64, @intCast(hdr.key_size));
                 {
-                    const st_v = file.read(val_off, val_buf);
+                    const st_v = file.read(io, val_off, val_buf);
                     if (!st_v.isOk()) {
                         if (skip_broken_records) continue;
                         return st_v;
@@ -2879,7 +2899,7 @@ pub const HashDBM = struct {
                 }
 
                 // overwrite=false so later (already imported) records win over earlier ones.
-                const st_set = self.set(key, val_buf, false, null);
+                const st_set = self.set(io, key, val_buf, false, null);
                 if (!st_set.isOk() and st_set.code != .DUPLICATION_ERROR) {
                     if (skip_broken_records) continue;
                     return st_set;
@@ -2908,6 +2928,7 @@ pub const HashDBM = struct {
     /// Matches C++ HashDBM::ImportFromFileBackward(const std::string&, ...).
     pub fn importFromFileBackward(
         self: *HashDBM,
+        io: std.Io,
         path: []const u8,
         skip_broken_records: bool,
         record_base: i64,
@@ -2917,22 +2938,22 @@ pub const HashDBM = struct {
         var file = sf.asFile();
         defer file.deinit(self.allocator);
         {
-            const st = file.open(path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
+            const st = file.open(io, path, false, .{ .no_lock = true }); // import source; caller ensures no concurrent writes
             if (!st.isOk()) return st;
         }
-        defer _ = file.close();
-        return self.importFromFileBackwardFile(file, skip_broken_records, record_base, end_offset);
+        defer _ = file.close(io);
+        return self.importFromFileBackwardFile(io, file, skip_broken_records, record_base, end_offset);
     }
 
     /// Restores a broken HashDBM database by creating a new valid copy.
     /// Matches C++ HashDBM::RestoreDatabase().
     pub fn restoreDatabase(
         allocator: std.mem.Allocator,
+        io: std.Io,
         old_path: []const u8,
         new_path: []const u8,
         end_offset: i64,
         cipher_key: []const u8,
-        io: std.Io,
     ) Status {
         _ = cipher_key; // Zig port does not implement compression/encryption
 
@@ -2941,10 +2962,10 @@ pub const HashDBM = struct {
         var old_file = old_sf.asFile();
         defer old_file.deinit(allocator);
         {
-            const st = old_file.open(old_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
+            const st = old_file.open(io, old_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
             if (!st.isOk()) return st;
         }
-        defer _ = old_file.close();
+        defer _ = old_file.close(io);
 
         // Read format parameters.
         var src_rb: i64 = 0;
@@ -2952,7 +2973,7 @@ pub const HashDBM = struct {
         var src_ow: i32 = DEFAULT_OFFSET_WIDTH;
         var src_ap: i32 = DEFAULT_ALIGN_POW;
         var last_sync: i64 = 0;
-        _ = HashDBM.findRecordBase(old_file, &src_rb, &src_sf_flags, &src_ow, &src_ap, &last_sync);
+        _ = HashDBM.findRecordBase(io, old_file, &src_rb, &src_sf_flags, &src_ow, &src_ap, &last_sync);
 
         // Read full metadata for num_buckets, db_type, opaque, etc.
         var cm: i32 = 0;
@@ -2966,7 +2987,7 @@ pub const HashDBM = struct {
         var ts: i64 = 0;
         var db_type: i32 = 0;
         var opaque_buf: [OPAQUE_METADATA_SIZE]u8 = [_]u8{0} ** OPAQUE_METADATA_SIZE;
-        _ = HashDBM.readMetadata(old_file, &cm, &pmaj, &pmin, &src_sf_flags, &src_ow, &src_ap,
+        _ = HashDBM.readMetadata(io, old_file, &cm, &pmaj, &pmin, &src_sf_flags, &src_ow, &src_ap,
             &cf, &nb, &nr, &eds, &fsz, &ts, &db_type, &opaque_buf);
 
         const file_sz = old_file.getSizeSimple();
@@ -2987,7 +3008,7 @@ pub const HashDBM = struct {
             new_sf.asFile().deinit(allocator);
             return Status.init(.SYSTEM_ERROR);
         };
-        defer new_db.deinit();
+        defer new_db.deinit(io);
         {
             const params = TuningParameters{
                 .num_buckets = nb,
@@ -2995,7 +3016,7 @@ pub const HashDBM = struct {
                 .align_pow = src_ap,
                 .update_mode = update_mode,
             };
-            const st = new_db.openAdvanced(new_path, true, .{ .truncate = true }, params, io);
+            const st = new_db.openAdvanced(io, new_path, true, .{ .truncate = true }, params);
             if (!st.isOk()) return st;
         }
         new_db.impl.db_type = db_type;
@@ -3003,9 +3024,9 @@ pub const HashDBM = struct {
 
         // Import records using path-based variants (the old file is still open for reading).
         const st_import = if (update_mode == .appending)
-            new_db.importFromFileBackward(old_path, true, src_rb, eff_end)
+            new_db.importFromFileBackward(io, old_path, true, src_rb, eff_end)
         else
-            new_db.importFromFileForward(old_path, true, src_rb, eff_end);
+            new_db.importFromFileForward(io, old_path, true, src_rb, eff_end);
         if (!st_import.isOk()) return st_import;
 
         return new_db.close(io);
@@ -3060,10 +3081,10 @@ pub const HashDBM = struct {
     }
 
     /// Copies the database file to dest_path, optionally syncing first.
-    pub fn copyFileData(self: *HashDBM, dest_path: []const u8, sync_hard: bool, io: std.Io) Status {
+    pub fn copyFileData(self: *HashDBM, io: std.Io, dest_path: []const u8, sync_hard: bool) Status {
         if (!self.isOpen()) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (sync_hard) {
-            const st = self.synchronize(true, io);
+            const st = self.synchronize(io, true);
             if (!st.isOk()) return st;
         }
         const src_path = self.getFilePathInternal();
@@ -3075,30 +3096,30 @@ pub const HashDBM = struct {
 
     /// Renames a key. Reads the old value, sets it under new_key, then removes old_key
     /// unless copying=true. Fails if new_key already exists and overwrite=false.
-    pub fn rekey(self: *HashDBM, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+    pub fn rekey(self: *HashDBM, io: std.Io, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
         if (!self.isOpen() or !self.isWritable())
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(self.allocator);
 
-        const st_get = self.get(old_key, &value_list);
+        const st_get = self.get(io, old_key, &value_list);
         if (!st_get.isOk()) return st_get;
 
-        const st_set = self.set(new_key, value_list.items, overwrite, null);
+        const st_set = self.set(io, new_key, value_list.items, overwrite, null);
         if (!st_set.isOk()) return st_set;
 
         if (!copying) {
-            _ = self.remove(old_key);
+            _ = self.remove(io, old_key);
         }
         return Status.init(.SUCCESS);
     }
 
     /// Exports all records from this DBM to dest (any DBM with a set() method).
-    pub fn export_(self: *HashDBM, dest: anytype) Status {
-        var iter = self.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        var st = iter.first();
+    pub fn export_(self: *HashDBM, io: std.Io, dest: anytype) Status {
+        var iter = self.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        var st = iter.first(io);
         if (st.code == .NOT_FOUND_ERROR) return Status.init(.SUCCESS);
         if (!st.isOk()) return st;
         while (true) {
@@ -3106,11 +3127,11 @@ pub const HashDBM = struct {
             defer key_list.deinit(self.allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get(io, &key_list, &val_list);
             if (!st_get.isOk()) break;
-            const st_set = dest.set(key_list.items, val_list.items, true, null);
+            const st_set = dest.set(io, key_list.items, val_list.items, true, null);
             if (!st_set.isOk()) return st_set;
-            st = iter.next();
+            st = iter.next(io);
             if (!st.isOk()) break;
         }
         return Status.init(.SUCCESS);
@@ -3120,6 +3141,7 @@ pub const HashDBM = struct {
     /// Matches C++ DBM::CompareExchangeMulti().
     pub fn compareExchangeMulti(
         self: *HashDBM,
+        io: std.Io,
         expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
         desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
     ) Status {
@@ -3127,7 +3149,7 @@ pub const HashDBM = struct {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const get_st = self.get(cond.key, &val_list);
+            const get_st = self.get(io, cond.key, &val_list);
             switch (cond.value) {
                 .absent => {
                     if (get_st.isOk()) return Status.init(.DUPLICATION_ERROR);
@@ -3145,11 +3167,11 @@ pub const HashDBM = struct {
         for (desired) |change| {
             switch (change.value) {
                 .remove => {
-                    const st = self.remove(change.key);
+                    const st = self.remove(io, change.key);
                     if (!st.isOk() and st.code != .NOT_FOUND_ERROR) return st;
                 },
                 .set => |new_val| {
-                    const st = self.set(change.key, new_val, true, null);
+                    const st = self.set(io, change.key, new_val, true, null);
                     if (!st.isOk()) return st;
                 },
                 .noop => {},
@@ -3167,7 +3189,7 @@ test "HashDBM.init and deinit: no open" {
     // StdFile ownership transfers to HashDBM via asFile(); db.deinit() frees it.
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 0, std.testing.allocator);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
     try std.testing.expect(!db.isOpen());
 }
 
@@ -3181,9 +3203,9 @@ test "HashDBM.open and close: creates file" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    const st_open = db.open(full_path, true, .{}, std.testing.io);
+    const st_open = db.open(std.testing.io, full_path, true, .{});
     try std.testing.expect(st_open.isOk());
     try std.testing.expect(db.isOpen());
     try std.testing.expect(db.isWritable());
@@ -3203,18 +3225,18 @@ test "HashDBM.set and get: basic CRUD" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.set("hello", "world", true, null).isOk());
-    try std.testing.expect(db.set("foo", "bar", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "hello", "world", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "foo", "bar", true, null).isOk());
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(std.testing.allocator);
-    try std.testing.expect(db.get("hello", &val).isOk());
+    try std.testing.expect(db.get(std.testing.io, "hello", &val).isOk());
     try std.testing.expectEqualStrings("world", val.items);
 
-    try std.testing.expect(db.get("missing", null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.get(std.testing.io, "missing", null).code == .NOT_FOUND_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3228,10 +3250,10 @@ test "HashDBM.set: overwrite=false returns DUPLICATION_ERROR" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("key", "val1", true, null).isOk());
-    try std.testing.expect(db.set("key", "val2", false, null).code == .DUPLICATION_ERROR);
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key", "val1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key", "val2", false, null).code == .DUPLICATION_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3245,12 +3267,12 @@ test "HashDBM.remove: existing key" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("k", "v", true, null).isOk());
-    try std.testing.expect(db.remove("k").isOk());
-    try std.testing.expect(db.get("k", null).code == .NOT_FOUND_ERROR);
-    try std.testing.expect(db.remove("k").code == .NOT_FOUND_ERROR);
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "k", "v", true, null).isOk());
+    try std.testing.expect(db.remove(std.testing.io, "k").isOk());
+    try std.testing.expect(db.get(std.testing.io, "k", null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.remove(std.testing.io, "k").code == .NOT_FOUND_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3264,11 +3286,11 @@ test "HashDBM.count and getEffectiveDataSize" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
     try std.testing.expectEqual(@as(i64, 0), db.countSimple());
-    try std.testing.expect(db.set("a", "1", true, null).isOk());
-    try std.testing.expect(db.set("b", "2", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "a", "1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "b", "2", true, null).isOk());
     try std.testing.expectEqual(@as(i64, 2), db.countSimple());
     try std.testing.expect(db.getEffectiveDataSize() >= 4);
     try std.testing.expect(db.close(std.testing.io).isOk());
@@ -3284,8 +3306,8 @@ test "HashDBM.processFirst: empty returns NOT_FOUND_ERROR" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     const NoopProc = struct {
         pub fn processFull(self: *@This(), k: []const u8, v: []const u8) RecordAction {
@@ -3296,7 +3318,7 @@ test "HashDBM.processFirst: empty returns NOT_FOUND_ERROR" {
         }
     };
     var proc: NoopProc = .{};
-    try std.testing.expect(db.processFirst(&proc, false).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.processFirst(std.testing.io, &proc, false).code == .NOT_FOUND_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3310,11 +3332,11 @@ test "HashDBM.processEach: visits all records" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("a", "1", true, null).isOk());
-    try std.testing.expect(db.set("b", "2", true, null).isOk());
-    try std.testing.expect(db.set("c", "3", true, null).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "a", "1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "b", "2", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "c", "3", true, null).isOk());
 
     const CountProc = struct {
         count: i64 = 0,
@@ -3326,7 +3348,7 @@ test "HashDBM.processEach: visits all records" {
         }
     };
     var proc: CountProc = .{};
-    try std.testing.expect(db.processEach(&proc, false).isOk());
+    try std.testing.expect(db.processEach(std.testing.io, &proc, false).isOk());
     try std.testing.expectEqual(@as(i64, 3), proc.count);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
@@ -3341,13 +3363,13 @@ test "HashDBM.clear: empties database" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("a", "1", true, null).isOk());
-    try std.testing.expect(db.set("b", "2", true, null).isOk());
-    try std.testing.expect(db.clear().isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "a", "1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "b", "2", true, null).isOk());
+    try std.testing.expect(db.clear(std.testing.io).isOk());
     try std.testing.expectEqual(@as(i64, 0), db.countSimple());
-    try std.testing.expect(db.get("a", null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.get(std.testing.io, "a", null).code == .NOT_FOUND_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3362,21 +3384,21 @@ test "HashDBM.synchronize and reopen: data persists" {
     {
         const std_file = try file_mod.StdFile.create(std.testing.allocator);
         var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-        defer db.deinit();
-        try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-        try std.testing.expect(db.set("persist_key", "persist_val", true, null).isOk());
-        try std.testing.expect(db.synchronize(false, std.testing.io).isOk());
+        defer db.deinit(std.testing.io);
+        try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+        try std.testing.expect(db.set(std.testing.io, "persist_key", "persist_val", true, null).isOk());
+        try std.testing.expect(db.synchronize(std.testing.io, false).isOk());
         try std.testing.expect(db.close(std.testing.io).isOk());
     }
 
     {
         const std_file2 = try file_mod.StdFile.create(std.testing.allocator);
         var db2 = try HashDBM.init(std_file2.asFile(), 0, std.testing.allocator);
-        defer db2.deinit();
-        try std.testing.expect(db2.open(full_path, true, .{}, std.testing.io).isOk());
+        defer db2.deinit(std.testing.io);
+        try std.testing.expect(db2.open(std.testing.io, full_path, true, .{}).isOk());
         var val: std.ArrayList(u8) = .empty;
         defer val.deinit(std.testing.allocator);
-        try std.testing.expect(db2.get("persist_key", &val).isOk());
+        try std.testing.expect(db2.get(std.testing.io, "persist_key", &val).isOk());
         try std.testing.expectEqualStrings("persist_val", val.items);
         try std.testing.expect(db2.close(std.testing.io).isOk());
     }
@@ -3392,8 +3414,8 @@ test "HashDBM.getOpaqueMetadata and setOpaqueMetadata: roundtrip" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     const meta_data = "my_custom_meta_data";
     try std.testing.expect(db.setOpaqueMetadata(meta_data).isOk());
@@ -3412,15 +3434,15 @@ test "HashDBM.Cursor: first and next" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("a", "1", true, null).isOk());
-    try std.testing.expect(db.set("b", "2", true, null).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "a", "1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "b", "2", true, null).isOk());
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    try std.testing.expect(iter.first().isOk());
+    try std.testing.expect(iter.first(std.testing.io).isOk());
 
     var count: i64 = 0;
     var k: std.ArrayList(u8) = .empty;
@@ -3428,9 +3450,9 @@ test "HashDBM.Cursor: first and next" {
     var v: std.ArrayList(u8) = .empty;
     defer v.deinit(std.testing.allocator);
 
-    while (iter.get(&k, &v).isOk()) {
+    while (iter.get(std.testing.io, &k, &v).isOk()) {
         count += 1;
-        if (iter.next().code == .NOT_FOUND_ERROR) break;
+        if (iter.next(std.testing.io).code == .NOT_FOUND_ERROR) break;
     }
     try std.testing.expectEqual(@as(i64, 2), count);
     try std.testing.expect(db.close(std.testing.io).isOk());
@@ -3446,21 +3468,21 @@ test "HashDBM.Cursor: jump to key" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("alpha", "A", true, null).isOk());
-    try std.testing.expect(db.set("beta", "B", true, null).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "alpha", "A", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "beta", "B", true, null).isOk());
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    try std.testing.expect(iter.jump("alpha").isOk());
+    try std.testing.expect(iter.jump(std.testing.io, "alpha").isOk());
     var v: std.ArrayList(u8) = .empty;
     defer v.deinit(std.testing.allocator);
-    try std.testing.expect(iter.get(null, &v).isOk());
+    try std.testing.expect(iter.get(std.testing.io, null, &v).isOk());
     try std.testing.expectEqualStrings("A", v.items);
 
-    try std.testing.expect(iter.jump("missing").code == .NOT_FOUND_ERROR);
+    try std.testing.expect(iter.jump(std.testing.io, "missing").code == .NOT_FOUND_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3474,14 +3496,14 @@ test "HashDBM.Cursor: orphan on close" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
     try std.testing.expect(db.close(std.testing.io).isOk());
     // After close, iterator is orphaned — operations return PRECONDITION_ERROR.
-    try std.testing.expect(iter.first().code == .PRECONDITION_ERROR);
+    try std.testing.expect(iter.first(std.testing.io).code == .PRECONDITION_ERROR);
 }
 
 test "HashDBM.compareExchange: success and mismatch" {
@@ -3494,18 +3516,18 @@ test "HashDBM.compareExchange: success and mismatch" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
-    try std.testing.expect(db.set("ce_key", "old", true, null).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
+    try std.testing.expect(db.set(std.testing.io, "ce_key", "old", true, null).isOk());
 
     // Correct expected value — should succeed.
-    try std.testing.expect(db.compareExchange("ce_key", .{ .exact = "old" }, .{ .set = "new" }, null, null).isOk());
+    try std.testing.expect(db.compareExchange(std.testing.io, "ce_key", .{ .exact = "old" }, .{ .set = "new" }, null, null).isOk());
 
     // Wrong expected value — should fail.
-    try std.testing.expect(db.compareExchange("ce_key", .{ .exact = "old" }, .{ .set = "newer" }, null, null).code == .INFEASIBLE_ERROR);
+    try std.testing.expect(db.compareExchange(std.testing.io, "ce_key", .{ .exact = "old" }, .{ .set = "newer" }, null, null).code == .INFEASIBLE_ERROR);
 
     // Absent key — correct expected absent.
-    try std.testing.expect(db.compareExchange("absent", .absent, .{ .set = "created" }, null, null).isOk());
+    try std.testing.expect(db.compareExchange(std.testing.io, "absent", .absent, .{ .set = "created" }, null, null).isOk());
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3519,13 +3541,13 @@ test "HashDBM.increment: with initial value" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     var current: i64 = 0;
-    try std.testing.expect(db.increment("counter", 5, &current, 100).isOk());
+    try std.testing.expect(db.increment(std.testing.io, "counter", 5, &current, 100).isOk());
     try std.testing.expectEqual(@as(i64, 105), current);
-    try std.testing.expect(db.increment("counter", 3, &current, 0).isOk());
+    try std.testing.expect(db.increment(std.testing.io, "counter", 3, &current, 0).isOk());
     try std.testing.expectEqual(@as(i64, 108), current);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
@@ -3540,21 +3562,21 @@ test "HashDBM.popFirst and pushLast" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.pushLast("payload1", time_util.getWallTime(std.testing.io), null, std.testing.io).isOk());
+    try std.testing.expect(db.pushLast(std.testing.io, "payload1", time_util.getWallTime(std.testing.io), null).isOk());
     try std.testing.expect(db.countSimple() == 1);
 
     var key_out: std.ArrayList(u8) = .empty;
     defer key_out.deinit(std.testing.allocator);
     var val_out: std.ArrayList(u8) = .empty;
     defer val_out.deinit(std.testing.allocator);
-    try std.testing.expect(db.popFirst(&key_out, &val_out).isOk());
+    try std.testing.expect(db.popFirst(std.testing.io, &key_out, &val_out).isOk());
     try std.testing.expectEqualStrings("payload1", val_out.items);
     try std.testing.expectEqual(@as(i64, 0), db.countSimple());
 
-    try std.testing.expect(db.popFirst(null, null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.popFirst(std.testing.io, null, null).code == .NOT_FOUND_ERROR);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
@@ -3568,16 +3590,16 @@ test "HashDBM.append: with delimiter" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.append("list", "a", ",").isOk());
-    try std.testing.expect(db.append("list", "b", ",").isOk());
-    try std.testing.expect(db.append("list", "c", ",").isOk());
+    try std.testing.expect(db.append(std.testing.io, "list", "a", ",").isOk());
+    try std.testing.expect(db.append(std.testing.io, "list", "b", ",").isOk());
+    try std.testing.expect(db.append(std.testing.io, "list", "c", ",").isOk());
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(std.testing.allocator);
-    try std.testing.expect(db.get("list", &val).isOk());
+    try std.testing.expect(db.get(std.testing.io, "list", &val).isOk());
     try std.testing.expectEqualStrings("a,b,c", val.items);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
@@ -3592,8 +3614,8 @@ test "HashDBM.rebuild: preserves records" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     var i: usize = 0;
     while (i < 10) : (i += 1) {
@@ -3601,7 +3623,7 @@ test "HashDBM.rebuild: preserves records" {
         var v_buf: [16]u8 = undefined;
         const k = try std.fmt.bufPrint(&k_buf, "key{d}", .{i});
         const v = try std.fmt.bufPrint(&v_buf, "val{d}", .{i});
-        try std.testing.expect(db.set(k, v, true, null).isOk());
+        try std.testing.expect(db.set(std.testing.io, k, v, true, null).isOk());
     }
     try std.testing.expectEqual(@as(i64, 10), db.countSimple());
 
@@ -3610,7 +3632,7 @@ test "HashDBM.rebuild: preserves records" {
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(std.testing.allocator);
-    try std.testing.expect(db.get("key5", &val).isOk());
+    try std.testing.expect(db.get(std.testing.io, "key5", &val).isOk());
     try std.testing.expectEqualStrings("val5", val.items);
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
@@ -3625,8 +3647,8 @@ test "HashDBM.getDatabaseType and setDatabaseType" {
 
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     // Default type is 0.
     try std.testing.expectEqual(@as(i32, 0), db.getDatabaseType());
@@ -3640,8 +3662,8 @@ test "HashDBM.getDatabaseType and setDatabaseType" {
 
     const std_file2 = try file_mod.StdFile.create(std.testing.allocator);
     var db2 = try HashDBM.init(std_file2.asFile(), 0, std.testing.allocator);
-    defer db2.deinit();
-    try std.testing.expect(db2.open(full_path, false, .{}, std.testing.io).isOk());
+    defer db2.deinit(std.testing.io);
+    try std.testing.expect(db2.open(std.testing.io, full_path, false, .{}).isOk());
     try std.testing.expectEqual(@as(i32, 42), db2.getDatabaseType());
     _ = db2.close(std.testing.io);
 }
@@ -3657,15 +3679,15 @@ test "HashDBM: read-only rejects setDatabaseType" {
     // Create the file first.
     const std_file = try file_mod.StdFile.create(std.testing.allocator);
     var db = try HashDBM.init(std_file.asFile(), 1024, std.testing.allocator);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
     try std.testing.expect(db.close(std.testing.io).isOk());
 
     // Reopen read-only: setDatabaseType must fail.
     const std_file2 = try file_mod.StdFile.create(std.testing.allocator);
     var db2 = try HashDBM.init(std_file2.asFile(), 0, std.testing.allocator);
-    defer db2.deinit();
-    try std.testing.expect(db2.open(full_path, false, .{}, std.testing.io).isOk());
+    defer db2.deinit(std.testing.io);
+    try std.testing.expect(db2.open(std.testing.io, full_path, false, .{}).isOk());
     try std.testing.expectEqual(lib_common.Code.PRECONDITION_ERROR, db2.setDatabaseType(1).code);
     _ = db2.close(std.testing.io);
 }
@@ -3708,10 +3730,10 @@ test "HashDBM: open/close lifecycle and isOpen" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     try std.testing.expect(!db.isOpen());
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
     try std.testing.expect(db.isOpen());
     try std.testing.expect(db.close(std.testing.io).isOk());
     try std.testing.expect(!db.isOpen());
@@ -3729,22 +3751,22 @@ test "HashDBM: set, get, remove, countSimple" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.set("alpha", "one", true, null).isOk());
-    try std.testing.expect(db.set("beta", "two", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "alpha", "one", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "beta", "two", true, null).isOk());
     try std.testing.expectEqual(@as(i64, 2), db.countSimple());
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    try std.testing.expect(db.get("alpha", &val).isOk());
+    try std.testing.expect(db.get(std.testing.io, "alpha", &val).isOk());
     try std.testing.expectEqualStrings("one", val.items);
 
-    try std.testing.expect(db.get("missing", null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.get(std.testing.io, "missing", null).code == .NOT_FOUND_ERROR);
 
-    try std.testing.expect(db.remove("alpha").isOk());
-    try std.testing.expect(db.get("alpha", null).code == .NOT_FOUND_ERROR);
+    try std.testing.expect(db.remove(std.testing.io, "alpha").isOk());
+    try std.testing.expect(db.get(std.testing.io, "alpha", null).code == .NOT_FOUND_ERROR);
     try std.testing.expectEqual(@as(i64, 1), db.countSimple());
 
     try std.testing.expect(db.close(std.testing.io).isOk());
@@ -3762,16 +3784,16 @@ test "HashDBM: iterator forward traversal" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.set("key1", "val1", true, null).isOk());
-    try std.testing.expect(db.set("key2", "val2", true, null).isOk());
-    try std.testing.expect(db.set("key3", "val3", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key1", "val1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key2", "val2", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key3", "val3", true, null).isOk());
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
-    try std.testing.expect(iter.first().isOk());
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
+    try std.testing.expect(iter.first(std.testing.io).isOk());
 
     var seen: usize = 0;
     while (true) {
@@ -3780,13 +3802,13 @@ test "HashDBM: iterator forward traversal" {
         var value: std.ArrayList(u8) = .empty;
         defer value.deinit(alloc);
 
-        const st = iter.get(&key, &value);
+        const st = iter.get(std.testing.io, &key, &value);
         if (st.code == .NOT_FOUND_ERROR) break;
         try std.testing.expect(st.isOk());
         try std.testing.expect(key.items.len > 0);
         try std.testing.expect(value.items.len > 0);
         seen += 1;
-        _ = iter.next();
+        _ = iter.next(std.testing.io);
     }
     try std.testing.expectEqual(@as(usize, 3), seen);
 
@@ -3830,8 +3852,8 @@ test "HashDBM: UpdateLogger integration" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     var mock_ctx: HashMockLoggerCtx = .{};
     var mock_logger: UpdateLogger = .{
@@ -3845,17 +3867,17 @@ test "HashDBM: UpdateLogger integration" {
     db.setUpdateLogger(&mock_logger);
 
     // set fires writeSet
-    try std.testing.expect(db.set("key1", "val1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key1", "val1", true, null).isOk());
     try std.testing.expect(mock_ctx.writeSet_count > 0);
 
     // remove fires writeRemove
-    try std.testing.expect(db.remove("key1").isOk());
+    try std.testing.expect(db.remove(std.testing.io, "key1").isOk());
     try std.testing.expect(mock_ctx.writeRemove_count > 0);
 
     // clear fires writeClear
-    try std.testing.expect(db.set("key2", "val2", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "key2", "val2", true, null).isOk());
     const pre_clear = mock_ctx.writeClear_count;
-    try std.testing.expect(db.clear().isOk());
+    try std.testing.expect(db.clear(std.testing.io).isOk());
     try std.testing.expect(mock_ctx.writeClear_count > pre_clear);
 
     try std.testing.expect(db.close(std.testing.io).isOk());
@@ -3873,14 +3895,14 @@ test "HashDBM.*Multi: bulk set/get/remove/append" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
     // setMulti: insert 3 keys
     const pairs = [_][2][]const u8{
         .{ "key1", "val1" }, .{ "key2", "val2" }, .{ "key3", "val3" },
     };
-    try std.testing.expect(db.setMulti(&pairs, true).isOk());
+    try std.testing.expect(db.setMulti(std.testing.io, &pairs, true).isOk());
 
     // getMulti: 2 existing + 1 missing → NOT_FOUND_ERROR, 2 entries in map
     var records = std.StringHashMap([]u8).init(alloc);
@@ -3892,17 +3914,17 @@ test "HashDBM.*Multi: bulk set/get/remove/append" {
         }
         records.deinit();
     }
-    const get_st = db.getMulti(&.{ "key1", "key2", "missing" }, &records);
+    const get_st = db.getMulti(std.testing.io, &.{ "key1", "key2", "missing" }, &records);
     try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, get_st.code);
     try std.testing.expectEqual(@as(usize, 2), records.count());
 
     // removeMulti: remove 2 existing keys
-    try std.testing.expect(db.removeMulti(&.{ "key1", "key2" }).isOk());
+    try std.testing.expect(db.removeMulti(std.testing.io, &.{ "key1", "key2" }).isOk());
 
     // appendMulti: append to remaining key3
     const app = [_][2][]const u8{ .{ "key3", "_appended" } };
-    try std.testing.expect(db.appendMulti(&app, "").isOk());
-    const got = try db.getSimple("key3", "", alloc);
+    try std.testing.expect(db.appendMulti(std.testing.io, &app, "").isOk());
+    const got = try db.getSimple(alloc, std.testing.io, "key3", "");
     defer alloc.free(got);
     try std.testing.expectEqualStrings("val3_appended", got);
 
@@ -3921,18 +3943,18 @@ test "HashDBM.Iterator: iterate() from beginning" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.set("a", "1", true, null).isOk());
-    try std.testing.expect(db.set("b", "2", true, null).isOk());
-    try std.testing.expect(db.set("c", "3", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "a", "1", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "b", "2", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "c", "3", true, null).isOk());
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
 
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         try std.testing.expect(entry.key.len > 0);
         try std.testing.expect(entry.value.len > 0);
         count += 1;
@@ -3942,7 +3964,7 @@ test "HashDBM.Iterator: iterate() from beginning" {
     try std.testing.expect(db.close(std.testing.io).isOk());
 }
 
-test "HashDBM.Iterator: iterateFrom() with lifetime contract" {
+test "HashDBM.Iterator: iterateFrom(std.testing.io) with lifetime contract" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3954,19 +3976,19 @@ test "HashDBM.Iterator: iterateFrom() with lifetime contract" {
 
     const std_file = try file_mod.StdFile.create(alloc);
     var db = try HashDBM.init(std_file.asFile(), 1024, alloc);
-    defer db.deinit();
-    try std.testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try std.testing.expect(db.open(std.testing.io, full_path, true, .{}).isOk());
 
-    try std.testing.expect(db.set("alpha", "one", true, null).isOk());
-    try std.testing.expect(db.set("beta", "two", true, null).isOk());
-    try std.testing.expect(db.set("gamma", "three", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "alpha", "one", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "beta", "two", true, null).isOk());
+    try std.testing.expect(db.set(std.testing.io, "gamma", "three", true, null).isOk());
 
     // iterateFrom() at "beta"
     {
-        var iter = try db.iterateFrom("beta", alloc);
-        defer iter.deinit();
+        var iter = try db.iterateFrom(alloc, std.testing.io, "beta");
+        defer iter.deinit(std.testing.io);
 
-        const first = try iter.next();
+        const first = try iter.next(std.testing.io);
         try std.testing.expect(first != null);
         try std.testing.expect(std.mem.startsWith(u8, first.?.key, "b"));
 
@@ -3977,7 +3999,7 @@ test "HashDBM.Iterator: iterateFrom() with lifetime contract" {
         defer alloc.free(val_copy);
 
         // Second next() — first.?.key is now invalid, copies are safe
-        _ = try iter.next();
+        _ = try iter.next(std.testing.io);
 
         // Verify copies are still valid
         try std.testing.expectEqualStrings("beta", key_copy);

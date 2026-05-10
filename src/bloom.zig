@@ -12,11 +12,9 @@
 //! a 128-bit `(h1, h2)`. `h1` selects the block; `k` bit positions within the
 //! block are derived via Kirsch-Mitzenmacher: `bit_i = (h2 +% i*%h1) % BLOCK_BITS`.
 //!
-//! Thread safety: every public method acquires an internal `SpinSharedMutex`.
+//! Thread safety: every public method acquires an internal `std.Io.RwLock`.
 //! Read-only methods (`mightContain`, `count`, etc.) use a shared lock so
-//! concurrent reads run in parallel. `add` uses an exclusive lock. Under a
-//! sustained read-heavy workload, writers may spin waiting for all readers to
-//! release the shared lock; this is a known trade-off of spin-based RW locking.
+//! concurrent reads run in parallel. `add` uses an exclusive lock.
 //!
 //! `deinit` must be called from a single thread with no concurrent access.
 //! The caller must ensure all concurrent operations have completed (e.g. by
@@ -28,7 +26,6 @@
 
 const std = @import("std");
 const hash_util = @import("hash_util.zig");
-const thread_util = @import("thread_util.zig");
 
 // ---------------------------------------------------------------------------
 // Block: 64 bytes / 512 bits, cache-line aligned.
@@ -107,7 +104,7 @@ fn deinitLayer(layer: *Layer, allocator: std.mem.Allocator) void {
 pub const BloomFilter = struct {
     layers: std.ArrayListUnmanaged(Layer),
     allocator: std.mem.Allocator,
-    mutex: thread_util.SpinSharedMutex,
+    mutex: std.Io.RwLock,
     total_count: usize,
     opts: Options,
 
@@ -171,7 +168,7 @@ pub const BloomFilter = struct {
         return .{
             .layers = layers,
             .allocator = allocator,
-            .mutex = .{},
+            .mutex = .init,
             .total_count = 0,
             .opts = opts,
         };
@@ -193,9 +190,9 @@ pub const BloomFilter = struct {
     /// already in use. This is a **permanent** terminal condition: once the
     /// limit is reached, every subsequent `add` call will return this error.
     /// `mightContain` continues to work correctly on existing data.
-    pub fn add(self: *BloomFilter, key: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn add(self: *BloomFilter, io: std.Io, key: []const u8) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         try self.maybeGrow();
         const layer = &self.layers.items[self.layers.items.len - 1];
         const h = hash_util.hashMurmur3_128(key, 0);
@@ -216,9 +213,9 @@ pub const BloomFilter = struct {
     /// post-growth correctness — keys inserted in older layers must still be
     /// found). False positives are possible; false negatives never occur for
     /// keys that were actually inserted.
-    pub fn mightContain(self: *BloomFilter, key: []const u8) bool {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    pub fn mightContain(self: *BloomFilter, io: std.Io, key: []const u8) bool {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         const h = hash_util.hashMurmur3_128(key, 0);
         for (self.layers.items) |*layer| {
             const block_idx = h.h1 % layer.num_blocks;
@@ -237,24 +234,24 @@ pub const BloomFilter = struct {
         return false;
     }
 
-    pub fn count(self: *BloomFilter) usize {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    pub fn count(self: *BloomFilter, io: std.Io) usize {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         return self.total_count;
     }
 
-    pub fn layerCount(self: *BloomFilter) usize {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    pub fn layerCount(self: *BloomFilter, io: std.Io) usize {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         return self.layers.items.len;
     }
 
     /// Returns the estimated false-positive probability for the current filter
     /// state, computed as the maximum estimated rate across all layers.
     /// Returns 0.0 when no items have been inserted.
-    pub fn estimatedFalsePositiveRate(self: *BloomFilter) f64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    pub fn estimatedFalsePositiveRate(self: *BloomFilter, io: std.Io) f64 {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         var max_rate: f64 = 0.0;
         for (self.layers.items) |layer| {
             const fill = @as(f64, @floatFromInt(layer.count)) /
@@ -292,9 +289,9 @@ pub const BloomFilter = struct {
     // -- serialization -----------------------------------------------------
 
     /// Exact byte length that `serialize` will write.
-    pub fn serializedSize(self: *BloomFilter) usize {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    pub fn serializedSize(self: *BloomFilter, io: std.Io) usize {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         const header_size: usize = 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 4;
         var total = header_size;
         for (self.layers.items) |layer| {
@@ -310,9 +307,9 @@ pub const BloomFilter = struct {
     ///   total_count:u64 num_layers:u32
     ///   per layer: num_blocks:u64 num_hashes:u32 count:u64 capacity:u64 fp_rate:f64
     ///              block_data: num_blocks * 64 bytes
-    pub fn serialize(self: *BloomFilter, writer: anytype) !void {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    pub fn serialize(self: *BloomFilter, io: std.Io, writer: anytype) !void {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         try writeU32(writer, MAGIC);
         try writeU32(writer, VERSION);
@@ -407,7 +404,7 @@ pub const BloomFilter = struct {
         return .{
             .layers = layers,
             .allocator = allocator,
-            .mutex = .{},
+            .mutex = .init,
             .total_count = @intCast(total_count),
             .opts = restored_opts,
         };
@@ -475,8 +472,8 @@ test "Block: set and get boundary indices" {
 test "BloomFilter: init with default options" {
     var f = try BloomFilter.init(testing.allocator, .{});
     defer f.deinit();
-    try testing.expectEqual(@as(usize, 0), f.count());
-    try testing.expectEqual(@as(usize, 1), f.layerCount());
+    try testing.expectEqual(@as(usize, 0), f.count(testing.io));
+    try testing.expectEqual(@as(usize, 1), f.layerCount(testing.io));
 }
 
 test "BloomFilter: init rejects invalid options" {
@@ -500,17 +497,17 @@ test "BloomFilter: init rejects invalid options" {
 test "BloomFilter: empty filter mightContain returns false" {
     var f = try BloomFilter.init(testing.allocator, .{});
     defer f.deinit();
-    try testing.expect(!f.mightContain("alpha"));
-    try testing.expect(!f.mightContain("beta"));
-    try testing.expect(!f.mightContain(""));
-    try testing.expect(!f.mightContain("\x00\x01\x02"));
+    try testing.expect(!f.mightContain(testing.io, "alpha"));
+    try testing.expect(!f.mightContain(testing.io, "beta"));
+    try testing.expect(!f.mightContain(testing.io, ""));
+    try testing.expect(!f.mightContain(testing.io, "\x00\x01\x02"));
 }
 
 test "BloomFilter: zero-length key" {
     var f = try BloomFilter.init(testing.allocator, .{});
     defer f.deinit();
-    try f.add("");
-    try testing.expect(f.mightContain(""));
+    try f.add(testing.io, "");
+    try testing.expect(f.mightContain(testing.io, ""));
 }
 
 test "BloomFilter: no false negatives (100 keys)" {
@@ -520,12 +517,12 @@ test "BloomFilter: no false negatives (100 keys)" {
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
     }
     i = 0;
     while (i < 100) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "key-{d}", .{i});
-        try testing.expect(f.mightContain(k));
+        try testing.expect(f.mightContain(testing.io, k));
     }
 }
 
@@ -538,9 +535,9 @@ test "BloomFilter: post-growth correctness" {
     defer f.deinit();
     var buf: [32]u8 = undefined;
     var inserted: usize = 0;
-    while (f.layerCount() < 2) {
+    while (f.layerCount(testing.io) < 2) {
         const k = try std.fmt.bufPrint(&buf, "grow-{d}", .{inserted});
-        try f.add(k);
+        try f.add(testing.io, k);
         inserted += 1;
         if (inserted > 10000) return error.GrowthDidNotTrigger;
     }
@@ -548,7 +545,7 @@ test "BloomFilter: post-growth correctness" {
     var i: usize = 0;
     while (i < inserted) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "grow-{d}", .{i});
-        try testing.expect(f.mightContain(k));
+        try testing.expect(f.mightContain(testing.io, k));
     }
 }
 
@@ -561,13 +558,13 @@ test "BloomFilter: layer fp_rate tightens across layers" {
     defer f.deinit();
     var buf: [32]u8 = undefined;
     var i: usize = 0;
-    while (f.layerCount() < 2) : (i += 1) {
+    while (f.layerCount(testing.io) < 2) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "tight-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
         if (i > 10000) return error.GrowthDidNotTrigger;
     }
-    f.mutex.lock();
-    defer f.mutex.unlock();
+    f.mutex.lockUncancelable(std.testing.io);
+    defer f.mutex.unlock(std.testing.io);
     try testing.expect(f.layers.items[1].fp_rate < f.layers.items[0].fp_rate);
 }
 
@@ -582,7 +579,7 @@ test "BloomFilter: false positive rate sanity" {
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "fp-test-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
     }
     var fp: usize = 0;
     i = 0;
@@ -591,7 +588,7 @@ test "BloomFilter: false positive rate sanity" {
     // is a genuine false positive.
     while (i < 10000) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "unseen-{d}", .{i});
-        if (f.mightContain(k)) fp += 1;
+        if (f.mightContain(testing.io, k)) fp += 1;
     }
     const rate = @as(f64, @floatFromInt(fp)) / 10000.0;
     try testing.expect(rate < 5.0 * opts.false_positive_rate);
@@ -600,14 +597,14 @@ test "BloomFilter: false positive rate sanity" {
 test "BloomFilter: estimatedFalsePositiveRate in range" {
     var f = try BloomFilter.init(testing.allocator, .{});
     defer f.deinit();
-    try testing.expectEqual(@as(f64, 0.0), f.estimatedFalsePositiveRate());
+    try testing.expectEqual(@as(f64, 0.0), f.estimatedFalsePositiveRate(testing.io));
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "est-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
     }
-    const r = f.estimatedFalsePositiveRate();
+    const r = f.estimatedFalsePositiveRate(testing.io);
     try testing.expect(r > 0.0);
     try testing.expect(r < 1.0);
 }
@@ -623,12 +620,12 @@ test "BloomFilter: serializedSize matches actual serialize output" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "size-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
     }
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try f.serialize(&aw.writer);
-    try testing.expectEqual(f.serializedSize(), aw.written().len);
+    try f.serialize(testing.io, &aw.writer);
+    try testing.expectEqual(f.serializedSize(testing.io), aw.written().len);
 }
 
 test "BloomFilter: serialize deserialize round-trip" {
@@ -642,23 +639,23 @@ test "BloomFilter: serialize deserialize round-trip" {
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "rt-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
     }
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try f.serialize(&aw.writer);
+    try f.serialize(testing.io, &aw.writer);
 
     var reader = std.Io.Reader.fixed(aw.written());
     var g = try BloomFilter.deserialize(testing.allocator, &reader, .{});
     defer g.deinit();
 
-    try testing.expectEqual(f.count(), g.count());
-    try testing.expectEqual(f.layerCount(), g.layerCount());
+    try testing.expectEqual(f.count(testing.io), g.count(testing.io));
+    try testing.expectEqual(f.layerCount(testing.io), g.layerCount(testing.io));
 
     i = 0;
     while (i < 50) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "rt-{d}", .{i});
-        try testing.expect(g.mightContain(k));
+        try testing.expect(g.mightContain(testing.io, k));
     }
 }
 
@@ -673,11 +670,11 @@ test "BloomFilter: serialize deserialize idempotent" {
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         const k = try std.fmt.bufPrint(&buf, "idem-{d}", .{i});
-        try f.add(k);
+        try f.add(testing.io, k);
     }
     var aw1: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw1.deinit();
-    try f.serialize(&aw1.writer);
+    try f.serialize(testing.io, &aw1.writer);
 
     var r1 = std.Io.Reader.fixed(aw1.written());
     var g = try BloomFilter.deserialize(testing.allocator, &r1, .{});
@@ -685,7 +682,7 @@ test "BloomFilter: serialize deserialize idempotent" {
 
     var aw2: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw2.deinit();
-    try g.serialize(&aw2.writer);
+    try g.serialize(testing.io, &aw2.writer);
 
     try testing.expectEqualSlices(u8, aw1.written(), aw2.written());
 }
@@ -762,7 +759,7 @@ test "BloomFilter: concurrent add no panic, count consistent" {
             var i: usize = 0;
             while (i < 250) : (i += 1) {
                 const k = try std.fmt.bufPrint(&buf, "thread-{d}-{d}", .{ t, i });
-                try filter.add(k);
+                try filter.add(std.testing.io, k);
             }
         }
     };
@@ -776,7 +773,7 @@ test "BloomFilter: concurrent add no panic, count consistent" {
     // to the joiner. Worker failures would be visible only via count() != 1000.
     for (threads) |th| th.join();
 
-    try testing.expectEqual(@as(usize, 1000), f.count());
+    try testing.expectEqual(@as(usize, 1000), f.count(testing.io));
 
     var buf: [32]u8 = undefined;
     t = 0;
@@ -784,7 +781,7 @@ test "BloomFilter: concurrent add no panic, count consistent" {
         var i: usize = 0;
         while (i < 250) : (i += 1) {
             const k = try std.fmt.bufPrint(&buf, "thread-{d}-{d}", .{ t, i });
-            try testing.expect(f.mightContain(k));
+            try testing.expect(f.mightContain(testing.io, k));
         }
     }
 }

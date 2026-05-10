@@ -30,7 +30,6 @@ pub const OpenOptions = file_mod.OpenOptions;
 pub const FlatRecord = file_util.FlatRecord;
 pub const FlatRecordReader = file_util.FlatRecordReader;
 pub const RecordType = file_util.RecordType;
-pub const SpinSharedMutex = thread_util.SpinSharedMutex;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -201,19 +200,19 @@ const CacheSlot = struct {
     num_buckets: i64,
     num_records: i64,
     eff_data_size: i64,
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock,
 
     fn deinit(self: *CacheSlot, allocator: std.mem.Allocator) void {
         self.releaseAllRecords(allocator);
         allocator.free(self.buckets);
     }
 
-    fn lock(self: *CacheSlot) void {
-        self.mutex.lock();
+    fn lock(self: *CacheSlot, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
     }
 
-    fn unlock(self: *CacheSlot) void {
-        self.mutex.unlock();
+    fn unlock(self: *CacheSlot, io: std.Io) void {
+        self.mutex.unlock(io);
     }
 
     fn count(self: *CacheSlot) i64 {
@@ -224,9 +223,9 @@ const CacheSlot = struct {
         return self.eff_data_size;
     }
 
-    fn getMemoryUsage(self: *CacheSlot) i64 {
-        self.lock();
-        defer self.unlock();
+    fn getMemoryUsage(self: *CacheSlot, io: std.Io) i64 {
+        self.lock(io);
+        defer self.unlock(io);
         return self.getMemoryUsageImpl();
     }
 
@@ -245,14 +244,15 @@ const CacheSlot = struct {
 
     fn exportRecords(
         self: *CacheSlot,
+        io: std.Io,
         flat_rec: *FlatRecord,
     ) !Status {
         var ptr: ?[*]u8 = self.first;
         while (ptr) |p| {
             const rv = deserializeRecord(p);
             var status = Status.init(.SUCCESS);
-            status.mergeFrom(flat_rec.write(rv.key, .normal));
-            status.mergeFrom(flat_rec.write(rv.value, .normal));
+            status.mergeFrom(flat_rec.write(io, rv.key, .normal));
+            status.mergeFrom(flat_rec.write(io, rv.value, .normal));
             if (!status.isOk()) return status;
             ptr = rv.next;
         }
@@ -273,9 +273,9 @@ const CacheSlot = struct {
 
     fn rebuild(
         self: *CacheSlot,
+        allocator: std.mem.Allocator,
         cap_rec_num: i64,
         cap_mem_size: i64,
-        allocator: std.mem.Allocator,
     ) void {
         self.releaseAllRecords(allocator);
         allocator.free(self.buckets);
@@ -300,9 +300,9 @@ const CacheSlot = struct {
 
     fn processFirst(
         self: *CacheSlot,
+        allocator: std.mem.Allocator,
         proc: anytype,
         writable: bool,
-        allocator: std.mem.Allocator,
     ) bool {
         // C++ CacheSlot::ProcessFirst also returns early here without calling ProcessEmpty.
         // The sentinel is the DBM-level caller's responsibility.
@@ -360,9 +360,9 @@ const CacheSlot = struct {
 
     fn processEach(
         self: *CacheSlot,
+        allocator: std.mem.Allocator,
         proc: anytype,
         writable: bool,
-        allocator: std.mem.Allocator,
     ) !void {
         if (writable) {
             // Collect keys first (snapshot), then call processImpl for each.
@@ -375,7 +375,7 @@ const CacheSlot = struct {
             }
             for (keys.items) |key| {
                 const hash_val = hash_util.primaryHash(key, std.math.maxInt(u64)) >> 8;
-                try self.processImpl(key, hash_val, proc, true, allocator);
+                try self.processImpl(allocator, key, hash_val, proc, true);
             }
         } else {
             // Read-only: iterate LRU chain directly under the slot lock held by caller.
@@ -390,24 +390,25 @@ const CacheSlot = struct {
 
     fn process(
         self: *CacheSlot,
+        allocator: std.mem.Allocator,
+        io: std.Io,
         key: []const u8,
         hash: u64,
         proc: anytype,
         writable: bool,
-        allocator: std.mem.Allocator,
     ) !void {
-        self.lock();
-        defer self.unlock();
-        try self.processImpl(key, hash, proc, writable, allocator);
+        self.lock(io);
+        defer self.unlock(io);
+        try self.processImpl(allocator, key, hash, proc, writable);
     }
 
     fn processImpl(
         self: *CacheSlot,
+        allocator: std.mem.Allocator,
         key: []const u8,
         hash: u64,
         proc: anytype,
         writable: bool,
-        allocator: std.mem.Allocator,
     ) !void {
         const bucket_index = hash % @as(u64, @intCast(self.num_buckets));
         const bidx: usize = @intCast(bucket_index);
@@ -858,7 +859,7 @@ const CacheDBMIteratorImpl = struct {
     keys: std.ArrayList([]u8),
     allocator: std.mem.Allocator,
 
-    fn init(dbm: *CacheDBMImpl, allocator: std.mem.Allocator) !*CacheDBMIteratorImpl {
+    fn init(dbm: *CacheDBMImpl, io: std.Io, allocator: std.mem.Allocator) !*CacheDBMIteratorImpl {
         const self = try allocator.create(CacheDBMIteratorImpl);
         self.* = CacheDBMIteratorImpl{
             .dbm = dbm,
@@ -866,20 +867,20 @@ const CacheDBMIteratorImpl = struct {
             .keys = .empty,
             .allocator = allocator,
         };
-        dbm.mutex.lock();
+        dbm.mutex.lockUncancelable(io);
         dbm.iterators.append(allocator, self) catch {
-            dbm.mutex.unlock();
+            dbm.mutex.unlock(io);
             allocator.destroy(self);
             return error.OutOfMemory;
         };
-        dbm.mutex.unlock();
+        dbm.mutex.unlock(io);
         return self;
     }
 
-    fn deinit(self: *CacheDBMIteratorImpl) void {
+    fn deinit(self: *CacheDBMIteratorImpl, io: std.Io) void {
         if (self.dbm) |dbm| {
-            dbm.mutex.lock();
-            defer dbm.mutex.unlock();
+            dbm.mutex.lockUncancelable(io);
+            defer dbm.mutex.unlock(io);
             for (0..dbm.iterators.items.len) |i| {
                 if (dbm.iterators.items[i] == self) {
                     _ = dbm.iterators.orderedRemove(i);
@@ -894,7 +895,8 @@ const CacheDBMIteratorImpl = struct {
         self.allocator.destroy(self);
     }
 
-    fn first(self: *CacheDBMIteratorImpl) !Status {
+    fn first(self: *CacheDBMIteratorImpl, io: std.Io) !Status {
+        _ = io;
         self.slot_index.store(-1, .release);
         for (self.keys.items) |key| {
             self.allocator.free(key);
@@ -903,7 +905,7 @@ const CacheDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn jump(self: *CacheDBMIteratorImpl, key: []const u8) !Status {
+    fn jump(self: *CacheDBMIteratorImpl, io: std.Io, key: []const u8) !Status {
         if (self.dbm == null) {
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
         }
@@ -918,7 +920,7 @@ const CacheDBMIteratorImpl = struct {
         }
         self.keys.clearRetainingCapacity();
 
-        const st = try dbm.readNextBucketRecords(self);
+        const st = try dbm.readNextBucketRecords(io, self);
         if (!st.isOk()) {
             return st;
         }
@@ -949,12 +951,12 @@ const CacheDBMIteratorImpl = struct {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
-    fn next(self: *CacheDBMIteratorImpl) !Status {
+    fn next(self: *CacheDBMIteratorImpl, io: std.Io) !Status {
         if (self.dbm == null) {
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
         }
 
-        const st = try self.readKeys();
+        const st = try self.readKeys(io);
         if (!st.isOk()) {
             return st;
         }
@@ -967,13 +969,13 @@ const CacheDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn process(self: *CacheDBMIteratorImpl, proc: anytype, writable: bool) !Status {
+    fn process(self: *CacheDBMIteratorImpl, io: std.Io, proc: anytype, writable: bool) !Status {
         if (self.dbm == null) {
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
         }
         const dbm = self.dbm.?;
 
-        const st = try self.readKeys();
+        const st = try self.readKeys(io);
         if (!st.isOk()) {
             return st;
         }
@@ -1009,7 +1011,7 @@ const CacheDBMIteratorImpl = struct {
         const record_hash = hash_val >> 8;
 
         var slot: *CacheSlot = &dbm.slots[@intCast(slot_index)];
-        try slot.process(current_key, record_hash, &wrapper, writable, dbm.allocator);
+        try slot.process(dbm.allocator, io, current_key, record_hash, &wrapper, writable);
 
         if (!wrapper.full_called) {
             return Status.init(.NOT_FOUND_ERROR);
@@ -1023,7 +1025,7 @@ const CacheDBMIteratorImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn readKeys(self: *CacheDBMIteratorImpl) !Status {
+    fn readKeys(self: *CacheDBMIteratorImpl, io: std.Io) !Status {
         if (self.keys.items.len > 0) {
             return Status.init(.SUCCESS);
         }
@@ -1031,7 +1033,7 @@ const CacheDBMIteratorImpl = struct {
             return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
         }
         const dbm = self.dbm.?;
-        return try dbm.readNextBucketRecords(self);
+        return try dbm.readNextBucketRecords(io, self);
     }
 };
 
@@ -1052,7 +1054,7 @@ const CacheDBMImpl = struct {
     slots: [NUM_CACHE_SLOTS]CacheSlot,
     update_logger: ?*UpdateLogger,
     iterators: std.ArrayList(*CacheDBMIteratorImpl),
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock,
 
     fn init(
         file: File,
@@ -1087,7 +1089,7 @@ const CacheDBMImpl = struct {
                 .num_buckets = nb,
                 .num_records = 0,
                 .eff_data_size = 0,
-                .mutex = .{},
+                .mutex = .init,
             };
         }
 
@@ -1104,17 +1106,15 @@ const CacheDBMImpl = struct {
             .slots = slots_array,
             .update_logger = null,
             .iterators = .empty,
-            .mutex = .{},
+            .mutex = .init,
         };
 
         return self;
     }
 
-    fn deinit(self: *CacheDBMImpl) void {
+    fn deinit(self: *CacheDBMImpl, io: std.Io) void {
         if (self.open) {
-            // Use std.Io.failing for emergency-close on deinit: the caller should
-            // have closed the DB explicitly before calling deinit.
-            _ = self.closeImpl(std.Io.failing);
+            _ = self.closeImpl(io);
         }
         // Orphan iterators.
         for (self.iterators.items) |iter| {
@@ -1135,35 +1135,35 @@ const CacheDBMImpl = struct {
 
     fn openImpl(
         self: *CacheDBMImpl,
+        io: std.Io,
         path: []const u8,
         writable: bool,
         options: OpenOptions,
-        io: std.Io,
     ) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "already open");
         }
 
         const norm_path = file_mod.normalizePath(path);
-        const st_open = self.file.open(norm_path, writable, options);
+        const st_open = self.file.open(io, norm_path, writable, options);
         if (!st_open.isOk()) return st_open;
 
         if (self.file.getSizeSimple() < 1) {
             self.timestamp = std.Io.Clock.real.now(io);
         }
 
-        const st_import = self.importRecords();
+        const st_import = self.importRecords(io);
         if (!st_import.isOk()) {
-            _ = self.file.close();
+            _ = self.file.close(io);
             return st_import;
         }
 
         self.path.clearRetainingCapacity();
         self.path.appendSlice(self.allocator, norm_path) catch {
-            _ = self.file.close();
+            _ = self.file.close(io);
             return Status.init(.SYSTEM_ERROR);
         };
         self.open = true;
@@ -1173,8 +1173,8 @@ const CacheDBMImpl = struct {
     }
 
     fn closeImpl(self: *CacheDBMImpl, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
@@ -1185,7 +1185,7 @@ const CacheDBMImpl = struct {
             const export_st = self.exportRecords(io) catch Status.init(.SYSTEM_ERROR);
             status.mergeFrom(export_st);
         }
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         self.cleanUpAllSlots();
         self.cancelIterators();
         self.open = false;
@@ -1198,6 +1198,7 @@ const CacheDBMImpl = struct {
 
     fn processImpl(
         self: *CacheDBMImpl,
+        io: std.Io,
         key: []const u8,
         proc: anytype,
         writable: bool,
@@ -1210,25 +1211,27 @@ const CacheDBMImpl = struct {
         // OOM from reserializeRecord surfaces as error.OutOfMemory from the slot.
         // C++ equivalent: std::bad_alloc propagates uncaught through the entire call chain.
         // We absorb it into SYSTEM_ERROR to preserve the plain-Status API contract.
-        slot.process(key, record_hash, proc, writable, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+        slot.process(self.allocator, io, key, record_hash, proc, writable) catch return Status.init(.SYSTEM_ERROR);
         return Status.init(.SUCCESS);
     }
 
     fn process(
         self: *CacheDBMImpl,
+        io: std.Io,
         key: []const u8,
         proc: anytype,
         writable: bool,
     ) Status {
         // Outer DBM lock is shared: slot-level lock provides mutation safety.
         // C++ CacheDBMImpl::Process uses shared_lock even for writable=true.
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
-        return self.processImpl(key, proc, writable);
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
+        return self.processImpl(io, key, proc, writable);
     }
 
     fn processMulti(
         self: *CacheDBMImpl,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
@@ -1242,8 +1245,8 @@ const CacheDBMImpl = struct {
         var slot_map: std.AutoHashMapUnmanaged(*CacheSlot, void) = .{};
         defer slot_map.deinit(self.allocator);
 
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         for (keys) |key| {
             const hash_val = hash_util.primaryHash(key, std.math.maxInt(u64));
@@ -1274,14 +1277,14 @@ const CacheDBMImpl = struct {
 
         // Lock all unique slots in sorted order.
         for (unique_slots.items) |slot| {
-            slot.lock();
+            slot.lock(io);
         }
         defer {
             // Unlock in reverse order.
             var i = unique_slots.items.len;
             while (i > 0) {
                 i -= 1;
-                unique_slots.items[i].unlock();
+                unique_slots.items[i].unlock(io);
             }
         }
 
@@ -1292,7 +1295,7 @@ const CacheDBMImpl = struct {
             const slot_index = (hash_val & 0xff) % @as(u64, NUM_CACHE_SLOTS);
             const record_hash = hash_val >> 8;
             var slot: *CacheSlot = &self.slots[@intCast(slot_index)];
-            slot.processImpl(key, record_hash, proc, writable, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+            slot.processImpl(self.allocator, key, record_hash, proc, writable) catch return Status.init(.SYSTEM_ERROR);
         }
 
         return Status.init(.SUCCESS);
@@ -1300,17 +1303,18 @@ const CacheDBMImpl = struct {
 
     fn processFirst(
         self: *CacheDBMImpl,
+        io: std.Io,
         proc: anytype,
         writable: bool,
     ) Status {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         for (0..NUM_CACHE_SLOTS) |i| {
             var slot: *CacheSlot = &self.slots[i];
-            slot.lock();
-            const found = slot.processFirst(proc, writable, self.allocator);
-            slot.unlock();
+            slot.lock(io);
+            const found = slot.processFirst(self.allocator, proc, writable);
+            slot.unlock(io);
             if (found) return Status.init(.SUCCESS);
         }
         return Status.init(.NOT_FOUND_ERROR);
@@ -1318,27 +1322,28 @@ const CacheDBMImpl = struct {
 
     fn processEach(
         self: *CacheDBMImpl,
+        io: std.Io,
         proc: anytype,
         writable: bool,
     ) Status {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         _ = proc.processEmpty(""); // C++ ProcessEach sentinel: fired once before the slot loop
         for (0..NUM_CACHE_SLOTS) |i| {
             var slot: *CacheSlot = &self.slots[i];
-            slot.lock();
-            defer slot.unlock();
+            slot.lock(io);
+            defer slot.unlock(io);
 
-            slot.processEach(proc, writable, self.allocator) catch return Status.init(.SYSTEM_ERROR);
+            slot.processEach(self.allocator, proc, writable) catch return Status.init(.SYSTEM_ERROR);
         }
         _ = proc.processEmpty(""); // C++ ProcessEach sentinel: fired once after the slot loop
         return Status.init(.SUCCESS);
     }
 
-    fn count(self: *CacheDBMImpl) i64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    fn count(self: *CacheDBMImpl, io: std.Io) i64 {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
 
         var total: i64 = 0;
         for (0..NUM_CACHE_SLOTS) |i| {
@@ -1356,9 +1361,9 @@ const CacheDBMImpl = struct {
         return total;
     }
 
-    fn getEffectiveDataSize(self: *CacheDBMImpl) i64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn getEffectiveDataSize(self: *CacheDBMImpl, io: std.Io) i64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var total: i64 = 0;
         for (0..NUM_CACHE_SLOTS) |i| {
@@ -1367,9 +1372,9 @@ const CacheDBMImpl = struct {
         return total;
     }
 
-    fn getMemoryUsage(self: *CacheDBMImpl) i64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn getMemoryUsage(self: *CacheDBMImpl, io: std.Io) i64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var total: i64 = @intCast(@sizeOf(CacheDBMImpl));
         for (0..NUM_CACHE_SLOTS) |i| {
@@ -1382,21 +1387,21 @@ const CacheDBMImpl = struct {
         return self.path.items;
     }
 
-    fn getFileSize(self: *CacheDBMImpl) i64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    fn getFileSize(self: *CacheDBMImpl, io: std.Io) i64 {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         return self.file.getSizeSimple();
     }
 
-    fn getTimestamp(self: *CacheDBMImpl) f64 {
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+    fn getTimestamp(self: *CacheDBMImpl, io: std.Io) f64 {
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         return @as(f64, @floatFromInt(self.timestamp.nanoseconds)) / 1_000_000_000.0;
     }
 
-    fn clear(self: *CacheDBMImpl) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn clear(self: *CacheDBMImpl, io: std.Io) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.update_logger) |ul| {
             _ = ul.writeClear();
@@ -1404,9 +1409,9 @@ const CacheDBMImpl = struct {
 
         for (0..NUM_CACHE_SLOTS) |i| {
             self.slots[i].rebuild(
+                self.allocator,
                 @divTrunc(self.cap_rec_num, NUM_CACHE_SLOTS) + 1,
                 @divTrunc(self.cap_mem_size, NUM_CACHE_SLOTS),
-                self.allocator,
             );
         }
         self.cancelIterators();
@@ -1415,29 +1420,30 @@ const CacheDBMImpl = struct {
 
     fn rebuild(
         self: *CacheDBMImpl,
+        io: std.Io,
         cap_rec_num: i64,
         cap_mem_size: i64,
     ) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         self.cap_rec_num = cap_rec_num;
         self.cap_mem_size = cap_mem_size;
 
         for (0..NUM_CACHE_SLOTS) |i| {
             self.slots[i].rebuild(
+                self.allocator,
                 @divTrunc(cap_rec_num, NUM_CACHE_SLOTS) + 1,
                 @divTrunc(cap_mem_size, NUM_CACHE_SLOTS),
-                self.allocator,
             );
         }
         self.cancelIterators();
         return Status.init(.SUCCESS);
     }
 
-    fn synchronize(self: *CacheDBMImpl, hard: bool, io: std.Io) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn synchronize(self: *CacheDBMImpl, io: std.Io, hard: bool) Status {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (!self.open) {
             return Status.initMsg(.PRECONDITION_ERROR, "not opened");
@@ -1454,12 +1460,12 @@ const CacheDBMImpl = struct {
             status.mergeFrom(export_st);
         }
         if (hard) {
-            status.mergeFrom(self.file.synchronize(true));
+            status.mergeFrom(self.file.synchronize(io, true));
         }
         return status;
     }
 
-    fn importRecords(self: *CacheDBMImpl) Status {
+    fn importRecords(self: *CacheDBMImpl, io: std.Io) Status {
         var reader = FlatRecordReader.init(
             self.file,
             self.allocator,
@@ -1473,7 +1479,7 @@ const CacheDBMImpl = struct {
         while (true) {
             var str: []const u8 = undefined;
             var rec_type: RecordType = undefined;
-            const st = reader.read(&str, &rec_type);
+            const st = reader.read(io, &str, &rec_type);
             if (!st.isOk()) {
                 if (st.code == .NOT_FOUND_ERROR) break;
                 return st;
@@ -1503,7 +1509,7 @@ const CacheDBMImpl = struct {
 
             var val_str: []const u8 = undefined;
             var val_type: RecordType = undefined;
-            const st2 = reader.read(&val_str, &val_type);
+            const st2 = reader.read(io, &val_str, &val_type);
             if (!st2.isOk()) {
                 if (st2.code == .NOT_FOUND_ERROR) {
                     return Status.initMsg(.BROKEN_DATA_ERROR, "odd number of records");
@@ -1525,7 +1531,7 @@ const CacheDBMImpl = struct {
             // C++ CacheSlot::Process returns void and uses xmalloc (throws on OOM), so
             // per-record insertion failure is unobservable in C++. Zig surfaces it as
             // SYSTEM_ERROR; we propagate it rather than silently skipping records.
-            const import_st = self.processImpl(key_store.items, &setter, true);
+            const import_st = self.processImpl(io, key_store.items, &setter, true);
             if (!import_st.isOk()) return import_st;
         }
         return Status.init(.SUCCESS);
@@ -1534,7 +1540,7 @@ const CacheDBMImpl = struct {
     fn exportRecords(self: *CacheDBMImpl, io: std.Io) !Status {
         var status = Status.init(.SUCCESS);
 
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         if (!status.isOk()) return status;
 
         var export_path_buf: std.ArrayList(u8) = .empty;
@@ -1551,18 +1557,18 @@ const CacheDBMImpl = struct {
             .sync_hard = self.open_options.sync_hard,
         };
 
-        const st_open = self.file.open(export_path, true, export_options);
+        const st_open = self.file.open(io, export_path, true, export_options);
         if (!st_open.isOk()) {
             var reopen_opts = self.open_options;
             reopen_opts.truncate = false;
-            _ = self.file.open(self.path.items, true, reopen_opts);
+            _ = self.file.open(io, self.path.items, true, reopen_opts);
             return st_open;
         }
 
         var export_file_open = true;
         defer {
             if (export_file_open) {
-                _ = self.file.close();
+                _ = self.file.close(io);
             }
         }
 
@@ -1591,11 +1597,11 @@ const CacheDBMImpl = struct {
                 return Status.init(.SYSTEM_ERROR);
             defer self.allocator.free(serialized);
 
-            status.mergeFrom(flat_rec.write(serialized, .metadata));
+            status.mergeFrom(flat_rec.write(io, serialized, .metadata));
         }
 
         for (0..NUM_CACHE_SLOTS) |i| {
-            const slot_status = self.slots[i].exportRecords(&flat_rec) catch {
+            const slot_status = self.slots[i].exportRecords(io, &flat_rec) catch {
                 return Status.initMsg(.SYSTEM_ERROR, "export error");
             };
             status.mergeFrom(slot_status);
@@ -1603,18 +1609,19 @@ const CacheDBMImpl = struct {
         }
 
         export_file_open = false;
-        status.mergeFrom(self.file.close());
+        status.mergeFrom(self.file.close(io));
         status.mergeFrom(file_mod.renameFile(export_path, self.path.items));
         _ = file_mod.removeFile(export_path);
 
         var reopen_opts = self.open_options;
         reopen_opts.truncate = false;
-        status.mergeFrom(self.file.open(self.path.items, true, reopen_opts));
+        status.mergeFrom(self.file.open(io, self.path.items, true, reopen_opts));
         return status;
     }
 
     fn readNextBucketRecords(
         self: *CacheDBMImpl,
+        io: std.Io,
         iter: *CacheDBMIteratorImpl,
     ) !Status {
         iter.keys.clearRetainingCapacity();
@@ -1626,8 +1633,8 @@ const CacheDBMImpl = struct {
 
         for (@intCast(start_index)..NUM_CACHE_SLOTS) |i| {
             var slot: *CacheSlot = &self.slots[i];
-            slot.lock();
-            defer slot.unlock();
+            slot.lock(io);
+            defer slot.unlock(io);
 
             iter.slot_index.store(@intCast(i), .release);
             var keys = slot.getKeys(self.allocator) catch
@@ -1681,7 +1688,7 @@ const CacheDBMImpl = struct {
                 .num_buckets = nb,
                 .num_records = 0,
                 .eff_data_size = 0,
-                .mutex = .{},
+                .mutex = .init,
             };
         }
     }
@@ -1713,23 +1720,23 @@ pub const CacheDBM = struct {
         impl: *CacheDBMIteratorImpl,
         allocator: std.mem.Allocator,
 
-        pub fn deinit(self: *Cursor) void {
-            self.impl.deinit();
+        pub fn deinit(self: *Cursor, io: std.Io) void {
+            self.impl.deinit(io);
         }
 
-        pub fn first(self: *Cursor) Status {
-            return self.impl.first() catch Status.init(.SYSTEM_ERROR);
+        pub fn first(self: *Cursor, io: std.Io) Status {
+            return self.impl.first(io) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn jump(self: *Cursor, key: []const u8) Status {
-            return self.impl.jump(key) catch Status.init(.SYSTEM_ERROR);
+        pub fn jump(self: *Cursor, io: std.Io, key: []const u8) Status {
+            return self.impl.jump(io, key) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn next(self: *Cursor) Status {
-            return self.impl.next() catch Status.init(.SYSTEM_ERROR);
+        pub fn next(self: *Cursor, io: std.Io) Status {
+            return self.impl.next(io) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn get(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+        pub fn get(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
             if (self.impl.keys.items.len == 0) {
                 return Status.init(.NOT_FOUND_ERROR);
             }
@@ -1755,7 +1762,7 @@ pub const CacheDBM = struct {
                     }
                 };
                 var check_proc = CheckProc{ .status = &status };
-                _ = self.impl.process(&check_proc, false) catch return Status.init(.SYSTEM_ERROR);
+                _ = self.impl.process(io, &check_proc, false) catch return Status.init(.SYSTEM_ERROR);
                 return status;
             }
 
@@ -1787,15 +1794,15 @@ pub const CacheDBM = struct {
             };
 
             var get_proc = GetProc{ .key = key, .value = value, .status = &status, .allocator = self.allocator };
-            _ = self.impl.process(&get_proc, false) catch return Status.init(.SYSTEM_ERROR);
+            _ = self.impl.process(io, &get_proc, false) catch return Status.init(.SYSTEM_ERROR);
             return status;
         }
 
-        pub fn process(self: *Cursor, proc: anytype, writable: bool) Status {
-            return self.impl.process(proc, writable) catch Status.init(.SYSTEM_ERROR);
+        pub fn process(self: *Cursor, io: std.Io, proc: anytype, writable: bool) Status {
+            return self.impl.process(io, proc, writable) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn set(self: *Cursor, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn set(self: *Cursor, io: std.Io, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             const SetProc = struct {
                 value: []const u8,
                 old_key: ?*std.ArrayList(u8),
@@ -1816,12 +1823,12 @@ pub const CacheDBM = struct {
                 pub fn processEmpty(_: *@This(), _: []const u8) RecordAction { return .noop; }
             };
             var proc = SetProc{ .value = value, .old_key = old_key, .old_value = old_value, .allocator = self.allocator };
-            const st = self.process(&proc, true);
+            const st = self.process(io, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn remove(self: *Cursor, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn remove(self: *Cursor, io: std.Io, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             const RemoveProc = struct {
                 old_key: ?*std.ArrayList(u8),
                 old_value: ?*std.ArrayList(u8),
@@ -1841,32 +1848,35 @@ pub const CacheDBM = struct {
                 pub fn processEmpty(p: *@This(), _: []const u8) RecordAction { p.status = Status.init(.NOT_FOUND_ERROR); return .noop; }
             };
             var proc = RemoveProc{ .old_key = old_key, .old_value = old_value, .allocator = self.allocator };
-            const st = self.process(&proc, true);
+            const st = self.process(io, &proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn step(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            const st = self.get(key_out, value_out);
+        pub fn step(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            const st = self.get(io, key_out, value_out);
             if (!st.isOk()) return st;
-            _ = self.next();
+            _ = self.next(io);
             return Status.init(.SUCCESS);
         }
 
         /// Last is not supported on unordered hash tables.
-        pub fn last(self: *Cursor) Status {
+        pub fn last(self: *Cursor, io: std.Io) Status {
+            _ = io;
             _ = self;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
         /// Previous is not supported on unordered hash tables.
-        pub fn previous(self: *Cursor) Status {
+        pub fn previous(self: *Cursor, io: std.Io) Status {
+            _ = io;
             _ = self;
             return Status.init(.NOT_IMPLEMENTED_ERROR);
         }
 
         /// JumpLower is not supported on unordered hash tables.
-        pub fn jumpLower(self: *Cursor, key: []const u8, inclusive: bool) Status {
+        pub fn jumpLower(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            _ = io;
             _ = self;
             _ = key;
             _ = inclusive;
@@ -1874,7 +1884,8 @@ pub const CacheDBM = struct {
         }
 
         /// JumpUpper is not supported on unordered hash tables.
-        pub fn jumpUpper(self: *Cursor, key: []const u8, inclusive: bool) Status {
+        pub fn jumpUpper(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            _ = io;
             _ = self;
             _ = key;
             _ = inclusive;
@@ -1894,7 +1905,7 @@ pub const CacheDBM = struct {
         /// The returned slices point into internal buffers and are invalidated
         /// on the next call to next() or deinit(). Copy them if you need the
         /// data to outlive this call.
-        pub fn next(self: *Iterator) !?Entry {
+        pub fn next(self: *Iterator, io: std.Io) !?Entry {
             if (self.done) return null;
 
             // Fill internal buffers from the current cursor position.
@@ -1920,7 +1931,7 @@ pub const CacheDBM = struct {
                 .val_buf = &self.value_buf,
                 .alloc = self.alloc,
             };
-            if (self.cursor.process(&proc, false).isOk() and !proc.oom) filled = true;
+            if (self.cursor.process(io, &proc, false).isOk() and !proc.oom) filled = true;
             if (proc.oom) return error.OutOfMemory;
 
             if (!filled) {
@@ -1930,7 +1941,7 @@ pub const CacheDBM = struct {
 
             // Advance cursor. If it reaches the end, mark done so the next
             // call returns null rather than re-reading the last record.
-            if (!self.cursor.next().isOk()) self.done = true;
+            if (!self.cursor.next(io).isOk()) self.done = true;
 
             return Entry{
                 .key = self.key_buf.items,
@@ -1939,10 +1950,10 @@ pub const CacheDBM = struct {
         }
 
         /// Release internal buffers and the underlying cursor.
-        pub fn deinit(self: *Iterator) void {
+        pub fn deinit(self: *Iterator, io: std.Io) void {
             self.key_buf.deinit(self.alloc);
             self.value_buf.deinit(self.alloc);
-            self.cursor.deinit();
+            self.cursor.deinit(io);
         }
     };
 
@@ -1954,19 +1965,19 @@ pub const CacheDBM = struct {
         };
     }
 
-    pub fn deinit(self: *CacheDBM) void {
-        self.impl.deinit();
+    pub fn deinit(self: *CacheDBM, io: std.Io) void {
+        self.impl.deinit(io);
     }
 
-    pub fn open(self: *CacheDBM, path: []const u8, writable: bool, options: OpenOptions, io: std.Io) Status {
-        return self.impl.openImpl(path, writable, options, io);
+    pub fn open(self: *CacheDBM, io: std.Io, path: []const u8, writable: bool, options: OpenOptions) Status {
+        return self.impl.openImpl(io, path, writable, options);
     }
 
     pub fn close(self: *CacheDBM, io: std.Io) Status {
         return self.impl.closeImpl(io);
     }
 
-    pub fn get(self: *CacheDBM, key: []const u8, value: ?*std.ArrayList(u8)) Status {
+    pub fn get(self: *CacheDBM, io: std.Io, key: []const u8, value: ?*std.ArrayList(u8)) Status {
         var status = Status.init(.NOT_FOUND_ERROR);
         var proc = ProcessorGet{
             .status = &status,
@@ -1975,22 +1986,22 @@ pub const CacheDBM = struct {
         };
         // C++ CacheDBMImpl::Process uses shared_lock for the outer mutex even for reads.
         // Slot-level lock handles LRU promotion safely.
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         // writable=false: read path never allocates, so OOM is impossible here.
-        _ = self.impl.processImpl(key, &proc, false);
+        _ = self.impl.processImpl(io, key, &proc, false);
         return status;
     }
 
-    pub fn getSimple(self: *CacheDBM, key: []const u8, default_value: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    pub fn getSimple(self: *CacheDBM, allocator: std.mem.Allocator, io: std.Io, key: []const u8, default_value: []const u8) ![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        const st = self.get(key, &buf);
+        const st = self.get(io, key, &buf);
         if (st.isOk()) return try allocator.dupe(u8, buf.items);
         return try allocator.dupe(u8, default_value);
     }
 
-    pub fn set(self: *CacheDBM, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*std.ArrayList(u8)) Status {
+    pub fn set(self: *CacheDBM, io: std.Io, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*std.ArrayList(u8)) Status {
         var status = Status.init(.SUCCESS);
         var proc = ProcessorSet{
             .status = &status,
@@ -1999,20 +2010,20 @@ pub const CacheDBM = struct {
             .old_value = old_value,
             .allocator = self.allocator,
         };
-        const proc_st = self.impl.process(key, &proc, true);
+        const proc_st = self.impl.process(io, key, &proc, true);
         if (!proc_st.isOk()) return proc_st;
         return status;
     }
 
-    pub fn remove(self: *CacheDBM, key: []const u8) Status {
+    pub fn remove(self: *CacheDBM, io: std.Io, key: []const u8) Status {
         var status = Status.init(.NOT_FOUND_ERROR);
         var proc = ProcessorRemove{ .status = &status };
-        const proc_st = self.impl.process(key, &proc, true);
+        const proc_st = self.impl.process(io, key, &proc, true);
         if (!proc_st.isOk()) return proc_st;
         return status;
     }
 
-    pub fn append(self: *CacheDBM, key: []const u8, value: []const u8, delim: []const u8) Status {
+    pub fn append(self: *CacheDBM, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
         var status = Status.init(.SUCCESS);
         var concat_buf: std.ArrayList(u8) = .empty;
         defer concat_buf.deinit(self.allocator);
@@ -2057,18 +2068,18 @@ pub const CacheDBM = struct {
             .status = &status,
             .allocator = self.allocator,
         };
-        _ = self.impl.process(key, &proc, true);
+        _ = self.impl.process(io, key, &proc, true);
         return status;
     }
 
-    pub fn getMulti(self: *CacheDBM, keys: []const []const u8, records: *std.StringHashMap([]u8)) Status {
+    pub fn getMulti(self: *CacheDBM, io: std.Io, keys: []const []const u8, records: *std.StringHashMap([]u8)) Status {
         const map_alloc = records.allocator;
         var status = Status.init(.SUCCESS);
         var val_buf: std.ArrayList(u8) = .empty;
         defer val_buf.deinit(self.allocator);
         for (keys) |key| {
             val_buf.clearRetainingCapacity();
-            const st = self.get(key, &val_buf);
+            const st = self.get(io, key, &val_buf);
             if (st.isOk()) {
                 const duped_key = map_alloc.dupe(u8, key) catch {
                     status.mergeFrom(Status.init(.SYSTEM_ERROR));
@@ -2092,38 +2103,38 @@ pub const CacheDBM = struct {
         return status;
     }
 
-    pub fn setMulti(self: *CacheDBM, records: []const [2][]const u8, overwrite: bool) Status {
+    pub fn setMulti(self: *CacheDBM, io: std.Io, records: []const [2][]const u8, overwrite: bool) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.set(r[0], r[1], overwrite, null);
+            const st = self.set(io, r[0], r[1], overwrite, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .DUPLICATION_ERROR) break;
         }
         return status;
     }
 
-    pub fn removeMulti(self: *CacheDBM, keys: []const []const u8) Status {
+    pub fn removeMulti(self: *CacheDBM, io: std.Io, keys: []const []const u8) Status {
         var status = Status.init(.SUCCESS);
         for (keys) |key| {
-            const st = self.remove(key);
+            const st = self.remove(io, key);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .NOT_FOUND_ERROR) break;
         }
         return status;
     }
 
-    pub fn appendMulti(self: *CacheDBM, records: []const [2][]const u8, delim: []const u8) Status {
+    pub fn appendMulti(self: *CacheDBM, io: std.Io, records: []const [2][]const u8, delim: []const u8) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.append(r[0], r[1], delim);
+            const st = self.append(io, r[0], r[1], delim);
             status.mergeFrom(st);
             if (!status.isOk()) break;
         }
         return status;
     }
 
-    pub fn process(self: *CacheDBM, key: []const u8, proc: anytype, writable: bool) Status {
-        return self.impl.process(key, proc, writable);
+    pub fn process(self: *CacheDBM, io: std.Io, key: []const u8, proc: anytype, writable: bool) Status {
+        return self.impl.process(io, key, proc, writable);
     }
 
     pub fn getInternalFile(self: *CacheDBM) File {
@@ -2132,57 +2143,57 @@ pub const CacheDBM = struct {
 
     // C++ GetCount/GetEffectiveDataSize/GetMemoryUsage delegate to impl methods
     // that each acquire their own lock. The public wrappers are one-liners, matching C++.
-    fn countInternal(self: *CacheDBM) i64 {
-        return self.impl.count();
+    fn countInternal(self: *CacheDBM, io: std.Io) i64 {
+        return self.impl.count(io);
     }
 
-    pub fn getEffectiveDataSize(self: *CacheDBM) i64 {
-        return self.impl.getEffectiveDataSize();
+    pub fn getEffectiveDataSize(self: *CacheDBM, io: std.Io) i64 {
+        return self.impl.getEffectiveDataSize(io);
     }
 
-    pub fn getMemoryUsage(self: *CacheDBM) i64 {
-        return self.impl.getMemoryUsage();
+    pub fn getMemoryUsage(self: *CacheDBM, io: std.Io) i64 {
+        return self.impl.getMemoryUsage(io);
     }
 
-    fn getFilePathInternal(self: *CacheDBM) []const u8 {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    fn getFilePathInternal(self: *CacheDBM, io: std.Io) []const u8 {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         return self.impl.path.items;
     }
 
-    fn getFileSizeInternal(self: *CacheDBM) i64 {
-        return self.impl.getFileSize();
+    fn getFileSizeInternal(self: *CacheDBM, io: std.Io) i64 {
+        return self.impl.getFileSize(io);
     }
 
-    fn getTimestampInternal(self: *CacheDBM) f64 {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    fn getTimestampInternal(self: *CacheDBM, io: std.Io) f64 {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         if (!self.impl.open) return 0.0;
         return @as(f64, @floatFromInt(self.impl.timestamp.nanoseconds)) / 1_000_000_000.0;
     }
 
-    pub fn setUpdateLogger(self: *CacheDBM, logger: ?*UpdateLogger) void {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn setUpdateLogger(self: *CacheDBM, io: std.Io, logger: ?*UpdateLogger) void {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         self.impl.update_logger = logger;
     }
 
-    pub fn getUpdateLogger(self: *CacheDBM) ?*UpdateLogger {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn getUpdateLogger(self: *CacheDBM, io: std.Io) ?*UpdateLogger {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         return self.impl.update_logger;
     }
 
     // Shared lock matches C++ std::shared_lock access pattern for flag reads.
-    pub fn isOpen(self: *CacheDBM) bool {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn isOpen(self: *CacheDBM, io: std.Io) bool {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         return self.impl.open;
     }
 
-    pub fn isWritable(self: *CacheDBM) bool {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn isWritable(self: *CacheDBM, io: std.Io) bool {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         return self.impl.open and self.impl.writable;
     }
 
@@ -2200,26 +2211,26 @@ pub const CacheDBM = struct {
     }
 
     /// Fills `out` with the number of records. Returns PRECONDITION_ERROR if not open.
-    pub fn count(self: *CacheDBM, out: *i64) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
-        out.* = self.impl.count();
+    pub fn count(self: *CacheDBM, io: std.Io, out: *i64) Status {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
+        out.* = self.impl.count(io);
         return Status.init(.SUCCESS);
     }
 
     /// Fills `out` with the file size. Returns PRECONDITION_ERROR if not open.
-    pub fn getFileSize(self: *CacheDBM, out: *i64) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn getFileSize(self: *CacheDBM, io: std.Io, out: *i64) Status {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        out.* = self.impl.getFileSize();
+        out.* = self.impl.getFileSize(io);
         return Status.init(.SUCCESS);
     }
 
     /// Appends the file path to `out`. Returns PRECONDITION_ERROR if not open.
-    pub fn getFilePath(self: *CacheDBM, out: *std.ArrayList(u8)) Status {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn getFilePath(self: *CacheDBM, io: std.Io, out: *std.ArrayList(u8)) Status {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         out.clearRetainingCapacity();
         out.appendSlice(self.allocator, self.impl.path.items) catch return Status.init(.SYSTEM_ERROR);
@@ -2227,9 +2238,9 @@ pub const CacheDBM = struct {
     }
 
     /// Fills `out` with the modification timestamp. Returns PRECONDITION_ERROR if not open.
-    pub fn getTimestamp(self: *CacheDBM, out: *f64) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn getTimestamp(self: *CacheDBM, io: std.Io, out: *f64) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         if (!self.impl.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         out.* = @as(f64, @floatFromInt(self.impl.timestamp.nanoseconds)) / 1_000_000_000.0;
         return Status.init(.SUCCESS);
@@ -2242,9 +2253,9 @@ pub const CacheDBM = struct {
         return Status.init(.SUCCESS);
     }
 
-    pub fn inspect(self: *CacheDBM, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn inspect(self: *CacheDBM, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         var result: std.ArrayList([2][]u8) = .empty;
         try result.ensureTotalCapacity(allocator, 8);
@@ -2280,8 +2291,8 @@ pub const CacheDBM = struct {
         var total_mem_usage: i64 = 0;
 
         for (0..NUM_CACHE_SLOTS) |i| {
-            self.impl.slots[i].lock();
-            defer self.impl.slots[i].unlock();
+            self.impl.slots[i].lock(io);
+            defer self.impl.slots[i].unlock(io);
             total_records += self.impl.slots[i].num_records;
             total_eff_size += self.impl.slots[i].eff_data_size;
             total_mem_usage += self.impl.slots[i].getMemoryUsageImpl();
@@ -2310,40 +2321,41 @@ pub const CacheDBM = struct {
         return result;
     }
 
-    pub fn processFirst(self: *CacheDBM, proc: anytype, writable: bool) Status {
-        return self.impl.processFirst(proc, writable);
+    pub fn processFirst(self: *CacheDBM, io: std.Io, proc: anytype, writable: bool) Status {
+        return self.impl.processFirst(io, proc, writable);
     }
 
-    pub fn processEach(self: *CacheDBM, proc: anytype, writable: bool) Status {
-        return self.impl.processEach(proc, writable);
+    pub fn processEach(self: *CacheDBM, io: std.Io, proc: anytype, writable: bool) Status {
+        return self.impl.processEach(io, proc, writable);
     }
 
     pub fn processMulti(
         self: *CacheDBM,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
         writable: bool,
     ) Status {
-        return self.impl.processMulti(P, keys, procs, writable);
+        return self.impl.processMulti(io, P, keys, procs, writable);
     }
 
     // C++ CacheDBM::Synchronize is a one-line passthrough to impl_->Synchronize.
-    pub fn synchronize(self: *CacheDBM, hard: bool, io: std.Io) Status {
-        return self.impl.synchronize(hard, io);
+    pub fn synchronize(self: *CacheDBM, io: std.Io, hard: bool) Status {
+        return self.impl.synchronize(io, hard);
     }
 
-    pub fn clear(self: *CacheDBM) Status {
-        return self.impl.clear();
+    pub fn clear(self: *CacheDBM, io: std.Io) Status {
+        return self.impl.clear(io);
     }
 
-    pub fn rebuild(self: *CacheDBM) Status {
-        return self.rebuildAdvanced(-1, -1);
+    pub fn rebuild(self: *CacheDBM, io: std.Io) Status {
+        return self.rebuildAdvanced(io, -1, -1);
     }
 
-    pub fn rebuildAdvanced(self: *CacheDBM, cap_rec_num: i64, cap_mem_size: i64) Status {
-        self.impl.mutex.lock();
-        defer self.impl.mutex.unlock();
+    pub fn rebuildAdvanced(self: *CacheDBM, io: std.Io, cap_rec_num: i64, cap_mem_size: i64) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
 
         if (!self.impl.writable) {
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
@@ -2354,9 +2366,9 @@ pub const CacheDBM = struct {
 
         for (0..NUM_CACHE_SLOTS) |i| {
             self.impl.slots[i].rebuild(
+                self.allocator,
                 @divTrunc(cap_rec_num, NUM_CACHE_SLOTS) + 1,
                 @divTrunc(cap_mem_size, NUM_CACHE_SLOTS),
-                self.allocator,
             );
         }
 
@@ -2367,9 +2379,9 @@ pub const CacheDBM = struct {
 
     /// Return a Zig-style iterator positioned at the first record.
     /// The caller must call deinit() when done.
-    pub fn iterate(self: *CacheDBM, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterate(self: *CacheDBM, alloc: std.mem.Allocator, io: std.Io) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -2377,15 +2389,15 @@ pub const CacheDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
     /// Return a Zig-style iterator positioned at the first record >= key.
     /// The caller must call deinit() when done.
-    pub fn iterateFrom(self: *CacheDBM, key: []const u8, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *CacheDBM, alloc: std.mem.Allocator, io: std.Io, key: []const u8) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -2393,24 +2405,23 @@ pub const CacheDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump(io, key).isOk()) iter.done = true;
         return iter;
     }
 
-    pub fn makeCursor(self: *CacheDBM) !Cursor {
-        const iter_impl = try CacheDBMIteratorImpl.init(self.impl, self.allocator);
+    pub fn makeCursor(self: *CacheDBM, io: std.Io) !Cursor {
+        const iter_impl = try CacheDBMIteratorImpl.init(self.impl, io, self.allocator);
         return Cursor{
             .impl = iter_impl,
             .allocator = self.allocator,
         };
     }
 
-    /// Deprecated: use makeCursor instead.
-    pub const makeIterator = makeCursor;
 
     /// Atomically compare and conditionally exchange the value for a key.
     pub fn compareExchange(
         self: *CacheDBM,
+        io: std.Io,
         key: []const u8,
         expected: dbm_mod.CompareExpected,
         desired: dbm_mod.CompareDesired,
@@ -2419,8 +2430,8 @@ pub const CacheDBM = struct {
     ) Status {
         var status = Status.init(.SUCCESS);
         // Outer DBM lock is shared: slot-level lock provides mutation safety.
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         var proc = ProcessorCompareExchange{
             .status = &status,
             .expected = expected,
@@ -2429,7 +2440,7 @@ pub const CacheDBM = struct {
             .found_out = found_out,
             .allocator = self.allocator,
         };
-        const proc_st = self.impl.processImpl(key, &proc, true);
+        const proc_st = self.impl.processImpl(io, key, &proc, true);
         if (!proc_st.isOk()) return proc_st;
         return status;
     }
@@ -2437,6 +2448,7 @@ pub const CacheDBM = struct {
     /// Atomically increment a stored i64 value by delta, returning the new value.
     pub fn increment(
         self: *CacheDBM,
+        io: std.Io,
         key: []const u8,
         delta: i64,
         current_out: ?*i64,
@@ -2444,8 +2456,8 @@ pub const CacheDBM = struct {
     ) Status {
         var status = Status.init(.SUCCESS);
         // Outer DBM lock is shared: slot-level lock provides mutation safety.
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         var proc = ProcessorIncrement{
             .status = &status,
             .delta = delta,
@@ -2453,20 +2465,21 @@ pub const CacheDBM = struct {
             .initial = initial,
             .allocator = self.allocator,
         };
-        const proc_st = self.impl.processImpl(key, &proc, true);
+        const proc_st = self.impl.processImpl(io, key, &proc, true);
         if (!proc_st.isOk()) return proc_st;
         return status;
     }
 
-    pub fn incrementSimple(self: *CacheDBM, key: []const u8, delta: i64, initial: i64) i64 {
+    pub fn incrementSimple(self: *CacheDBM, io: std.Io, key: []const u8, delta: i64, initial: i64) i64 {
         var result: i64 = initial;
-        _ = self.increment(key, delta, &result, initial);
+        _ = self.increment(io, key, delta, &result, initial);
         return result;
     }
 
     /// Remove and return the first record in the database (arbitrary order on unordered DBMs).
     pub fn popFirst(
         self: *CacheDBM,
+        io: std.Io,
         key_out: ?*std.ArrayList(u8),
         value_out: ?*std.ArrayList(u8),
     ) Status {
@@ -2477,7 +2490,7 @@ pub const CacheDBM = struct {
             .value_out = value_out,
             .allocator = self.allocator,
         };
-        return self.processFirst(&proc, true);
+        return self.processFirst(io, &proc, true);
     }
 
     /// Push a value at the lexicographic end using a timestamp-based key.
@@ -2485,10 +2498,10 @@ pub const CacheDBM = struct {
     /// Key is returned in key_out if non-null.
     pub fn pushLast(
         self: *CacheDBM,
+        io: std.Io,
         value: []const u8,
         wtime: f64,
         key_out: ?*std.ArrayList(u8),
-        io: std.Io,
     ) Status {
         const base: u64 = time_util.pushLastKeyBase(wtime, io);
         var seq: u64 = 0;
@@ -2496,7 +2509,7 @@ pub const CacheDBM = struct {
             const ts: u64 = base +% seq;
             var key_buf: [8]u8 = undefined;
             const key = str_util.intToStrBigEndian(ts, 8, &key_buf);
-            const st = self.set(key, value, false, null);
+            const st = self.set(io, key, value, false, null);
             if (st.code != .DUPLICATION_ERROR) {
                 if (key_out) |ko| {
                     ko.clearRetainingCapacity();
@@ -2519,27 +2532,27 @@ pub const CacheDBM = struct {
         return dbm;
     }
 
-    /// Returns the record count or -1 when not open. Matches C++ DBM::CountSimple().
-    pub fn countSimple(self: *CacheDBM) i64 {
-        return self.countInternal();
+    /// Returns the record count. Matches C++ DBM::CountSimple().
+    pub fn countSimple(self: *CacheDBM, io: std.Io) i64 {
+        return self.countInternal(io);
     }
 
-    /// Returns the file size in bytes or -1 when not open. Matches C++ DBM::GetFileSizeSimple().
+    /// Returns the file size in bytes or -1 when not open. Lock-free approximate read.
     pub fn getFileSizeSimple(self: *CacheDBM) i64 {
         if (!self.impl.open) return -1;
-        return self.getFileSizeInternal();
+        return self.impl.file.getSizeSimple();
     }
 
-    /// Returns the file path or "" when not open. Matches C++ DBM::GetFilePathSimple().
+    /// Returns the file path or "" when not open.
     pub fn getFilePathSimple(self: *CacheDBM) []const u8 {
         if (!self.impl.open) return "";
-        return self.getFilePathInternal();
+        return self.impl.path.items;
     }
 
-    /// Returns the timestamp or NaN when not open. Matches C++ DBM::GetTimestampSimple().
+    /// Returns the timestamp or NaN when not open. Lock-free approximate read.
     pub fn getTimestampSimple(self: *CacheDBM) f64 {
         if (!self.impl.open) return std.math.nan(f64);
-        return self.getTimestampInternal();
+        return @as(f64, @floatFromInt(self.impl.timestamp.nanoseconds)) / 1_000_000_000.0;
     }
 
     /// Returns false. CacheDBM never needs rebuilding.
@@ -2549,13 +2562,13 @@ pub const CacheDBM = struct {
 
     /// Copies the backing file to dest_path.
     /// Returns NOT_IMPLEMENTED_ERROR when no backing file path is set.
-    pub fn copyFileData(self: *CacheDBM, dest_path: []const u8, sync_hard: bool, io: std.Io) Status {
-        if (!self.isOpen()) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
+    pub fn copyFileData(self: *CacheDBM, io: std.Io, dest_path: []const u8, sync_hard: bool) Status {
+        if (!self.isOpen(io)) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (sync_hard) {
-            const st = self.synchronize(true, io);
+            const st = self.synchronize(io, true);
             if (!st.isOk()) return st;
         }
-        const src_path = self.getFilePathInternal();
+        const src_path = self.getFilePathInternal(io);
         if (src_path.len == 0) return Status.initMsg(.NOT_IMPLEMENTED_ERROR, "no backing file");
         file_mod.copyFileAbsolute(src_path, dest_path) catch
             return Status.initMsg(.SYSTEM_ERROR, "copy file failed");
@@ -2563,30 +2576,30 @@ pub const CacheDBM = struct {
     }
 
     /// Renames a key. Reads old value, sets under new_key, removes old_key unless copying=true.
-    pub fn rekey(self: *CacheDBM, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
-        if (!self.isOpen() or !self.isWritable())
+    pub fn rekey(self: *CacheDBM, io: std.Io, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+        if (!self.isOpen(io) or !self.isWritable(io))
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(self.allocator);
 
-        const st_get = self.get(old_key, &value_list);
+        const st_get = self.get(io, old_key, &value_list);
         if (!st_get.isOk()) return st_get;
 
-        const st_set = self.set(new_key, value_list.items, overwrite, null);
+        const st_set = self.set(io, new_key, value_list.items, overwrite, null);
         if (!st_set.isOk()) return st_set;
 
         if (!copying) {
-            _ = self.remove(old_key);
+            _ = self.remove(io, old_key);
         }
         return Status.init(.SUCCESS);
     }
 
     /// Exports all records from this DBM to dest (any DBM with a set() method).
-    pub fn export_(self: *CacheDBM, dest: anytype) Status {
-        var iter = self.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        var st = iter.first();
+    pub fn export_(self: *CacheDBM, io: std.Io, dest: anytype) Status {
+        var iter = self.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        var st = iter.first(io);
         if (st.code == .NOT_FOUND_ERROR) return Status.init(.SUCCESS);
         if (!st.isOk()) return st;
         while (true) {
@@ -2594,11 +2607,11 @@ pub const CacheDBM = struct {
             defer key_list.deinit(self.allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get(io, &key_list, &val_list);
             if (!st_get.isOk()) break;
-            const st_set = dest.set(key_list.items, val_list.items, true, null);
+            const st_set = dest.set(io, key_list.items, val_list.items, true, null);
             if (!st_set.isOk()) return st_set;
-            st = iter.next();
+            st = iter.next(io);
             if (!st.isOk()) break;
         }
         return Status.init(.SUCCESS);
@@ -2607,13 +2620,14 @@ pub const CacheDBM = struct {
     /// Atomically checks multiple expected conditions then applies multiple desired changes.
     pub fn compareExchangeMulti(
         self: *CacheDBM,
+        io: std.Io,
         expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
         desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.allocator);
-            const get_st = self.get(cond.key, &val_list);
+            const get_st = self.get(io, cond.key, &val_list);
             switch (cond.value) {
                 .absent => {
                     if (get_st.isOk()) return Status.init(.DUPLICATION_ERROR);
@@ -2630,11 +2644,11 @@ pub const CacheDBM = struct {
         for (desired) |change| {
             switch (change.value) {
                 .remove => {
-                    const st = self.remove(change.key);
+                    const st = self.remove(io, change.key);
                     if (!st.isOk() and st.code != .NOT_FOUND_ERROR) return st;
                 },
                 .set => |new_val| {
-                    const st = self.set(change.key, new_val, true, null);
+                    const st = self.set(io, change.key, new_val, true, null);
                     if (!st.isOk()) return st;
                 },
                 .noop => {},
@@ -2651,15 +2665,15 @@ pub const CacheDBM = struct {
 test "CacheDBM.Cursor.last returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    _ = iter.first();
-    const status = iter.last();
+    _ = iter.first(std.testing.io);
+    const status = iter.last(std.testing.io);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(lib_common.Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -2667,15 +2681,15 @@ test "CacheDBM.Cursor.last returns NOT_IMPLEMENTED_ERROR" {
 test "CacheDBM.Cursor.previous returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    _ = iter.first();
-    const status = iter.previous();
+    _ = iter.first(std.testing.io);
+    const status = iter.previous(std.testing.io);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(lib_common.Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -2683,14 +2697,14 @@ test "CacheDBM.Cursor.previous returns NOT_IMPLEMENTED_ERROR" {
 test "CacheDBM.Cursor.jumpLower returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    const status = iter.jumpLower("key1", true);
+    const status = iter.jumpLower(std.testing.io, "key1", true);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(lib_common.Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -2698,14 +2712,14 @@ test "CacheDBM.Cursor.jumpLower returns NOT_IMPLEMENTED_ERROR" {
 test "CacheDBM.Cursor.jumpUpper returns NOT_IMPLEMENTED_ERROR" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
 
-    const status = iter.jumpUpper("key1", false);
+    const status = iter.jumpUpper(std.testing.io, "key1", false);
     try std.testing.expect(!status.isOk());
     try std.testing.expectEqual(lib_common.Code.NOT_IMPLEMENTED_ERROR, status.code);
 }
@@ -2713,14 +2727,14 @@ test "CacheDBM.Cursor.jumpUpper returns NOT_IMPLEMENTED_ERROR" {
 test "CacheDBM.append concatenation with delimiter" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "hello", true, null);
-    _ = db.append("key1", "world", " ");
+    _ = db.set(std.testing.io, "key1", "hello", true, null);
+    _ = db.append(std.testing.io, "key1", "world", " ");
 
     var result_buf: std.ArrayList(u8) = .empty;
     defer result_buf.deinit(alloc);
-    const get_st_1 = db.get("key1", &result_buf);
+    const get_st_1 = db.get(std.testing.io, "key1", &result_buf);
     try std.testing.expect(get_st_1.isOk());
 
     try std.testing.expectEqualStrings("hello world", result_buf.items);
@@ -2729,13 +2743,13 @@ test "CacheDBM.append concatenation with delimiter" {
 test "CacheDBM.append creates new record when missing" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.append("newkey", "value", "-");
+    _ = db.append(std.testing.io, "newkey", "value", "-");
 
     var result_buf: std.ArrayList(u8) = .empty;
     defer result_buf.deinit(alloc);
-    const get_st_2 = db.get("newkey", &result_buf);
+    const get_st_2 = db.get(std.testing.io, "newkey", &result_buf);
     try std.testing.expect(get_st_2.isOk());
 
     try std.testing.expectEqualStrings("value", result_buf.items);
@@ -2744,12 +2758,12 @@ test "CacheDBM.append creates new record when missing" {
 test "CacheDBM.inspect returns all 8 metadata keys" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 100, 100000, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("k1", "v1", true, null);
-    _ = db.set("k2", "v2", true, null);
+    _ = db.set(std.testing.io, "k1", "v1", true, null);
+    _ = db.set(std.testing.io, "k2", "v2", true, null);
 
-    var inspect_result = try db.inspect(alloc);
+    var inspect_result = try db.inspect(alloc, std.testing.io);
     defer {
         for (inspect_result.items) |pair| {
             alloc.free(pair[0]);
@@ -2805,11 +2819,11 @@ test "CacheDBM.inspect returns all 8 metadata keys" {
 test "CacheDBM.processMulti reads multiple keys" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // Set up test data
-    _ = db.set("key1", "value1", true, null);
-    _ = db.set("key2", "value2", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key2", "value2", true, null);
 
     // Read-only processor that counts calls
     var call_count: i32 = 0;
@@ -2834,7 +2848,7 @@ test "CacheDBM.processMulti reads multiple keys" {
     const keys = [_][]const u8{ "key1", "key2" };
     const procs = [_]*TestProcessor{ &proc1, &proc2 };
 
-    const status = db.processMulti(TestProcessor, &keys, &procs, false);
+    const status = db.processMulti(std.testing.io, TestProcessor, &keys, &procs, false);
     try std.testing.expect(status.isOk());
     try std.testing.expectEqual(@as(i32, 2), call_count);
 }
@@ -2842,13 +2856,13 @@ test "CacheDBM.processMulti reads multiple keys" {
 test "CacheDBM.processMulti with writable removes records" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // Set up test data
-    _ = db.set("key1", "value1", true, null);
-    _ = db.set("key2", "value2", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key2", "value2", true, null);
 
-    try std.testing.expectEqual(@as(i64, 2), db.countSimple());
+    try std.testing.expectEqual(@as(i64, 2), db.countSimple(std.testing.io));
 
     // Processor that removes records
     const TestProcessor = struct {
@@ -2871,11 +2885,11 @@ test "CacheDBM.processMulti with writable removes records" {
     const keys = [_][]const u8{ "key1", "key2" };
     const procs = [_]*TestProcessor{ &proc1, &proc2 };
 
-    const status = db.processMulti(TestProcessor, &keys, &procs, true);
+    const status = db.processMulti(std.testing.io, TestProcessor, &keys, &procs, true);
     try std.testing.expect(status.isOk());
 
     // Verify records were removed
-    try std.testing.expectEqual(@as(i64, 0), db.countSimple());
+    try std.testing.expectEqual(@as(i64, 0), db.countSimple(std.testing.io));
 }
 
 // Mock UpdateLogger for testing
@@ -2912,7 +2926,7 @@ fn mockSynchronize(ctx: *anyopaque, _hard: bool) Status {
 test "CacheDBM.updateLogger fires writeSet callback" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var mock_ctx: MockLoggerCtx = .{};
     var mock_logger: UpdateLogger = .{
@@ -2924,24 +2938,24 @@ test "CacheDBM.updateLogger fires writeSet callback" {
         },
     };
 
-    db.setUpdateLogger(&mock_logger);
+    db.setUpdateLogger(std.testing.io, &mock_logger);
 
     // Initial state: no calls
     try std.testing.expectEqual(@as(i32, 0), mock_ctx.writeSet_count);
 
     // Set a key - should fire writeSet
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
     try std.testing.expect(mock_ctx.writeSet_count > 0);
 
     const set_count = mock_ctx.writeSet_count;
-    _ = db.set("key1", "modified", true, null);
+    _ = db.set(std.testing.io, "key1", "modified", true, null);
     try std.testing.expect(mock_ctx.writeSet_count > set_count);
 }
 
 test "CacheDBM.updateLogger fires writeRemove callback" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var mock_ctx: MockLoggerCtx = .{};
     var mock_logger: UpdateLogger = .{
@@ -2953,20 +2967,20 @@ test "CacheDBM.updateLogger fires writeRemove callback" {
         },
     };
 
-    db.setUpdateLogger(&mock_logger);
+    db.setUpdateLogger(std.testing.io, &mock_logger);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
     try std.testing.expectEqual(@as(i32, 0), mock_ctx.writeRemove_count);
 
     // Remove the key - should fire writeRemove
-    _ = db.remove("key1");
+    _ = db.remove(std.testing.io, "key1");
     try std.testing.expect(mock_ctx.writeRemove_count > 0);
 }
 
 test "CacheDBM.updateLogger fires writeClear callback" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var mock_ctx: MockLoggerCtx = .{};
     var mock_logger: UpdateLogger = .{
@@ -2978,25 +2992,25 @@ test "CacheDBM.updateLogger fires writeClear callback" {
         },
     };
 
-    db.setUpdateLogger(&mock_logger);
+    db.setUpdateLogger(std.testing.io, &mock_logger);
 
     // Add some records
-    _ = db.set("key1", "value1", true, null);
-    _ = db.set("key2", "value2", true, null);
-    try std.testing.expectEqual(@as(i64, 2), db.countSimple());
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key2", "value2", true, null);
+    try std.testing.expectEqual(@as(i64, 2), db.countSimple(std.testing.io));
 
     const initial_clear_count = mock_ctx.writeClear_count;
 
     // Clear all records - should fire writeClear
-    _ = db.clear();
+    _ = db.clear(std.testing.io);
     try std.testing.expect(mock_ctx.writeClear_count > initial_clear_count);
-    try std.testing.expectEqual(@as(i64, 0), db.countSimple());
+    try std.testing.expectEqual(@as(i64, 0), db.countSimple(std.testing.io));
 }
 
 test "CacheDBM.updateLogger synchronize callback exists" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var mock_ctx: MockLoggerCtx = .{};
     var mock_logger: UpdateLogger = .{
@@ -3009,32 +3023,32 @@ test "CacheDBM.updateLogger synchronize callback exists" {
         },
     };
 
-    db.setUpdateLogger(&mock_logger);
+    db.setUpdateLogger(std.testing.io, &mock_logger);
 
-    _ = db.set("key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
 
     // Synchronize can be called; result depends on file implementation
     // NullFile returns NOT_IMPLEMENTED_ERROR, so we just verify it doesn't crash
-    const sync_status = db.synchronize(false, std.testing.io);
+    const sync_status = db.synchronize(std.testing.io, false);
     _ = sync_status;
 }
 
 test "CacheDBM.compareExchange: match and exchange" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "foo", true, null);
+    _ = db.set(std.testing.io, "key1", "foo", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key1", .{ .exact = "foo" }, .{ .set = "bar" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key1", .{ .exact = "foo" }, .{ .set = "bar" }, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "foo", actual.items);
 
     actual.clearRetainingCapacity();
-    const get_st_3 = db.get("key1", &actual);
+    const get_st_3 = db.get(std.testing.io, "key1", &actual);
     try std.testing.expect(get_st_3.isOk());
     try std.testing.expectEqualSlices(u8, "bar", actual.items);
 }
@@ -3042,13 +3056,13 @@ test "CacheDBM.compareExchange: match and exchange" {
 test "CacheDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key2", "old", true, null);
+    _ = db.set(std.testing.io, "key2", "old", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key2", .{ .exact = "wrong" }, .{ .set = "new" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key2", .{ .exact = "wrong" }, .{ .set = "new" }, &actual, &found);
     try std.testing.expect(st.code == .INFEASIBLE_ERROR);
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "old", actual.items);
@@ -3057,17 +3071,17 @@ test "CacheDBM.compareExchange: mismatch returns INFEASIBLE_ERROR" {
 test "CacheDBM.compareExchange: absent creates record" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("newkey", .absent, .{ .set = "value" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "newkey", .absent, .{ .set = "value" }, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(!found);
 
     actual.clearRetainingCapacity();
-    const get_st = db.get("newkey", &actual);
+    const get_st = db.get(std.testing.io, "newkey", &actual);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualSlices(u8, "value", actual.items);
 }
@@ -3075,36 +3089,36 @@ test "CacheDBM.compareExchange: absent creates record" {
 test "CacheDBM.compareExchange: absent noop on missing key" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("missing", .absent, .noop, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "missing", .absent, .noop, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(!found);
 
     actual.clearRetainingCapacity();
-    const get_st = db.get("missing", &actual);
+    const get_st = db.get(std.testing.io, "missing", &actual);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
 test "CacheDBM.compareExchange: any probe reads without writing" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "original", true, null);
+    _ = db.set(std.testing.io, "key", "original", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .any, .noop, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .any, .noop, &actual, &found);
     try std.testing.expect(st.isOk());
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "original", actual.items);
 
     actual.clearRetainingCapacity();
-    const get_st_4 = db.get("key", &actual);
+    const get_st_4 = db.get(std.testing.io, "key", &actual);
     try std.testing.expect(get_st_4.isOk());
     try std.testing.expectEqualSlices(u8, "original", actual.items);
 }
@@ -3112,30 +3126,30 @@ test "CacheDBM.compareExchange: any probe reads without writing" {
 test "CacheDBM.compareExchange: desired remove deletes record" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "foo", true, null);
+    _ = db.set(std.testing.io, "key", "foo", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .{ .exact = "foo" }, .remove, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .{ .exact = "foo" }, .remove, &actual, &found);
     try std.testing.expect(st.isOk());
 
     actual.clearRetainingCapacity();
-    const get_st = db.get("key", &actual);
+    const get_st = db.get(std.testing.io, "key", &actual);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
 test "CacheDBM.compareExchange: absent fails when key exists" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key", "exists", true, null);
+    _ = db.set(std.testing.io, "key", "exists", true, null);
     var actual: std.ArrayList(u8) = .empty;
     defer actual.deinit(alloc);
     var found: bool = undefined;
-    const st = db.compareExchange("key", .absent, .{ .set = "new" }, &actual, &found);
+    const st = db.compareExchange(std.testing.io, "key", .absent, .{ .set = "new" }, &actual, &found);
     try std.testing.expect(st.code == .INFEASIBLE_ERROR);
     try std.testing.expect(found);
     try std.testing.expectEqualSlices(u8, "exists", actual.items);
@@ -3144,16 +3158,16 @@ test "CacheDBM.compareExchange: absent fails when key exists" {
 test "CacheDBM.increment: fresh key uses initial+delta" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var current: i64 = undefined;
-    const st = db.increment("counter", 3, &current, 10);
+    const st = db.increment(std.testing.io, "counter", 3, &current, 10);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 13), current);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st_5 = db.get("counter", &val);
+    const get_st_5 = db.get(std.testing.io, "counter", &val);
     try std.testing.expect(get_st_5.isOk());
     try std.testing.expectEqual(@as(usize, 8), val.items.len);
     const stored = @as(i64, @bitCast(str_util.strToIntBigEndian(val.items)));
@@ -3163,14 +3177,14 @@ test "CacheDBM.increment: fresh key uses initial+delta" {
 test "CacheDBM.increment: existing key adds delta" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var buf: [8]u8 = undefined;
     const initial_bytes = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 10))), 8, &buf);
-    _ = db.set("num", initial_bytes, true, null);
+    _ = db.set(std.testing.io, "num", initial_bytes, true, null);
 
     var current: i64 = undefined;
-    const st = db.increment("num", 5, &current, 0);
+    const st = db.increment(std.testing.io, "num", 5, &current, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 15), current);
 }
@@ -3178,20 +3192,20 @@ test "CacheDBM.increment: existing key adds delta" {
 test "CacheDBM.increment: INT64MIN probe reads without writing" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var buf: [8]u8 = undefined;
     const initial_bytes = str_util.intToStrBigEndian(@as(u64, @bitCast(@as(i64, 7))), 8, &buf);
-    _ = db.set("num", initial_bytes, true, null);
+    _ = db.set(std.testing.io, "num", initial_bytes, true, null);
 
     var current: i64 = undefined;
-    const st = db.increment("num", lib_common.INT64MIN, &current, 0);
+    const st = db.increment(std.testing.io, "num", lib_common.INT64MIN, &current, 0);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 7), current);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    _ = db.get("num", &val);
+    _ = db.get(std.testing.io, "num", &val);
     const stored = @as(i64, @bitCast(str_util.strToIntBigEndian(val.items)));
     try std.testing.expectEqual(@as(i64, 7), stored);
 }
@@ -3199,71 +3213,71 @@ test "CacheDBM.increment: INT64MIN probe reads without writing" {
 test "CacheDBM.increment: INT64MIN probe on missing key returns initial" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var current: i64 = undefined;
-    const st = db.increment("missing", lib_common.INT64MIN, &current, 42);
+    const st = db.increment(std.testing.io, "missing", lib_common.INT64MIN, &current, 42);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqual(@as(i64, 42), current);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st = db.get("missing", &val);
+    const get_st = db.get(std.testing.io, "missing", &val);
     try std.testing.expect(get_st.code == .NOT_FOUND_ERROR);
 }
 
 test "CacheDBM.popFirst: returns and removes first record" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("key1", "value1", true, null);
-    _ = db.set("key2", "value2", true, null);
-    _ = db.set("key3", "value3", true, null);
-    try std.testing.expectEqual(@as(i64, 3), db.countSimple());
+    _ = db.set(std.testing.io, "key1", "value1", true, null);
+    _ = db.set(std.testing.io, "key2", "value2", true, null);
+    _ = db.set(std.testing.io, "key3", "value3", true, null);
+    try std.testing.expectEqual(@as(i64, 3), db.countSimple(std.testing.io));
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = db.popFirst(&key, &value);
+    const st = db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.isOk());
     try std.testing.expect(key.items.len > 0);
     try std.testing.expect(value.items.len > 0);
 
-    const count = db.countSimple();
+    const count = db.countSimple(std.testing.io);
     try std.testing.expectEqual(@as(i64, 2), count);
 }
 
 test "CacheDBM.popFirst: empty returns NOT_FOUND_ERROR" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
     var value: std.ArrayList(u8) = .empty;
     defer value.deinit(alloc);
 
-    const st = db.popFirst(&key, &value);
+    const st = db.popFirst(std.testing.io, &key, &value);
     try std.testing.expect(st.code == .NOT_FOUND_ERROR);
 }
 
 test "CacheDBM.pushLast: creates record with key_out" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
-    const st = db.pushLast("hello", 1.0, &key, std.testing.io);
+    const st = db.pushLast(std.testing.io, "hello", 1.0, &key);
     try std.testing.expect(st.isOk());
     try std.testing.expect(key.items.len > 0);
 
     var val: std.ArrayList(u8) = .empty;
     defer val.deinit(alloc);
-    const get_st = db.get(key.items, &val);
+    const get_st = db.get(std.testing.io, key.items, &val);
     try std.testing.expect(get_st.isOk());
     try std.testing.expectEqualSlices(u8, "hello", val.items);
 }
@@ -3271,15 +3285,15 @@ test "CacheDBM.pushLast: creates record with key_out" {
 test "CacheDBM.pushLast: two pushes at same wtime produce sequential keys" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     var key1: std.ArrayList(u8) = .empty;
     defer key1.deinit(alloc);
     var key2: std.ArrayList(u8) = .empty;
     defer key2.deinit(alloc);
 
-    _ = db.pushLast("a", 1.0, &key1, std.testing.io);
-    _ = db.pushLast("b", 1.0, &key2, std.testing.io);
+    _ = db.pushLast(std.testing.io, "a", 1.0, &key1);
+    _ = db.pushLast(std.testing.io, "b", 1.0, &key2);
 
     try std.testing.expectEqual(@as(usize, 8), key1.items.len);
     try std.testing.expectEqual(@as(usize, 8), key2.items.len);
@@ -3292,19 +3306,19 @@ test "CacheDBM.pushLast: two pushes at same wtime produce sequential keys" {
 test "CacheDBM.pushLast: pop-after-push round-trips value" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const original = "round-trip-value";
     var key: std.ArrayList(u8) = .empty;
     defer key.deinit(alloc);
-    _ = db.pushLast(original, 2.0, &key, std.testing.io);
+    _ = db.pushLast(std.testing.io, original, 2.0, &key);
 
     var popped_key: std.ArrayList(u8) = .empty;
     defer popped_key.deinit(alloc);
     var popped_val: std.ArrayList(u8) = .empty;
     defer popped_val.deinit(alloc);
 
-    const st = db.popFirst(&popped_key, &popped_val);
+    const st = db.popFirst(std.testing.io, &popped_key, &popped_val);
     try std.testing.expect(st.isOk());
     try std.testing.expectEqualSlices(u8, original, popped_val.items);
 }
@@ -3312,28 +3326,28 @@ test "CacheDBM.pushLast: pop-after-push round-trips value" {
 test "CacheDBM.get: null value buffer returns SUCCESS on found key" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("exists", "hello", true, null);
+    _ = db.set(std.testing.io, "exists", "hello", true, null);
 
     // null value = existence check only
-    const present = db.get("exists", null);
+    const present = db.get(std.testing.io, "exists", null);
     try std.testing.expect(present.isOk());
 
-    const absent = db.get("missing", null);
+    const absent = db.get(std.testing.io, "missing", null);
     try std.testing.expect(absent.code == .NOT_FOUND_ERROR);
 }
 
 test "CacheDBM.*Multi: bulk set/get/remove/append" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, -1, -1, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     // setMulti: insert 3 keys
     const pairs = [_][2][]const u8{
         .{ "key1", "val1" }, .{ "key2", "val2" }, .{ "key3", "val3" },
     };
-    try std.testing.expect(db.setMulti(&pairs, true).isOk());
+    try std.testing.expect(db.setMulti(std.testing.io, &pairs, true).isOk());
 
     // getMulti: 2 existing + 1 missing → NOT_FOUND_ERROR, 2 entries in map
     var records = std.StringHashMap([]u8).init(alloc);
@@ -3345,17 +3359,17 @@ test "CacheDBM.*Multi: bulk set/get/remove/append" {
         }
         records.deinit();
     }
-    const get_st = db.getMulti(&.{ "key1", "key2", "missing" }, &records);
+    const get_st = db.getMulti(std.testing.io, &.{ "key1", "key2", "missing" }, &records);
     try std.testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, get_st.code);
     try std.testing.expectEqual(@as(usize, 2), records.count());
 
     // removeMulti: remove 2 existing keys
-    try std.testing.expect(db.removeMulti(&.{ "key1", "key2" }).isOk());
+    try std.testing.expect(db.removeMulti(std.testing.io, &.{ "key1", "key2" }).isOk());
 
     // appendMulti: append to remaining key3
     const app = [_][2][]const u8{ .{ "key3", "_appended" } };
-    try std.testing.expect(db.appendMulti(&app, "").isOk());
-    const got = try db.getSimple("key3", "", alloc);
+    try std.testing.expect(db.appendMulti(std.testing.io, &app, "").isOk());
+    const got = try db.getSimple(alloc, std.testing.io, "key3", "");
     defer alloc.free(got);
     try std.testing.expectEqualStrings("val3_appended", got);
 }
@@ -3363,17 +3377,17 @@ test "CacheDBM.*Multi: bulk set/get/remove/append" {
 test "CacheDBM.Iterator: basic iteration" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
-    _ = db.set("c", "3", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
+    _ = db.set(std.testing.io, "c", "3", true, null);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
     
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         _ = entry.key;
         _ = entry.value;
         count += 1;
@@ -3384,15 +3398,15 @@ test "CacheDBM.Iterator: basic iteration" {
 test "CacheDBM.Iterator: lifetime contract" {
     const alloc = std.testing.allocator;
     var db = try CacheDBM.init(file_mod.NullFile, 1024, 1024 * 1024, alloc);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    _ = db.set("a", "1", true, null);
-    _ = db.set("b", "2", true, null);
+    _ = db.set(std.testing.io, "a", "1", true, null);
+    _ = db.set(std.testing.io, "b", "2", true, null);
 
-    var iter = try db.iterate(alloc);
-    defer iter.deinit();
+    var iter = try db.iterate(alloc, std.testing.io);
+    defer iter.deinit(std.testing.io);
     
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try std.testing.expect(first != null);
     
     // Copy before next() to demonstrate lifetime contract.
@@ -3400,7 +3414,7 @@ test "CacheDBM.Iterator: lifetime contract" {
     defer alloc.free(key_copy);
     
     // Second next() — first.?.key is now invalid.
-    _ = try iter.next();
+    _ = try iter.next(std.testing.io);
     // key_copy is still valid here.
     try std.testing.expect(key_copy.len > 0);
 }

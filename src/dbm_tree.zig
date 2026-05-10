@@ -16,7 +16,6 @@ const dbm_hash = @import("dbm_hash.zig");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayListUnmanaged;
 const AutoHashMap = std.AutoHashMapUnmanaged;
-const SpinSharedMutex = thread_util.SpinSharedMutex;
 const Status = lib_common.Status;
 const Code = lib_common.Code;
 const KeyComparator = lib_common.KeyComparator;
@@ -278,7 +277,7 @@ fn SimpleCache(comptime T: type) type {
             try self.lru.append(alloc, id);
         }
 
-        fn remove(self: *Self, id: i64, alloc: Allocator) ?*T {
+        fn remove(self: *Self, alloc: Allocator, id: i64) ?*T {
             const node = self.map.fetchRemove(id) orelse return null;
             for (self.lru.items, 0..) |lid, i| {
                 if (lid == id) {
@@ -324,7 +323,7 @@ const TreeLeafNode = struct {
     dirty: bool,
     on_disk: bool,
     ref_count: std.atomic.Value(i32),
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock = .init,
     allocator: Allocator,
 
     fn deinit(self: *TreeLeafNode) void {
@@ -362,12 +361,12 @@ const TreeInnerNode = struct {
 
 const LeafSlot = struct {
     cache: SimpleCache(TreeLeafNode),
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock = .init,
 };
 
 const InnerSlot = struct {
     cache: SimpleCache(TreeInnerNode),
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock = .init,
 };
 
 // ---------------------------------------------------------------------------
@@ -456,7 +455,7 @@ const TreeDBMImpl = struct {
     leaf_slots: [NUM_PAGE_SLOTS]LeafSlot,
     inner_slots: [NUM_PAGE_SLOTS]InnerSlot,
     proc_clock: std.atomic.Value(u32),
-    mutex: SpinSharedMutex,
+    mutex: std.Io.RwLock = .init,
 
     fn leafSlotIndex(id: i64) usize {
         return @intCast(@mod(id, NUM_PAGE_SLOTS));
@@ -495,7 +494,7 @@ const TreeDBMImpl = struct {
             .dirty = false,
             .on_disk = true,
             .ref_count = std.atomic.Value(i32).init(0),
-            .mutex = SpinSharedMutex{},
+            .mutex = .init,
             .allocator = self.allocator,
         };
         errdefer node.deinit();
@@ -665,11 +664,11 @@ const TreeDBMImpl = struct {
         const inner_per_slot = @max(@as(usize, 1), inner_cap / NUM_PAGE_SLOTS);
         for (&self.leaf_slots) |*slot| {
             slot.cache = SimpleCache(TreeLeafNode).init(leaf_per_slot);
-            slot.mutex = SpinSharedMutex{};
+            slot.mutex = .init;
         }
         for (&self.inner_slots) |*slot| {
             slot.cache = SimpleCache(TreeInnerNode).init(inner_per_slot);
-            slot.mutex = SpinSharedMutex{};
+            slot.mutex = .init;
         }
     }
 
@@ -684,7 +683,7 @@ const TreeDBMImpl = struct {
             .dirty = true,
             .on_disk = false,
             .ref_count = std.atomic.Value(i32).init(0),
-            .mutex = SpinSharedMutex{},
+            .mutex = .init,
             .allocator = self.allocator,
         };
         return node;
@@ -704,13 +703,13 @@ const TreeDBMImpl = struct {
         return node;
     }
 
-    fn loadLeafNode(self: *TreeDBMImpl, id: i64, promote: bool) !*TreeLeafNode {
+    fn loadLeafNode(self: *TreeDBMImpl, io: std.Io, id: i64, promote: bool) !*TreeLeafNode {
         const slot_idx = leafSlotIndex(id);
         const slot = &self.leaf_slots[slot_idx];
-        slot.mutex.lock();
+        slot.mutex.lockUncancelable(io);
         if (slot.cache.get(id, promote)) |node| {
             _ = node.ref_count.fetchAdd(1, .acq_rel);
-            slot.mutex.unlock();
+            slot.mutex.unlock(io);
             return node;
         }
         // Cache miss — load from HashDBM while holding the slot lock to avoid races.
@@ -718,46 +717,46 @@ const TreeDBMImpl = struct {
         writeFixNum(&id_buf, id, PAGE_ID_WIDTH);
         var loaded_data = ArrayList(u8).empty;
         defer loaded_data.deinit(self.allocator);
-        _ = self.hash_dbm.get(&id_buf, &loaded_data);
+        _ = self.hash_dbm.get( io,&id_buf, &loaded_data);
         var node: *TreeLeafNode = undefined;
         if (loaded_data.items.len > 0) {
             node = self.deserializeLeafNode(id, loaded_data.items) catch {
-                slot.mutex.unlock();
+                slot.mutex.unlock(io);
                 return error.OutOfMemory;
             };
         } else {
             node = self.newLeafNode(id) catch {
-                slot.mutex.unlock();
+                slot.mutex.unlock(io);
                 return error.OutOfMemory;
             };
         }
         _ = node.ref_count.fetchAdd(1, .acq_rel);
         slot.cache.add(id, node, self.allocator) catch {
             node.deinit();
-            slot.mutex.unlock();
+            slot.mutex.unlock(io);
             return error.OutOfMemory;
         };
-        slot.mutex.unlock();
+        slot.mutex.unlock(io);
         return node;
     }
 
-    fn releaseLeafNode(self: *TreeDBMImpl, id: i64) void {
+    fn releaseLeafNode(self: *TreeDBMImpl, io: std.Io, id: i64) void {
         const slot_idx = leafSlotIndex(id);
         const slot = &self.leaf_slots[slot_idx];
-        slot.mutex.lock();
-        defer slot.mutex.unlock();
+        slot.mutex.lockUncancelable(io);
+        defer slot.mutex.unlock(io);
         if (slot.cache.get(id, false)) |node| {
             _ = node.ref_count.fetchSub(1, .acq_rel);
         }
     }
 
-    fn saveLeafNodeImpl(self: *TreeDBMImpl, node: *TreeLeafNode) Status {
+    fn saveLeafNodeImpl(self: *TreeDBMImpl, io: std.Io, node: *TreeLeafNode) Status {
         var buf = ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         self.serializeLeafNode(node, &buf) catch return Status.init(.SYSTEM_ERROR);
         var id_buf: [PAGE_ID_WIDTH]u8 = undefined;
         writeFixNum(&id_buf, node.id, PAGE_ID_WIDTH);
-        const st = self.hash_dbm.set(&id_buf, buf.items, true, null);
+        const st = self.hash_dbm.set( io,&id_buf, buf.items, true, null);
         if (st.isOk()) {
             node.dirty = false;
             node.on_disk = true;
@@ -765,17 +764,17 @@ const TreeDBMImpl = struct {
         return st;
     }
 
-    fn removeLeafNode(self: *TreeDBMImpl, node: *TreeLeafNode) Status {
+    fn removeLeafNode(self: *TreeDBMImpl, io: std.Io, node: *TreeLeafNode) Status {
         const id = node.id;
         const slot_idx = leafSlotIndex(id);
         const slot = &self.leaf_slots[slot_idx];
-        slot.mutex.lock();
-        defer slot.mutex.unlock();
-        _ = slot.cache.remove(id, self.allocator);
+        slot.mutex.lockUncancelable(io);
+        defer slot.mutex.unlock(io);
+        _ = slot.cache.remove(self.allocator, id);
         if (node.on_disk) {
             var id_buf: [PAGE_ID_WIDTH]u8 = undefined;
             writeFixNum(&id_buf, id, PAGE_ID_WIDTH);
-            const st = self.hash_dbm.remove(&id_buf);
+            const st = self.hash_dbm.remove( io,&id_buf);
             node.deinit();
             return st;
         }
@@ -783,10 +782,10 @@ const TreeDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn flushLeafCacheOne(self: *TreeDBMImpl, empty: bool, slot_idx: usize) Status {
+    fn flushLeafCacheOne(self: *TreeDBMImpl, io: std.Io, empty: bool, slot_idx: usize) Status {
         const slot = &self.leaf_slots[slot_idx];
-        slot.mutex.lock();
-        defer slot.mutex.unlock();
+        slot.mutex.lockUncancelable(io);
+        defer slot.mutex.unlock(io);
         var st = Status.init(.SUCCESS);
         while (true) {
             if (!empty and !slot.cache.isSaturated()) break;
@@ -798,7 +797,7 @@ const TreeDBMImpl = struct {
                 break;
             }
             if (node.dirty) {
-                const save_st = self.saveLeafNodeImpl(node);
+                const save_st = self.saveLeafNodeImpl( io,node);
                 if (!save_st.isOk()) {
                     st = save_st;
                     slot.cache.add(node.id, node, self.allocator) catch {};
@@ -810,75 +809,75 @@ const TreeDBMImpl = struct {
         return st;
     }
 
-    fn flushLeafCacheAll(self: *TreeDBMImpl, empty: bool) Status {
+    fn flushLeafCacheAll(self: *TreeDBMImpl, io: std.Io, empty: bool) Status {
         var st = Status.init(.SUCCESS);
         for (0..NUM_PAGE_SLOTS) |i| {
-            st.mergeFrom(self.flushLeafCacheOne(empty, i));
+            st.mergeFrom(self.flushLeafCacheOne( io,empty, i));
         }
         return st;
     }
 
-    fn discardLeafCache(self: *TreeDBMImpl) void {
+    fn discardLeafCache(self: *TreeDBMImpl, io: std.Io) void {
         for (&self.leaf_slots) |*slot| {
-            slot.mutex.lock();
-            defer slot.mutex.unlock();
+            slot.mutex.lockUncancelable(io);
+            defer slot.mutex.unlock(io);
             while (slot.cache.removeLRU(self.allocator)) |node| node.deinit();
         }
     }
 
-    fn loadInnerNode(self: *TreeDBMImpl, id: i64, promote: bool) !*TreeInnerNode {
+    fn loadInnerNode(self: *TreeDBMImpl, io: std.Io, id: i64, promote: bool) !*TreeInnerNode {
         const slot_idx = innerSlotIndex(id);
         const slot = &self.inner_slots[slot_idx];
-        slot.mutex.lock();
+        slot.mutex.lockUncancelable(io);
         if (slot.cache.get(id, promote)) |node| {
             _ = node.ref_count.fetchAdd(1, .acq_rel);
-            slot.mutex.unlock();
+            slot.mutex.unlock(io);
             return node;
         }
         var id_buf: [PAGE_ID_WIDTH]u8 = undefined;
         writeFixNum(&id_buf, id, PAGE_ID_WIDTH);
         var loaded_data = ArrayList(u8).empty;
         defer loaded_data.deinit(self.allocator);
-        _ = self.hash_dbm.get(&id_buf, &loaded_data);
+        _ = self.hash_dbm.get( io,&id_buf, &loaded_data);
         var node: *TreeInnerNode = undefined;
         if (loaded_data.items.len > 0) {
             node = self.deserializeInnerNode(id, loaded_data.items) catch {
-                slot.mutex.unlock();
+                slot.mutex.unlock(io);
                 return error.OutOfMemory;
             };
         } else {
             node = self.newInnerNode(id) catch {
-                slot.mutex.unlock();
+                slot.mutex.unlock(io);
                 return error.OutOfMemory;
             };
         }
         _ = node.ref_count.fetchAdd(1, .acq_rel);
         slot.cache.add(id, node, self.allocator) catch {
             node.deinit();
-            slot.mutex.unlock();
+            slot.mutex.unlock(io);
             return error.OutOfMemory;
         };
-        slot.mutex.unlock();
+        slot.mutex.unlock(io);
         return node;
     }
 
-    fn releaseInnerNode(self: *TreeDBMImpl, id: i64) void {
+    fn releaseInnerNode(self: *TreeDBMImpl, io: std.Io, id: i64) void {
         const slot_idx = innerSlotIndex(id);
         const slot = &self.inner_slots[slot_idx];
-        slot.mutex.lock();
-        defer slot.mutex.unlock();
+        slot.mutex.lockUncancelable(io);
+        defer slot.mutex.unlock(io);
         if (slot.cache.get(id, false)) |node| {
             _ = node.ref_count.fetchSub(1, .acq_rel);
         }
     }
 
-    fn saveInnerNode(self: *TreeDBMImpl, node: *TreeInnerNode) Status {
+    fn saveInnerNode(self: *TreeDBMImpl, io: std.Io, node: *TreeInnerNode) Status {
         var buf = ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         self.serializeInnerNode(node, &buf) catch return Status.init(.SYSTEM_ERROR);
         var id_buf: [PAGE_ID_WIDTH]u8 = undefined;
         writeFixNum(&id_buf, node.id, PAGE_ID_WIDTH);
-        const st = self.hash_dbm.set(&id_buf, buf.items, true, null);
+        const st = self.hash_dbm.set( io,&id_buf, buf.items, true, null);
         if (st.isOk()) {
             node.dirty = false;
             node.on_disk = true;
@@ -886,17 +885,17 @@ const TreeDBMImpl = struct {
         return st;
     }
 
-    fn removeInnerNode(self: *TreeDBMImpl, node: *TreeInnerNode) Status {
+    fn removeInnerNode(self: *TreeDBMImpl, io: std.Io, node: *TreeInnerNode) Status {
         const id = node.id;
         const slot_idx = innerSlotIndex(id);
         const slot = &self.inner_slots[slot_idx];
-        slot.mutex.lock();
-        defer slot.mutex.unlock();
-        _ = slot.cache.remove(id, self.allocator);
+        slot.mutex.lockUncancelable(io);
+        defer slot.mutex.unlock(io);
+        _ = slot.cache.remove(self.allocator, id);
         if (node.on_disk) {
             var id_buf: [PAGE_ID_WIDTH]u8 = undefined;
             writeFixNum(&id_buf, id, PAGE_ID_WIDTH);
-            const st = self.hash_dbm.remove(&id_buf);
+            const st = self.hash_dbm.remove( io,&id_buf);
             node.deinit();
             return st;
         }
@@ -904,12 +903,12 @@ const TreeDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn flushInnerCacheAll(self: *TreeDBMImpl, empty: bool) Status {
+    fn flushInnerCacheAll(self: *TreeDBMImpl, io: std.Io, empty: bool) Status {
         var st = Status.init(.SUCCESS);
         for (&self.inner_slots, 0..) |_, i| {
             const slot = &self.inner_slots[i];
-            slot.mutex.lock();
-            defer slot.mutex.unlock();
+            slot.mutex.lockUncancelable(io);
+            defer slot.mutex.unlock(io);
             if (!empty and !slot.cache.isSaturated()) continue;
             while (true) {
                 if (slot.cache.count() == 0) break;
@@ -919,7 +918,7 @@ const TreeDBMImpl = struct {
                     break;
                 }
                 if (node.dirty) {
-                    const save_st = self.saveInnerNode(node);
+                    const save_st = self.saveInnerNode( io,node);
                     if (!save_st.isOk()) {
                         st = save_st;
                         slot.cache.add(node.id, node, self.allocator) catch {};
@@ -932,10 +931,10 @@ const TreeDBMImpl = struct {
         return st;
     }
 
-    fn discardInnerCache(self: *TreeDBMImpl) void {
+    fn discardInnerCache(self: *TreeDBMImpl, io: std.Io) void {
         for (&self.inner_slots) |*slot| {
-            slot.mutex.lock();
-            defer slot.mutex.unlock();
+            slot.mutex.lockUncancelable(io);
+            defer slot.mutex.unlock(io);
             while (slot.cache.removeLRU(self.allocator)) |node| node.deinit();
         }
     }
@@ -945,25 +944,26 @@ const TreeDBMImpl = struct {
     // -----------------------------------------------------------------------
 
     /// Walk inner nodes from root to leaf; returns a loaded+retained leaf node.
-    fn searchTree(self: *TreeDBMImpl, key: []const u8) !*TreeLeafNode {
+    fn searchTree(self: *TreeDBMImpl, io: std.Io, key: []const u8) !*TreeLeafNode {
         var node_id = self.root_id;
         while (node_id >= INNER_NODE_ID_BASE) {
-            const inner = try self.loadInnerNode(node_id, true);
+            const inner = try self.loadInnerNode( io,node_id, true);
             var child = inner.heir_id;
             for (inner.links.items) |lnk| {
                 if (self.key_comparator(key, lnk.key) == .lt) break;
                 child = lnk.child;
             }
             const next_id = child;
-            self.releaseInnerNode(node_id);
+            self.releaseInnerNode( io,node_id);
             node_id = next_id;
         }
-        return self.loadLeafNode(node_id, true);
+        return self.loadLeafNode( io,node_id, true);
     }
 
     /// Like searchTree but records each inner node ID into hist[].
     fn traceTree(
         self: *TreeDBMImpl,
+        io: std.Io,
         key: []const u8,
         leaf_id_out: *i64,
         hist: []i64,
@@ -976,14 +976,14 @@ const TreeDBMImpl = struct {
                 hist[depth] = node_id;
                 depth += 1;
             }
-            const inner = try self.loadInnerNode(node_id, true);
+            const inner = try self.loadInnerNode( io,node_id, true);
             var child = inner.heir_id;
             for (inner.links.items) |lnk| {
                 if (self.key_comparator(key, lnk.key) == .lt) break;
                 child = lnk.child;
             }
             const next_id = child;
-            self.releaseInnerNode(node_id);
+            self.releaseInnerNode( io,node_id);
             node_id = next_id;
         }
         leaf_id_out.* = node_id;
@@ -1102,7 +1102,7 @@ const TreeDBMImpl = struct {
     // Divide / merge
     // -----------------------------------------------------------------------
 
-    fn divideNodes(self: *TreeDBMImpl, leaf: *TreeLeafNode, node_key: []const u8) !Status {
+    fn divideNodes(self: *TreeDBMImpl, io: std.Io, leaf: *TreeLeafNode, node_key: []const u8) !Status {
         const mid = leaf.records.items.len / 2;
 
         // Allocate the sibling ID from the ever-increasing num_leaf_nodes counter
@@ -1140,10 +1140,10 @@ const TreeDBMImpl = struct {
         if (sibling.next_id == 0) {
             self.last_id = sibling_id;
         } else {
-            if (self.loadLeafNode(sibling.next_id, false)) |next_leaf| {
+            if (self.loadLeafNode( io,sibling.next_id, false)) |next_leaf| {
                 next_leaf.prev_id = sibling_id;
                 next_leaf.dirty = true;
-                self.releaseLeafNode(next_leaf.id);
+                self.releaseLeafNode( io,next_leaf.id);
             } else |_| {}
         }
 
@@ -1151,8 +1151,8 @@ const TreeDBMImpl = struct {
         {
             const slot_idx = leafSlotIndex(sibling_id);
             const slot = &self.leaf_slots[slot_idx];
-            slot.mutex.lock();
-            defer slot.mutex.unlock();
+            slot.mutex.lockUncancelable(io);
+            defer slot.mutex.unlock(io);
             slot.cache.add(sibling_id, sibling, self.allocator) catch return Status.init(.SYSTEM_ERROR);
         }
 
@@ -1160,7 +1160,7 @@ const TreeDBMImpl = struct {
         var hist: [TREE_LEVEL_MAX]i64 = undefined;
         var hist_len: usize = 0;
         var leaf_id_found: i64 = 0;
-        try self.traceTree(node_key, &leaf_id_found, &hist, &hist_len);
+        try self.traceTree( io,node_key, &leaf_id_found, &hist, &hist_len);
 
         var child_id = sibling_id;
         var heir_id = leaf.id; // left child when growing a new root; updated on inner overflow
@@ -1190,8 +1190,8 @@ const TreeDBMImpl = struct {
                 self.num_inner_nodes += 1;
                 const inner_slot_idx = innerSlotIndex(new_root_id);
                 const inner_slot = &self.inner_slots[inner_slot_idx];
-                inner_slot.mutex.lock();
-                defer inner_slot.mutex.unlock();
+                inner_slot.mutex.lockUncancelable(io);
+                defer inner_slot.mutex.unlock(io);
                 inner_slot.cache.add(new_root_id, new_root, self.allocator) catch {
                     new_root.deinit();
                     return Status.init(.SYSTEM_ERROR);
@@ -1200,10 +1200,10 @@ const TreeDBMImpl = struct {
             }
             level -= 1;
             const parent_id = hist[level];
-            const parent = try self.loadInnerNode(parent_id, false);
+            const parent = try self.loadInnerNode( io,parent_id, false);
             // addLinkToInnerNode dups the key; prop_key is still ours.
             try self.addLinkToInnerNode(parent, prop_key, child_id);
-            self.releaseInnerNode(parent_id);
+            self.releaseInnerNode( io,parent_id);
 
             if (parent.links.items.len <= @as(usize, @intCast(self.max_branches))) break;
 
@@ -1234,8 +1234,8 @@ const TreeDBMImpl = struct {
 
             const new_inner_slot_idx = innerSlotIndex(new_inner_id);
             const new_inner_slot = &self.inner_slots[new_inner_slot_idx];
-            new_inner_slot.mutex.lock();
-            defer new_inner_slot.mutex.unlock();
+            new_inner_slot.mutex.lockUncancelable(io);
+            defer new_inner_slot.mutex.unlock(io);
             new_inner_slot.cache.add(new_inner_id, new_inner, self.allocator) catch {
                 new_inner.deinit();
                 return Status.init(.SYSTEM_ERROR);
@@ -1256,34 +1256,34 @@ const TreeDBMImpl = struct {
         }
 
         if (self.page_update_mode == .write) {
-            var st = self.saveLeafNodeImpl(leaf);
-            st.mergeFrom(self.saveLeafNodeImpl(sibling));
+            var st = self.saveLeafNodeImpl( io,leaf);
+            st.mergeFrom(self.saveLeafNodeImpl( io,sibling));
             return st;
         }
         return Status.init(.SUCCESS);
     }
 
-    fn mergeNodes(self: *TreeDBMImpl, leaf: *TreeLeafNode, node_key: []const u8) !Status {
+    fn mergeNodes(self: *TreeDBMImpl, io: std.Io, leaf: *TreeLeafNode, node_key: []const u8) !Status {
         if (leaf.id == self.root_id) return Status.init(.SUCCESS);
 
         var hist: [TREE_LEVEL_MAX]i64 = undefined;
         var hist_len: usize = 0;
         var leaf_id_found: i64 = 0;
-        try self.traceTree(node_key, &leaf_id_found, &hist, &hist_len);
+        try self.traceTree( io,node_key, &leaf_id_found, &hist, &hist_len);
         if (hist_len == 0) return Status.init(.SUCCESS);
 
         const merge_with_prev = leaf.prev_id != 0 and leaf.id != self.first_id;
         const sibling_id = if (merge_with_prev) leaf.prev_id else leaf.next_id;
         if (sibling_id == 0) return Status.init(.SUCCESS);
 
-        const sibling = self.loadLeafNode(sibling_id, false) catch return Status.init(.SUCCESS);
+        const sibling = self.loadLeafNode( io,sibling_id, false) catch return Status.init(.SUCCESS);
 
         if (merge_with_prev) {
             // Append this leaf's records onto sibling (which precedes it).
             for (leaf.records.items) |rec| {
                 sibling.page_size += @intCast(rec.getSerializedSize());
                 sibling.records.append(self.allocator, rec) catch {
-                    self.releaseLeafNode(sibling_id);
+                    self.releaseLeafNode( io,sibling_id);
                     return Status.init(.SYSTEM_ERROR);
                 };
             }
@@ -1291,10 +1291,10 @@ const TreeDBMImpl = struct {
             sibling.next_id = leaf.next_id;
             sibling.dirty = true;
             if (leaf.next_id != 0) {
-                if (self.loadLeafNode(leaf.next_id, false)) |next_leaf| {
+                if (self.loadLeafNode( io,leaf.next_id, false)) |next_leaf| {
                     next_leaf.prev_id = sibling_id;
                     next_leaf.dirty = true;
-                    self.releaseLeafNode(next_leaf.id);
+                    self.releaseLeafNode( io,next_leaf.id);
                 } else |_| {}
             }
             if (self.last_id == leaf.id) self.last_id = sibling_id;
@@ -1303,12 +1303,12 @@ const TreeDBMImpl = struct {
             var combined = ArrayList(*TreeRecord).empty;
             combined.appendSlice(self.allocator, leaf.records.items) catch {
                 combined.deinit(self.allocator);
-                self.releaseLeafNode(sibling_id);
+                self.releaseLeafNode( io,sibling_id);
                 return Status.init(.SYSTEM_ERROR);
             };
             combined.appendSlice(self.allocator, sibling.records.items) catch {
                 combined.deinit(self.allocator);
-                self.releaseLeafNode(sibling_id);
+                self.releaseLeafNode( io,sibling_id);
                 return Status.init(.SYSTEM_ERROR);
             };
             // Sibling now owns all records; clear leaf.records without freeing them.
@@ -1321,16 +1321,16 @@ const TreeDBMImpl = struct {
             sibling.prev_id = leaf.prev_id;
             sibling.dirty = true;
             if (leaf.prev_id != 0) {
-                if (self.loadLeafNode(leaf.prev_id, false)) |prev_leaf| {
+                if (self.loadLeafNode( io,leaf.prev_id, false)) |prev_leaf| {
                     prev_leaf.next_id = sibling_id;
                     prev_leaf.dirty = true;
-                    self.releaseLeafNode(prev_leaf.id);
+                    self.releaseLeafNode( io,prev_leaf.id);
                 } else |_| {}
             }
             if (self.first_id == leaf.id) self.first_id = sibling_id;
         }
 
-        self.releaseLeafNode(sibling_id);
+        self.releaseLeafNode( io,sibling_id);
 
         // Redirect any iterators from the removed leaf.
         for (self.iterators.items) |it| {
@@ -1340,7 +1340,7 @@ const TreeDBMImpl = struct {
         // Save leaf.id before removeLeafNode — that call frees the leaf via
         // node.deinit(), so any subsequent access to leaf.id is use-after-free.
         const removed_leaf_id = leaf.id;
-        var st = self.removeLeafNode(leaf);
+        var st = self.removeLeafNode( io,leaf);
         // Do not decrement num_leaf_nodes — it is a monotonic counter used for
         // ID allocation, matching C++ behaviour (num_leaf_nodes_++ in constructor).
 
@@ -1349,19 +1349,19 @@ const TreeDBMImpl = struct {
         while (level > 0) {
             level -= 1;
             const parent_id = hist[level];
-            const parent = self.loadInnerNode(parent_id, false) catch break;
+            const parent = self.loadInnerNode( io,parent_id, false) catch break;
             if (merge_with_prev) {
                 self.joinPrevLinkInInnerNode(parent, removed_leaf_id);
             } else {
                 self.joinNextLinkInInnerNode(parent, removed_leaf_id, sibling_id);
             }
-            self.releaseInnerNode(parent_id);
+            self.releaseInnerNode( io,parent_id);
             if (parent.links.items.len >= @as(usize, @intCast(@divTrunc(self.max_branches, 2)))) break;
             if (level == 0 and parent.links.items.len == 0) {
                 // Collapse root.
                 self.root_id = parent.heir_id;
                 self.tree_level -= 1;
-                st.mergeFrom(self.removeInnerNode(parent));
+                st.mergeFrom(self.removeInnerNode( io,parent));
                 // Do not decrement num_inner_nodes — it is a monotonic ID counter.
                 break;
             }
@@ -1369,7 +1369,7 @@ const TreeDBMImpl = struct {
         return st;
     }
 
-    fn reorganizeTree(self: *TreeDBMImpl) Status {
+    fn reorganizeTree(self: *TreeDBMImpl, io: std.Io) Status {
         if (self.reorg_ids.count() == 0) return Status.init(.SUCCESS);
         var st = Status.init(.SUCCESS);
 
@@ -1393,15 +1393,15 @@ const TreeDBMImpl = struct {
         self.reorg_ids.clearRetainingCapacity();
 
         for (to_process.items) |*entry| {
-            const leaf = self.loadLeafNode(entry.id, false) catch continue;
+            const leaf = self.loadLeafNode( io,entry.id, false) catch continue;
             if (self.checkLeafNodeToDivide(leaf)) {
-                const div_st = self.divideNodes(leaf, entry.key.items) catch Status.init(.SYSTEM_ERROR);
+                const div_st = self.divideNodes( io,leaf, entry.key.items) catch Status.init(.SYSTEM_ERROR);
                 st.mergeFrom(div_st);
             } else if (self.checkLeafNodeToMerge(leaf)) {
-                const merge_st = self.mergeNodes(leaf, entry.key.items) catch Status.init(.SYSTEM_ERROR);
+                const merge_st = self.mergeNodes( io,leaf, entry.key.items) catch Status.init(.SYSTEM_ERROR);
                 st.mergeFrom(merge_st);
             }
-            self.releaseLeafNode(entry.id);
+            self.releaseLeafNode( io,entry.id);
         }
         return st;
     }
@@ -1477,38 +1477,38 @@ const TreeDBMImpl = struct {
     // processImpl
     // -----------------------------------------------------------------------
 
-    fn processImpl(self: *TreeDBMImpl, key: []const u8, proc: anytype, writable: bool) Status {
+    fn processImpl(self: *TreeDBMImpl, io: std.Io, key: []const u8, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (writable and !self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
         if (writable and self.reorg_ids.count() > 0) {
-            self.mutex.lock();
-            const reorg_st = self.reorganizeTree();
-            self.mutex.unlock();
+            self.mutex.lockUncancelable(io);
+            const reorg_st = self.reorganizeTree(io);
+            self.mutex.unlock(io);
             if (!reorg_st.isOk()) return reorg_st;
         }
-        self.mutex.lockShared();
-        const leaf = self.searchTree(key) catch {
-            self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        const leaf = self.searchTree( io,key) catch {
+            self.mutex.unlockShared(io);
             return Status.init(.SYSTEM_ERROR);
         };
-        if (writable) leaf.mutex.lock() else leaf.mutex.lockShared();
+        if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
         const st = self.processLeaf(leaf, key, proc, writable);
-        if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
-        self.releaseLeafNode(leaf.id);
-        self.mutex.unlockShared();
-        self.adjustCaches();
+        if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
+        self.releaseLeafNode( io,leaf.id);
+        self.mutex.unlockShared(io);
+        self.adjustCaches(io);
         return st;
     }
 
-    fn processFirstImpl(self: *TreeDBMImpl, proc: anytype, writable: bool) Status {
+    fn processFirstImpl(self: *TreeDBMImpl, io: std.Io, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         var node_id = self.first_id;
         while (node_id != 0) {
-            const leaf = self.loadLeafNode(node_id, true) catch return Status.init(.SYSTEM_ERROR);
+            const leaf = self.loadLeafNode( io,node_id, true) catch return Status.init(.SYSTEM_ERROR);
             if (leaf.records.items.len > 0) {
-                if (writable) leaf.mutex.lock() else leaf.mutex.lockShared();
+                if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
                 const rec = leaf.records.items[0];
                 const action = proc.processFull(rec.key, rec.value);
                 if (writable) {
@@ -1526,8 +1526,8 @@ const TreeDBMImpl = struct {
                             const old_sz: i32 = @intCast(rec.getSerializedSize());
                             const old_val_len: i64 = @intCast(rec.value.len);
                             rec.modifyValue(new_val, self.allocator) catch {
-                                if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
-                                self.releaseLeafNode(node_id);
+                                if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
+                                self.releaseLeafNode( io,node_id);
                                 return Status.init(.SYSTEM_ERROR);
                             };
                             leaf.page_size += @as(i32, @intCast(rec.getSerializedSize())) - old_sz;
@@ -1536,27 +1536,27 @@ const TreeDBMImpl = struct {
                         },
                     }
                 }
-                if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
-                self.releaseLeafNode(node_id);
+                if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
+                self.releaseLeafNode( io,node_id);
                 return Status.init(.SUCCESS);
             }
             const next = leaf.next_id;
-            self.releaseLeafNode(node_id);
+            self.releaseLeafNode( io,node_id);
             node_id = next;
         }
         return Status.init(.NOT_FOUND_ERROR);
     }
 
-    fn processEachImpl(self: *TreeDBMImpl, proc: anytype, writable: bool) Status {
+    fn processEachImpl(self: *TreeDBMImpl, io: std.Io, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        self.mutex.lockSharedUncancelable(io);
+        defer self.mutex.unlockShared(io);
         // Signal begin.
         _ = proc.processEmpty("");
         var node_id = self.first_id;
         while (node_id != 0) {
-            const leaf = self.loadLeafNode(node_id, false) catch return Status.init(.SYSTEM_ERROR);
-            if (writable) leaf.mutex.lock() else leaf.mutex.lockShared();
+            const leaf = self.loadLeafNode( io,node_id, false) catch return Status.init(.SYSTEM_ERROR);
+            if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
             var i: usize = 0;
             while (i < leaf.records.items.len) {
                 const rec = leaf.records.items[i];
@@ -1586,9 +1586,9 @@ const TreeDBMImpl = struct {
                     i += 1;
                 }
             }
-            if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
+            if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
             const next = leaf.next_id;
-            self.releaseLeafNode(node_id);
+            self.releaseLeafNode( io,node_id);
             node_id = next;
         }
         // Signal end.
@@ -1596,12 +1596,12 @@ const TreeDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    fn adjustCaches(self: *TreeDBMImpl) void {
+    fn adjustCaches(self: *TreeDBMImpl, io: std.Io) void {
         const clock = self.proc_clock.fetchAdd(1, .acq_rel);
         if (clock % ADJUST_CACHES_INV_FREQ != 0) return;
         for (0..NUM_PAGE_SLOTS) |i| {
             if (self.leaf_slots[i].cache.isSaturated()) {
-                _ = self.flushLeafCacheOne(false, i);
+                _ = self.flushLeafCacheOne( io,false, i);
                 break;
             }
         }
@@ -1611,19 +1611,19 @@ const TreeDBMImpl = struct {
     // clear / rebuild / synchronize
     // -----------------------------------------------------------------------
 
-    fn clearImpl(self: *TreeDBMImpl) Status {
+    fn clearImpl(self: *TreeDBMImpl, io: std.Io) Status {
         if (self.update_logger) |ul| {
             const log_st = ul.writeClear();
             if (!log_st.isOk()) return log_st;
         }
-        self.discardLeafCache();
-        self.discardInnerCache();
+        self.discardLeafCache(io);
+        self.discardInnerCache(io);
         {
             var it = self.reorg_ids.iterator();
             while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         }
         self.reorg_ids.clearRetainingCapacity();
-        const st = self.hash_dbm.clear();
+        const st = self.hash_dbm.clear(io);
         if (!st.isOk()) return st;
         self.num_records.store(0, .release);
         self.eff_data_size.store(0, .release);
@@ -1639,34 +1639,34 @@ const TreeDBMImpl = struct {
         const slot_idx = leafSlotIndex(root_id);
         {
             const slot = &self.leaf_slots[slot_idx];
-            slot.mutex.lock();
-            defer slot.mutex.unlock();
+            slot.mutex.lockUncancelable(io);
+            defer slot.mutex.unlock(io);
             slot.cache.add(root_id, root_leaf, self.allocator) catch return Status.init(.SYSTEM_ERROR);
         }
         return self.saveMetadata();
     }
 
     fn rebuildImpl(self: *TreeDBMImpl, io: std.Io) Status {
-        var st = self.flushLeafCacheAll(true);
-        st.mergeFrom(self.flushInnerCacheAll(true));
+        var st = self.flushLeafCacheAll( io,true);
+        st.mergeFrom(self.flushInnerCacheAll( io,true));
         st.mergeFrom(self.saveMetadata());
         st.mergeFrom(self.hash_dbm.rebuild(io));
         return st;
     }
 
-    fn synchronizeImpl(self: *TreeDBMImpl, hard: bool, io: std.Io) Status {
-        var st = self.flushLeafCacheAll(false);
-        st.mergeFrom(self.flushInnerCacheAll(false));
-        self.mutex.lock();
+    fn synchronizeImpl(self: *TreeDBMImpl, io: std.Io, hard: bool) Status {
+        var st = self.flushLeafCacheAll( io,false);
+        st.mergeFrom(self.flushInnerCacheAll( io,false));
+        self.mutex.lockUncancelable(io);
         if (self.update_logger) |ul| {
             st.mergeFrom(ul.synchronize(hard));
         }
-        st.mergeFrom(self.reorganizeTree());
-        self.mutex.unlock();
-        st.mergeFrom(self.flushLeafCacheAll(false));
-        st.mergeFrom(self.flushInnerCacheAll(false));
+        st.mergeFrom(self.reorganizeTree(io));
+        self.mutex.unlock(io);
+        st.mergeFrom(self.flushLeafCacheAll( io,false));
+        st.mergeFrom(self.flushInnerCacheAll( io,false));
         st.mergeFrom(self.saveMetadata());
-        st.mergeFrom(self.hash_dbm.synchronize(hard, io));
+        st.mergeFrom(self.hash_dbm.synchronize( io,hard));
         return st;
     }
 
@@ -1674,7 +1674,7 @@ const TreeDBMImpl = struct {
     // open / close
     // -----------------------------------------------------------------------
 
-    fn openImpl(self: *TreeDBMImpl, path: []const u8, writable: bool, opts: OpenOptions, params: TuningParameters, io: std.Io) Status {
+    fn openImpl(self: *TreeDBMImpl, io: std.Io, path: []const u8, writable: bool, opts: OpenOptions, params: TuningParameters) Status {
         const hash_params = HashDBM.TuningParameters{
             .update_mode = params.update_mode,
             .record_crc_mode = params.record_crc_mode,
@@ -1688,7 +1688,7 @@ const TreeDBMImpl = struct {
             .cache_buckets = params.cache_buckets,
             .cipher_key = params.cipher_key,
         };
-        const hash_st = self.hash_dbm.openAdvanced(path, writable, opts, hash_params, io);
+        const hash_st = self.hash_dbm.openAdvanced( io,path, writable, opts, hash_params);
         if (!hash_st.isOk()) return hash_st;
         self.writable = writable;
         self.path.clearRetainingCapacity();
@@ -1711,8 +1711,8 @@ const TreeDBMImpl = struct {
             self.num_leaf_nodes = 1;
             const slot_idx = leafSlotIndex(root_id);
             const slot = &self.leaf_slots[slot_idx];
-            slot.mutex.lock();
-            defer slot.mutex.unlock();
+            slot.mutex.lockUncancelable(io);
+            defer slot.mutex.unlock(io);
             slot.cache.add(root_id, root_leaf, self.allocator) catch return Status.init(.SYSTEM_ERROR);
             if (writable) return self.saveMetadata();
             return Status.init(.SUCCESS);
@@ -1725,27 +1725,27 @@ const TreeDBMImpl = struct {
         self.iterators.clearRetainingCapacity();
         var st = Status.init(.SUCCESS);
         if (self.writable) {
-            self.mutex.lock();
-            st.mergeFrom(self.reorganizeTree());
-            self.mutex.unlock();
-            st.mergeFrom(self.flushLeafCacheAll(true));
-            st.mergeFrom(self.flushInnerCacheAll(true));
+            self.mutex.lockUncancelable(io);
+            st.mergeFrom(self.reorganizeTree(io));
+            self.mutex.unlock(io);
+            st.mergeFrom(self.flushLeafCacheAll( io,true));
+            st.mergeFrom(self.flushInnerCacheAll( io,true));
             st.mergeFrom(self.saveMetadata());
         } else {
-            self.discardLeafCache();
-            self.discardInnerCache();
+            self.discardLeafCache(io);
+            self.discardInnerCache(io);
         }
         st.mergeFrom(self.hash_dbm.close(io));
         self.open = false;
         return st;
     }
 
-    fn deinit(self: *TreeDBMImpl) void {
-        if (self.open) _ = self.closeImpl(std.Io.failing);
+    fn deinit(self: *TreeDBMImpl, io: std.Io) void {
+        if (self.open) _ = self.closeImpl(io);
         for (self.iterators.items) |it| it.deinit();
         self.iterators.deinit(self.allocator);
-        self.discardLeafCache();
-        self.discardInnerCache();
+        self.discardLeafCache(io);
+        self.discardInnerCache(io);
         for (&self.leaf_slots) |*slot| slot.cache.deinit(self.allocator);
         for (&self.inner_slots) |*slot| slot.cache.deinit(self.allocator);
         {
@@ -1755,7 +1755,7 @@ const TreeDBMImpl = struct {
         self.reorg_ids.deinit(self.allocator);
         self.mini_opaque.deinit(self.allocator);
         self.path.deinit(self.allocator);
-        self.hash_dbm.deinit();
+        self.hash_dbm.deinit(io);
         self.allocator.destroy(self.hash_dbm);
         self.allocator.destroy(self);
     }
@@ -1770,13 +1770,13 @@ const IteratorStatus = enum { ok, not_found };
 /// Helpers on the impl struct that need TreeDBMImpl to be fully defined.
 /// (The struct declaration and basic helpers are earlier in the file.)
 
-fn iterSetPositionFirst(it: *TreeDBMIteratorImpl) !Status {
+fn iterSetPositionFirst( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     var node_id = impl.first_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         if (leaf.records.items.len > 0) {
             try it.setPosition(cur_id, leaf.records.items[0].key);
             return Status.init(.SUCCESS);
@@ -1787,13 +1787,13 @@ fn iterSetPositionFirst(it: *TreeDBMIteratorImpl) !Status {
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterSetPositionLast(it: *TreeDBMIteratorImpl) !Status {
+fn iterSetPositionLast( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     var node_id = impl.last_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         if (leaf.records.items.len > 0) {
             const last_rec = leaf.records.items[leaf.records.items.len - 1];
             try it.setPosition(cur_id, last_rec.key);
@@ -1805,14 +1805,14 @@ fn iterSetPositionLast(it: *TreeDBMIteratorImpl) !Status {
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterNext(it: *TreeDBMIteratorImpl) !Status {
+fn iterNext( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
     var node_id = it.leaf_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
         // If we found the current key, advance past it.
         const start = if (idx < leaf.records.items.len and
@@ -1830,14 +1830,14 @@ fn iterNext(it: *TreeDBMIteratorImpl) !Status {
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterPrevious(it: *TreeDBMIteratorImpl) !Status {
+fn iterPrevious( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
     var node_id = it.leaf_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
         if (idx > 0) {
             try it.setPosition(cur_id, leaf.records.items[idx - 1].key);
@@ -1849,10 +1849,10 @@ fn iterPrevious(it: *TreeDBMIteratorImpl) !Status {
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterJump(it: *TreeDBMIteratorImpl, key: []const u8) !Status {
+fn iterJump( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-    const leaf = impl.searchTree(key) catch return Status.init(.SYSTEM_ERROR);
-    defer impl.releaseLeafNode(leaf.id);
+    const leaf = impl.searchTree( io,key) catch return Status.init(.SYSTEM_ERROR);
+    defer impl.releaseLeafNode( io,leaf.id);
     const idx = impl.lowerBoundRecords(leaf.records.items, key);
     if (idx < leaf.records.items.len) {
         try it.setPosition(leaf.id, leaf.records.items[idx].key);
@@ -1862,8 +1862,8 @@ fn iterJump(it: *TreeDBMIteratorImpl, key: []const u8) !Status {
     var node_id = leaf.next_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const next_leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const next_leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         if (next_leaf.records.items.len > 0) {
             try it.setPosition(cur_id, next_leaf.records.items[0].key);
             return Status.init(.SUCCESS);
@@ -1874,10 +1874,10 @@ fn iterJump(it: *TreeDBMIteratorImpl, key: []const u8) !Status {
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterJumpLower(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !Status {
+fn iterJumpLower( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-    const leaf = impl.searchTree(key) catch return Status.init(.SYSTEM_ERROR);
-    defer impl.releaseLeafNode(leaf.id);
+    const leaf = impl.searchTree( io,key) catch return Status.init(.SYSTEM_ERROR);
+    defer impl.releaseLeafNode( io,leaf.id);
     const idx = impl.lowerBoundRecords(leaf.records.items, key);
     // Find the last record that is strictly less than (or equal to, if inclusive) key.
     var found_idx: ?usize = null;
@@ -1902,8 +1902,8 @@ fn iterJumpLower(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !St
     var node_id = leaf.prev_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const prev_leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const prev_leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         if (prev_leaf.records.items.len > 0) {
             const last_rec = prev_leaf.records.items[prev_leaf.records.items.len - 1];
             try it.setPosition(cur_id, last_rec.key);
@@ -1915,10 +1915,10 @@ fn iterJumpLower(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !St
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterJumpUpper(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !Status {
+fn iterJumpUpper( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-    const leaf = impl.searchTree(key) catch return Status.init(.SYSTEM_ERROR);
-    defer impl.releaseLeafNode(leaf.id);
+    const leaf = impl.searchTree( io,key) catch return Status.init(.SYSTEM_ERROR);
+    defer impl.releaseLeafNode( io,leaf.id);
     const idx = impl.lowerBoundRecords(leaf.records.items, key);
     var start: usize = idx;
     if (!inclusive and idx < leaf.records.items.len and
@@ -1933,8 +1933,8 @@ fn iterJumpUpper(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !St
     var node_id = leaf.next_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const next_leaf = impl.loadLeafNode(cur_id, true) catch return Status.init(.SYSTEM_ERROR);
-        defer impl.releaseLeafNode(cur_id);
+        const next_leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        defer impl.releaseLeafNode( io,cur_id);
         if (next_leaf.records.items.len > 0) {
             try it.setPosition(cur_id, next_leaf.records.items[0].key);
             return Status.init(.SUCCESS);
@@ -1945,13 +1945,13 @@ fn iterJumpUpper(it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !St
     return Status.init(.NOT_FOUND_ERROR);
 }
 
-fn iterGetCurrent(it: *TreeDBMIteratorImpl, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+fn iterGetCurrent( io: std.Io,it: *TreeDBMIteratorImpl, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
-    const leaf = impl.loadLeafNode(it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
-    defer impl.releaseLeafNode(it.leaf_id);
-    leaf.mutex.lockShared();
-    defer leaf.mutex.unlockShared();
+    const leaf = impl.loadLeafNode( io,it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
+    defer impl.releaseLeafNode( io,it.leaf_id);
+    leaf.mutex.lockSharedUncancelable(io);
+    defer leaf.mutex.unlockShared(io);
     const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
     if (idx >= leaf.records.items.len or
         impl.key_comparator(leaf.records.items[idx].key, cur_key) != .eq)
@@ -1971,13 +1971,13 @@ fn iterGetCurrent(it: *TreeDBMIteratorImpl, key_out: ?*std.ArrayList(u8), value_
     return Status.init(.SUCCESS);
 }
 
-fn iterProcess(it: *TreeDBMIteratorImpl, proc: anytype, writable: bool) Status {
+fn iterProcess( io: std.Io,it: *TreeDBMIteratorImpl, proc: anytype, writable: bool) Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
-    const leaf = impl.loadLeafNode(it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
-    defer impl.releaseLeafNode(it.leaf_id);
-    if (writable) leaf.mutex.lock() else leaf.mutex.lockShared();
-    defer if (writable) leaf.mutex.unlock() else leaf.mutex.unlockShared();
+    const leaf = impl.loadLeafNode( io,it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
+    defer impl.releaseLeafNode( io,it.leaf_id);
+    if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
+    defer if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
     return impl.processLeaf(leaf, cur_key, proc, writable);
 }
 
@@ -2027,30 +2027,30 @@ pub const TreeDBM = struct {
             .leaf_slots = undefined,
             .inner_slots = undefined,
             .proc_clock = std.atomic.Value(u32).init(0),
-            .mutex = SpinSharedMutex{},
+            .mutex = .init,
         };
         // Zero-init slots.
         for (&impl.leaf_slots) |*slot| {
             slot.cache = SimpleCache(TreeLeafNode).init(1);
-            slot.mutex = SpinSharedMutex{};
+            slot.mutex = .init;
         }
         for (&impl.inner_slots) |*slot| {
             slot.cache = SimpleCache(TreeInnerNode).init(1);
-            slot.mutex = SpinSharedMutex{};
+            slot.mutex = .init;
         }
         return .{ .impl = impl };
     }
 
-    pub fn deinit(self: *TreeDBM) void {
-        self.impl.deinit();
+    pub fn deinit(self: *TreeDBM, io: std.Io) void {
+        self.impl.deinit(io);
     }
 
-    pub fn open(self: *TreeDBM, path: []const u8, writable: bool, opts: OpenOptions, io: std.Io) Status {
-        return self.openAdvanced(path, writable, opts, .{}, io);
+    pub fn open(self: *TreeDBM, io: std.Io, path: []const u8, writable: bool, opts: OpenOptions) Status {
+        return self.openAdvanced( io,path, writable, opts, .{});
     }
 
-    pub fn openAdvanced(self: *TreeDBM, path: []const u8, writable: bool, opts: OpenOptions, params: TuningParameters, io: std.Io) Status {
-        const st = self.impl.openImpl(path, writable, opts, params, io);
+    pub fn openAdvanced(self: *TreeDBM, io: std.Io, path: []const u8, writable: bool, opts: OpenOptions, params: TuningParameters) Status {
+        const st = self.impl.openImpl( io,path, writable, opts, params);
         if (st.isOk()) self.impl.open = true;
         return st;
     }
@@ -2059,7 +2059,7 @@ pub const TreeDBM = struct {
         return self.impl.closeImpl(io);
     }
 
-    pub fn get(self: *TreeDBM, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
+    pub fn get(self: *TreeDBM, io: std.Io, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
         const GetProc = struct {
             value: ?*std.ArrayList(u8),
             alloc: Allocator,
@@ -2078,13 +2078,13 @@ pub const TreeDBM = struct {
             }
         };
         var proc = GetProc{ .value = value_out, .alloc = self.impl.allocator };
-        const st = self.impl.processImpl(key, &proc, false);
+        const st = self.impl.processImpl( io,key, &proc, false);
         if (!st.isOk()) return st;
         if (!proc.found) return Status.init(.NOT_FOUND_ERROR);
         return Status.init(.SUCCESS);
     }
 
-    pub fn set(self: *TreeDBM, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*ArrayList(u8)) Status {
+    pub fn set(self: *TreeDBM, io: std.Io, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*ArrayList(u8)) Status {
         const SetProc = struct {
             value: []const u8,
             overwrite: bool,
@@ -2109,13 +2109,13 @@ pub const TreeDBM = struct {
             .old_value = old_value,
             .allocator = self.impl.allocator,
         };
-        const st = self.impl.processImpl(key, &proc, true);
+        const st = self.impl.processImpl( io,key, &proc, true);
         if (!st.isOk()) return st;
         if (proc.conflict) return Status.init(.DUPLICATION_ERROR);
         return Status.init(.SUCCESS);
     }
 
-    pub fn remove(self: *TreeDBM, key: []const u8) Status {
+    pub fn remove(self: *TreeDBM, io: std.Io, key: []const u8) Status {
         const RemoveProc = struct {
             found: bool = false,
             pub fn processFull(p: *@This(), _: []const u8, _: []const u8) RecordAction {
@@ -2128,22 +2128,22 @@ pub const TreeDBM = struct {
             }
         };
         var proc = RemoveProc{};
-        const st = self.impl.processImpl(key, &proc, true);
+        const st = self.impl.processImpl( io,key, &proc, true);
         if (!st.isOk()) return st;
         if (!proc.found) return Status.init(.NOT_FOUND_ERROR);
         return Status.init(.SUCCESS);
     }
 
-    pub fn process(self: *TreeDBM, key: []const u8, proc: anytype, writable: bool) Status {
-        return self.impl.processImpl(key, proc, writable);
+    pub fn process(self: *TreeDBM, io: std.Io, key: []const u8, proc: anytype, writable: bool) Status {
+        return self.impl.processImpl( io,key, proc, writable);
     }
 
-    pub fn processFirst(self: *TreeDBM, proc: anytype, writable: bool) Status {
-        return self.impl.processFirstImpl(proc, writable);
+    pub fn processFirst(self: *TreeDBM, io: std.Io, proc: anytype, writable: bool) Status {
+        return self.impl.processFirstImpl( io,proc, writable);
     }
 
-    pub fn processEach(self: *TreeDBM, proc: anytype, writable: bool) Status {
-        return self.impl.processEachImpl(proc, writable);
+    pub fn processEach(self: *TreeDBM, io: std.Io, proc: anytype, writable: bool) Status {
+        return self.impl.processEachImpl( io,proc, writable);
     }
 
     fn countInternal(self: *TreeDBM) i64 {
@@ -2170,15 +2170,15 @@ pub const TreeDBM = struct {
         return self.impl.auto_restored;
     }
 
-    pub fn synchronize(self: *TreeDBM, hard: bool, io: std.Io) Status {
-        return self.impl.synchronizeImpl(hard, io);
+    pub fn synchronize(self: *TreeDBM, io: std.Io, hard: bool) Status {
+        return self.impl.synchronizeImpl( io,hard);
     }
 
     pub fn rebuild(self: *TreeDBM, io: std.Io) Status {
         return self.impl.rebuildImpl(io);
     }
 
-    pub fn rebuildAdvanced(self: *TreeDBM, params: TuningParameters, skip_broken_records: bool, sync_hard: bool, io: std.Io) Status {
+    pub fn rebuildAdvanced(self: *TreeDBM, io: std.Io, params: TuningParameters, skip_broken_records: bool, sync_hard: bool) Status {
         _ = skip_broken_records;
         _ = sync_hard;
         if (params.max_page_size > 0) self.impl.max_page_size = params.max_page_size;
@@ -2187,8 +2187,8 @@ pub const TreeDBM = struct {
         return self.impl.rebuildImpl(io);
     }
 
-    pub fn clear(self: *TreeDBM) Status {
-        return self.impl.clearImpl();
+    pub fn clear(self: *TreeDBM, io: std.Io) Status {
+        return self.impl.clearImpl(io);
     }
 
     pub fn getOpaqueMetadata(self: *TreeDBM) []const u8 {
@@ -2302,7 +2302,7 @@ pub const TreeDBM = struct {
         return self.impl.hash_dbm.validateRecords(record_base, end_offset);
     }
 
-    pub fn append(self: *TreeDBM, key: []const u8, value: []const u8, delim: []const u8) Status {
+    pub fn append(self: *TreeDBM, io: std.Io, key: []const u8, value: []const u8, delim: []const u8) Status {
         const AppendProc = struct {
             value: []const u8,
             delim: []const u8,
@@ -2324,7 +2324,7 @@ pub const TreeDBM = struct {
         };
         var proc = AppendProc{ .value = value, .delim = delim, .allocator = self.impl.allocator };
         defer if (proc.combined) |c| self.impl.allocator.free(c);
-        return self.impl.processImpl(key, &proc, true);
+        return self.impl.processImpl( io,key, &proc, true);
     }
 
     /// Fetches values for each key in `keys`, inserting found entries into `records`.
@@ -2335,6 +2335,7 @@ pub const TreeDBM = struct {
     /// never stopped early — the C++ `|=` semantics are preserved via Status.mergeFrom.
     pub fn getMulti(
         self: *TreeDBM,
+        io: std.Io,
         keys: []const []const u8,
         records: *std.StringHashMap([]u8),
     ) Status {
@@ -2342,7 +2343,7 @@ pub const TreeDBM = struct {
         for (keys) |key| {
             var val_buf: std.ArrayList(u8) = .empty;
             defer val_buf.deinit(self.impl.allocator);
-            const st = self.get(key, &val_buf);
+            const st = self.get( io,key, &val_buf);
             if (st.isOk()) {
                 const duped_key = records.allocator.dupe(u8, key) catch
                     return Status.init(.SYSTEM_ERROR);
@@ -2367,12 +2368,13 @@ pub const TreeDBM = struct {
     /// Stops early on any error other than DUPLICATION_ERROR (matching C++ SetMulti semantics).
     pub fn setMulti(
         self: *TreeDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         overwrite: bool,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.set(r[0], r[1], overwrite, null);
+            const st = self.set( io,r[0], r[1], overwrite, null);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .DUPLICATION_ERROR) break;
         }
@@ -2382,10 +2384,10 @@ pub const TreeDBM = struct {
     /// Removes each key in `keys`.
     ///
     /// Stops early on any error other than NOT_FOUND_ERROR (matching C++ RemoveMulti semantics).
-    pub fn removeMulti(self: *TreeDBM, keys: []const []const u8) Status {
+    pub fn removeMulti(self: *TreeDBM, io: std.Io, keys: []const []const u8) Status {
         var status = Status.init(.SUCCESS);
         for (keys) |key| {
-            const st = self.remove(key);
+            const st = self.remove( io,key);
             status.mergeFrom(st);
             if (!status.isOk() and status.code != .NOT_FOUND_ERROR) break;
         }
@@ -2397,12 +2399,13 @@ pub const TreeDBM = struct {
     /// Stops on the first error (matching C++ AppendMulti semantics).
     pub fn appendMulti(
         self: *TreeDBM,
+        io: std.Io,
         records: []const [2][]const u8,
         delim: []const u8,
     ) Status {
         var status = Status.init(.SUCCESS);
         for (records) |r| {
-            const st = self.append(r[0], r[1], delim);
+            const st = self.append( io,r[0], r[1], delim);
             status.mergeFrom(st);
             if (!status.isOk()) break;
         }
@@ -2411,6 +2414,7 @@ pub const TreeDBM = struct {
 
     pub fn compareExchange(
         self: *TreeDBM,
+        io: std.Io,
         key: []const u8,
         expected: dbm.CompareExpected,
         desired: dbm.CompareDesired,
@@ -2475,12 +2479,12 @@ pub const TreeDBM = struct {
             .actual_out = actual_out,
             .found_out = found_out,
         };
-        const st = self.impl.processImpl(key, &proc, true);
+        const st = self.impl.processImpl( io,key, &proc, true);
         if (!st.isOk()) return st;
         return proc.status;
     }
 
-    pub fn increment(self: *TreeDBM, key: []const u8, delta: i64, current_out: ?*i64, initial: i64) Status {
+    pub fn increment(self: *TreeDBM, io: std.Io, key: []const u8, delta: i64, current_out: ?*i64, initial: i64) Status {
         const IncrProc = struct {
             status: Status = Status.init(.SUCCESS),
             delta: i64,
@@ -2515,18 +2519,18 @@ pub const TreeDBM = struct {
             }
         };
         var proc = IncrProc{ .delta = delta, .current_out = current_out, .initial = initial };
-        const st = self.impl.processImpl(key, &proc, true);
+        const st = self.impl.processImpl( io,key, &proc, true);
         if (!st.isOk()) return st;
         return proc.status;
     }
 
-    pub fn incrementSimple(self: *TreeDBM, key: []const u8, delta: i64, initial: i64) i64 {
+    pub fn incrementSimple(self: *TreeDBM, io: std.Io, key: []const u8, delta: i64, initial: i64) i64 {
         var result: i64 = initial;
-        _ = self.increment(key, delta, &result, initial);
+        _ = self.increment( io,key, delta, &result, initial);
         return result;
     }
 
-    pub fn popFirst(self: *TreeDBM, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+    pub fn popFirst(self: *TreeDBM, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
         const PopProc = struct {
             status: Status = Status.init(.SUCCESS),
             key_out: ?*std.ArrayList(u8),
@@ -2556,19 +2560,19 @@ pub const TreeDBM = struct {
             }
         };
         var proc = PopProc{ .key_out = key_out, .value_out = value_out, .allocator = self.impl.allocator };
-        const st = self.impl.processFirstImpl(&proc, true);
+        const st = self.impl.processFirstImpl( io,&proc, true);
         if (!st.isOk()) return st;
         return proc.status;
     }
 
-    pub fn pushLast(self: *TreeDBM, value: []const u8, wtime: f64, key_out: ?*std.ArrayList(u8), io: std.Io) Status {
+    pub fn pushLast(self: *TreeDBM, io: std.Io, value: []const u8, wtime: f64, key_out: ?*std.ArrayList(u8)) Status {
         const base: u64 = time_util.pushLastKeyBase(wtime, io);
         var seq: u64 = 0;
         while (true) : (seq += 1) {
             const ts: u64 = base +% seq;
             var key_buf: [8]u8 = undefined;
             const key = str_util.intToStrBigEndian(ts, 8, &key_buf);
-            const st = self.set(key, value, false, null);
+            const st = self.set( io,key, value, false, null);
             if (st.code != .DUPLICATION_ERROR) {
                 if (key_out) |ko| {
                     ko.clearRetainingCapacity();
@@ -2581,6 +2585,7 @@ pub const TreeDBM = struct {
 
     pub fn processMulti(
         self: *TreeDBM,
+        io: std.Io,
         comptime P: type,
         keys: []const []const u8,
         procs: []const *P,
@@ -2588,14 +2593,14 @@ pub const TreeDBM = struct {
     ) Status {
         var status = Status.init(.SUCCESS);
         for (keys, procs) |key, proc| {
-            status.mergeFrom(self.impl.processImpl(key, proc, writable));
+            status.mergeFrom(self.impl.processImpl( io,key, proc, writable));
         }
         return status;
     }
 
-    pub fn inspect(self: *TreeDBM, allocator: std.mem.Allocator) !std.ArrayList([2][]u8) {
-        self.impl.mutex.lockShared();
-        defer self.impl.mutex.unlockShared();
+    pub fn inspect(self: *TreeDBM, allocator: std.mem.Allocator, io: std.Io) !std.ArrayList([2][]u8) {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
 
         var list: std.ArrayList([2][]u8) = .empty;
         errdefer {
@@ -2717,7 +2722,7 @@ pub const TreeDBM = struct {
     }
 
     /// Make a cursor; caller must call `cursor.deinit()` when done.
-    pub fn makeCursor(self: *TreeDBM) !Cursor {
+    pub fn makeCursor(self: *TreeDBM, io: std.Io) !Cursor {
         const it = try self.impl.allocator.create(TreeDBMIteratorImpl);
         it.* = .{
             .dbm_impl = self.impl,
@@ -2727,12 +2732,16 @@ pub const TreeDBM = struct {
             .leaf_id = 0,
             .allocator = self.impl.allocator,
         };
-        try self.impl.iterators.append(self.impl.allocator, it);
+        self.impl.mutex.lockUncancelable(io);
+        self.impl.iterators.append(self.impl.allocator, it) catch {
+            self.impl.mutex.unlock(io);
+            self.impl.allocator.destroy(it);
+            return error.OutOfMemory;
+        };
+        self.impl.mutex.unlock(io);
         return Cursor{ .impl = it, .dbm_impl = self.impl };
     }
 
-    /// Deprecated: use makeCursor instead.
-    pub const makeIterator = makeCursor;
 
     // -----------------------------------------------------------------------
     // Static methods (Phase 5.3)
@@ -2782,11 +2791,11 @@ pub const TreeDBM = struct {
     /// Matches C++ TreeDBM::RestoreDatabase().
     pub fn restoreDatabase(
         allocator: std.mem.Allocator,
+        io: std.Io,
         old_path: []const u8,
         new_path: []const u8,
         end_offset: i64,
         cipher_key: []const u8,
-        io: std.Io,
     ) Status {
         _ = cipher_key;
         // Use sentinel values to distinguish "skip hash restore" from normal end_offset.
@@ -2801,22 +2810,22 @@ pub const TreeDBM = struct {
             const filled = std.fmt.bufPrint(tmp_path, "{s}.tmp.restore", .{new_path}) catch
                 return Status.init(.SYSTEM_ERROR);
             const hash_end: i64 = end_offset;
-            const st = HashDBM.restoreDatabase(allocator, old_path, filled, hash_end, "", io);
+            const st = HashDBM.restoreDatabase(allocator, io, old_path, filled, hash_end, "");
             if (!st.isOk()) return st;
-            const st2 = rebuildTreeFromHashFile(allocator, filled, new_path, io);
+            const st2 = rebuildTreeFromHashFile(allocator, io, filled, new_path);
             // Clean up temp file regardless of rebuild outcome.
             file_mod.deleteFileAbsolute(filled);
             return st2;
         }
 
-        return rebuildTreeFromHashFile(allocator, old_path, new_path, io);
+        return rebuildTreeFromHashFile(allocator, io, old_path, new_path);
     }
 
     fn rebuildTreeFromHashFile(
         allocator: std.mem.Allocator,
+        io: std.Io,
         src_path: []const u8,
         new_path: []const u8,
-        io: std.Io,
     ) Status {
         // Open source as a TreeDBM to iterate user-visible records.
         const src_sf = file_mod.StdFile.create(allocator) catch return Status.init(.SYSTEM_ERROR);
@@ -2824,9 +2833,9 @@ pub const TreeDBM = struct {
             src_sf.asFile().deinit(allocator);
             return Status.init(.SYSTEM_ERROR);
         };
-        defer src_db.deinit();
+        defer src_db.deinit(io);
         {
-            const st = src_db.open(src_path, false, .{ .no_lock = true }, io); // restore source; may be broken/unlocked
+            const st = src_db.open( io,src_path, false, .{ .no_lock = true }); // restore source; may be broken/unlocked
             if (!st.isOk()) return st;
         }
 
@@ -2855,29 +2864,29 @@ pub const TreeDBM = struct {
             new_sf.asFile().deinit(allocator);
             return Status.init(.SYSTEM_ERROR);
         };
-        defer new_db.deinit();
+        defer new_db.deinit(io);
         {
             const params = TuningParameters{
                 .max_page_size = if (max_page > 0) max_page else DEFAULT_MAX_PAGE_SIZE,
                 .max_branches = if (max_branches > 0) max_branches else DEFAULT_MAX_BRANCHES,
             };
-            const st = new_db.openAdvanced(new_path, true, .{ .truncate = true }, params, io);
+            const st = new_db.openAdvanced( io,new_path, true, .{ .truncate = true }, params);
             if (!st.isOk()) return st;
         }
 
         // Copy all user records from source to destination.
-        var iter = src_db.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        _ = iter.first();
+        var iter = src_db.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        _ = iter.first(io);
         while (true) {
             var key_list: std.ArrayList(u8) = .empty;
             defer key_list.deinit(allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get( io,&key_list, &val_list);
             if (!st_get.isOk()) break;
-            _ = new_db.set(key_list.items, val_list.items, true, null);
-            _ = iter.next();
+            _ = new_db.set( io,key_list.items, val_list.items, true, null);
+            _ = iter.next(io);
         }
 
         return new_db.close(io);
@@ -2932,10 +2941,10 @@ pub const TreeDBM = struct {
     }
 
     /// Copies the database file to dest_path, optionally syncing first.
-    pub fn copyFileData(self: *TreeDBM, dest_path: []const u8, sync_hard: bool, io: std.Io) Status {
+    pub fn copyFileData(self: *TreeDBM, io: std.Io, dest_path: []const u8, sync_hard: bool) Status {
         if (!self.isOpen()) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         if (sync_hard) {
-            const st = self.synchronize(true, io);
+            const st = self.synchronize( io,true);
             if (!st.isOk()) return st;
         }
         const src_path = self.getFilePathInternal();
@@ -2946,30 +2955,30 @@ pub const TreeDBM = struct {
     }
 
     /// Renames a key. Reads old value, sets under new_key, removes old_key unless copying=true.
-    pub fn rekey(self: *TreeDBM, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
+    pub fn rekey(self: *TreeDBM, io: std.Io, old_key: []const u8, new_key: []const u8, overwrite: bool, copying: bool) Status {
         if (!self.isOpen() or !self.isWritable())
             return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
         var value_list: std.ArrayList(u8) = .empty;
         defer value_list.deinit(self.impl.allocator);
 
-        const st_get = self.get(old_key, &value_list);
+        const st_get = self.get( io,old_key, &value_list);
         if (!st_get.isOk()) return st_get;
 
-        const st_set = self.set(new_key, value_list.items, overwrite, null);
+        const st_set = self.set( io,new_key, value_list.items, overwrite, null);
         if (!st_set.isOk()) return st_set;
 
         if (!copying) {
-            _ = self.remove(old_key);
+            _ = self.remove( io,old_key);
         }
         return Status.init(.SUCCESS);
     }
 
     /// Exports all records from this DBM to dest (any DBM with a set() method).
-    pub fn export_(self: *TreeDBM, dest: anytype) Status {
-        var iter = self.makeCursor() catch return Status.init(.SYSTEM_ERROR);
-        defer iter.deinit();
-        var st = iter.first();
+    pub fn export_(self: *TreeDBM, io: std.Io, dest: anytype) Status {
+        var iter = self.makeCursor(io) catch return Status.init(.SYSTEM_ERROR);
+        defer iter.deinit(io);
+        var st = iter.first(io);
         if (st.code == .NOT_FOUND_ERROR) return Status.init(.SUCCESS);
         if (!st.isOk()) return st;
         while (true) {
@@ -2977,11 +2986,11 @@ pub const TreeDBM = struct {
             defer key_list.deinit(self.impl.allocator);
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.impl.allocator);
-            const st_get = iter.get(&key_list, &val_list);
+            const st_get = iter.get( io,&key_list, &val_list);
             if (!st_get.isOk()) break;
-            const st_set = dest.set(key_list.items, val_list.items, true, null);
+            const st_set = dest.set( io,key_list.items, val_list.items, true, null);
             if (!st_set.isOk()) return st_set;
-            st = iter.next();
+            st = iter.next(io);
             if (!st.isOk()) break;
         }
         return Status.init(.SUCCESS);
@@ -2990,13 +2999,14 @@ pub const TreeDBM = struct {
     /// Atomically checks multiple expected conditions then applies multiple desired changes.
     pub fn compareExchangeMulti(
         self: *TreeDBM,
+        io: std.Io,
         expected: []const struct { key: []const u8, value: dbm.CompareExpected },
         desired: []const struct { key: []const u8, value: dbm.CompareDesired },
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
             defer val_list.deinit(self.impl.allocator);
-            const get_st = self.get(cond.key, &val_list);
+            const get_st = self.get( io,cond.key, &val_list);
             switch (cond.value) {
                 .absent => {
                     if (get_st.isOk()) return Status.init(.DUPLICATION_ERROR);
@@ -3013,11 +3023,11 @@ pub const TreeDBM = struct {
         for (desired) |change| {
             switch (change.value) {
                 .remove => {
-                    const st = self.remove(change.key);
+                    const st = self.remove( io,change.key);
                     if (!st.isOk() and st.code != .NOT_FOUND_ERROR) return st;
                 },
                 .set => |new_val| {
-                    const st = self.set(change.key, new_val, true, null);
+                    const st = self.set( io,change.key, new_val, true, null);
                     if (!st.isOk()) return st;
                 },
                 .noop => {},
@@ -3034,13 +3044,14 @@ pub const TreeDBM = struct {
         impl: *TreeDBMIteratorImpl,
         dbm_impl: *TreeDBMImpl,
 
-        pub fn deinit(self: *Cursor) void {
+        pub fn deinit(self: *Cursor, io: std.Io) void {
             // If close() has run on the DBM, it nulled `impl.dbm_impl` and
             // cleared the iterators list. In that case we must NOT touch
             // `self.dbm_impl.iterators` (which may be mid-teardown in
             // TreeDBMImpl.deinit, or freed if the DBM has been deinited),
             // we only need to free the impl.
             if (self.impl.dbm_impl != null) {
+                self.dbm_impl.mutex.lockUncancelable(io);
                 // Unregister from dbm_impl's iterator list.
                 for (self.dbm_impl.iterators.items, 0..) |it, i| {
                     if (it == self.impl) {
@@ -3048,59 +3059,60 @@ pub const TreeDBM = struct {
                         break;
                     }
                 }
+                self.dbm_impl.mutex.unlock(io);
             }
             self.impl.deinit();
         }
 
-        pub fn first(self: *Cursor) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterSetPositionFirst(self.impl) catch Status.init(.SYSTEM_ERROR);
+        pub fn first(self: *Cursor, io: std.Io) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterSetPositionFirst( io,self.impl) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn last(self: *Cursor) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterSetPositionLast(self.impl) catch Status.init(.SYSTEM_ERROR);
+        pub fn last(self: *Cursor, io: std.Io) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterSetPositionLast( io,self.impl) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn jump(self: *Cursor, key: []const u8) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterJump(self.impl, key) catch Status.init(.SYSTEM_ERROR);
+        pub fn jump(self: *Cursor, io: std.Io, key: []const u8) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterJump( io,self.impl, key) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn jumpLower(self: *Cursor, key: []const u8, inclusive: bool) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterJumpLower(self.impl, key, inclusive) catch Status.init(.SYSTEM_ERROR);
+        pub fn jumpLower(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterJumpLower( io,self.impl, key, inclusive) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn jumpUpper(self: *Cursor, key: []const u8, inclusive: bool) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterJumpUpper(self.impl, key, inclusive) catch Status.init(.SYSTEM_ERROR);
+        pub fn jumpUpper(self: *Cursor, io: std.Io, key: []const u8, inclusive: bool) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterJumpUpper( io,self.impl, key, inclusive) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn next(self: *Cursor) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterNext(self.impl) catch Status.init(.SYSTEM_ERROR);
+        pub fn next(self: *Cursor, io: std.Io) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterNext( io,self.impl) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn previous(self: *Cursor) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterPrevious(self.impl) catch Status.init(.SYSTEM_ERROR);
+        pub fn previous(self: *Cursor, io: std.Io) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterPrevious( io,self.impl) catch Status.init(.SYSTEM_ERROR);
         }
 
-        pub fn get(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            self.dbm_impl.mutex.lockShared();
-            defer self.dbm_impl.mutex.unlockShared();
-            return iterGetCurrent(self.impl, key_out, value_out);
+        pub fn get(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            self.dbm_impl.mutex.lockSharedUncancelable(io);
+            defer self.dbm_impl.mutex.unlockShared(io);
+            return iterGetCurrent( io,self.impl, key_out, value_out);
         }
 
-        pub fn set(self: *Cursor, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn set(self: *Cursor, io: std.Io, value: []const u8, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             const SetProc = struct {
                 value: []const u8,
                 old_key: ?*std.ArrayList(u8),
@@ -3122,12 +3134,12 @@ pub const TreeDBM = struct {
             };
             const alloc = self.dbm_impl.allocator;
             var proc = SetProc{ .value = value, .old_key = old_key, .old_value = old_value, .allocator = alloc };
-            const st = self.process(&proc, true);
+            const st = self.process( io,&proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn remove(self: *Cursor, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
+        pub fn remove(self: *Cursor, io: std.Io, old_key: ?*std.ArrayList(u8), old_value: ?*std.ArrayList(u8)) Status {
             const RemoveProc = struct {
                 old_key: ?*std.ArrayList(u8),
                 old_value: ?*std.ArrayList(u8),
@@ -3148,27 +3160,27 @@ pub const TreeDBM = struct {
             };
             const alloc = self.dbm_impl.allocator;
             var proc = RemoveProc{ .old_key = old_key, .old_value = old_value, .allocator = alloc };
-            const st = self.process(&proc, true);
+            const st = self.process( io,&proc, true);
             if (!st.isOk()) return st;
             return proc.status;
         }
 
-        pub fn step(self: *Cursor, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
-            const st = self.get(key_out, value_out);
+        pub fn step(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            const st = self.get( io,key_out, value_out);
             if (!st.isOk()) return st;
-            _ = self.next();
+            _ = self.next(io);
             return Status.init(.SUCCESS);
         }
 
-        pub fn process(self: *Cursor, proc: anytype, writable: bool) Status {
+        pub fn process(self: *Cursor, io: std.Io, proc: anytype, writable: bool) Status {
             if (writable) {
-                self.dbm_impl.mutex.lock();
-                defer self.dbm_impl.mutex.unlock();
+                self.dbm_impl.mutex.lockUncancelable(io);
+                defer self.dbm_impl.mutex.unlock(io);
             } else {
-                self.dbm_impl.mutex.lockShared();
-                defer self.dbm_impl.mutex.unlockShared();
+                self.dbm_impl.mutex.lockSharedUncancelable(io);
+                defer self.dbm_impl.mutex.unlockShared(io);
             }
-            return iterProcess(self.impl, proc, writable);
+            return iterProcess( io,self.impl, proc, writable);
         }
     };
 
@@ -3197,7 +3209,7 @@ pub const TreeDBM = struct {
         /// The returned slices point into internal buffers and are invalidated
         /// on the next call to next() or deinit(). Copy them if you need the
         /// data to outlive this call.
-        pub fn next(self: *Iterator) !?Entry {
+        pub fn next(self: *Iterator, io: std.Io) !?Entry {
             if (self.done) return null;
 
             // Fill internal buffers from the current cursor position.
@@ -3229,7 +3241,7 @@ pub const TreeDBM = struct {
                 .alloc = self.alloc,
                 .filled = &filled,
             };
-            _ = self.cursor.process(&proc, false);
+            _ = self.cursor.process( io,&proc, false);
             if (proc.oom) return error.OutOfMemory;
 
             if (!filled) {
@@ -3239,7 +3251,7 @@ pub const TreeDBM = struct {
 
             // Advance cursor. If it reaches the end, mark done so the next
             // call returns null rather than re-reading the last record.
-            if (!self.cursor.next().isOk()) self.done = true;
+            if (!self.cursor.next(io).isOk()) self.done = true;
 
             return Entry{
                 .key = self.key_buf.items,
@@ -3248,18 +3260,18 @@ pub const TreeDBM = struct {
         }
 
         /// Release internal buffers and the underlying cursor.
-        pub fn deinit(self: *Iterator) void {
+        pub fn deinit(self: *Iterator, io: std.Io) void {
             self.key_buf.deinit(self.alloc);
             self.value_buf.deinit(self.alloc);
-            self.cursor.deinit();
+            self.cursor.deinit(io);
         }
     };
 
     /// Return a Zig-style iterator positioned at the first record.
     /// The caller must call deinit() when done.
-    pub fn iterate(self: *TreeDBM, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterate(self: *TreeDBM, alloc: std.mem.Allocator, io: std.Io) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -3267,15 +3279,15 @@ pub const TreeDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.first().isOk()) iter.done = true;
+        if (!iter.cursor.first(io).isOk()) iter.done = true;
         return iter;
     }
 
     /// Return a Zig-style iterator positioned at the first record >= key.
     /// The caller must call deinit() when done.
-    pub fn iterateFrom(self: *TreeDBM, key: []const u8, alloc: std.mem.Allocator) !Iterator {
-        var cursor = try self.makeCursor();
-        errdefer cursor.deinit();
+    pub fn iterateFrom(self: *TreeDBM, alloc: std.mem.Allocator, io: std.Io, key: []const u8) !Iterator {
+        var cursor = try self.makeCursor(io);
+        errdefer cursor.deinit(io);
         var iter = Iterator{
             .cursor = cursor,
             .alloc = alloc,
@@ -3283,7 +3295,7 @@ pub const TreeDBM = struct {
             .value_buf = .empty,
             .done = false,
         };
-        if (!iter.cursor.jump(key).isOk()) iter.done = true;
+        if (!iter.cursor.jump( io,key).isOk()) iter.done = true;
         return iter;
     }
 };
@@ -3297,8 +3309,8 @@ const testing = std.testing;
 fn openTestDB(tmp_path: []const u8, params: TuningParameters) !TreeDBM {
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    errdefer db.deinit();
-    const st = db.openAdvanced(tmp_path, true, .{ .truncate = true }, params, std.testing.io);
+    errdefer db.deinit(std.testing.io);
+    const st = db.openAdvanced( std.testing.io,tmp_path, true, .{ .truncate = true }, params);
     try testing.expect(st.isOk());
     return db;
 }
@@ -3306,45 +3318,45 @@ fn openTestDB(tmp_path: []const u8, params: TuningParameters) !TreeDBM {
 test "TreeDBM: basic set/get/remove" {
     const tmp = "/tmp/tkrzw_tree_basic.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    try testing.expect(db.set("hello", "world", true, null).isOk());
-    try testing.expect(db.set("foo", "bar", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"hello", "world", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"foo", "bar", true, null).isOk());
     try testing.expectEqual(@as(i64, 2), db.countSimple());
 
     var val = ArrayList(u8).empty;
     defer val.deinit(testing.allocator);
-    try testing.expect(db.get("hello", &val).isOk());
+    try testing.expect(db.get( std.testing.io,"hello", &val).isOk());
     try testing.expectEqualStrings("world", val.items);
 
-    try testing.expect(db.get("missing", null).code == .NOT_FOUND_ERROR);
-    try testing.expect(db.remove("hello").isOk());
-    try testing.expect(db.get("hello", null).code == .NOT_FOUND_ERROR);
+    try testing.expect(db.get( std.testing.io,"missing", null).code == .NOT_FOUND_ERROR);
+    try testing.expect(db.remove( std.testing.io,"hello").isOk());
+    try testing.expect(db.get( std.testing.io,"hello", null).code == .NOT_FOUND_ERROR);
     try testing.expectEqual(@as(i64, 1), db.countSimple());
 }
 
 test "TreeDBM: overwrite and duplication" {
     const tmp = "/tmp/tkrzw_tree_overwrite.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    try testing.expect(db.set("k", "v1", true, null).isOk());
-    try testing.expect(db.set("k", "v2", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"k", "v1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"k", "v2", true, null).isOk());
 
     var val = ArrayList(u8).empty;
     defer val.deinit(testing.allocator);
-    try testing.expect(db.get("k", &val).isOk());
+    try testing.expect(db.get( std.testing.io,"k", &val).isOk());
     try testing.expectEqualStrings("v2", val.items);
 
-    try testing.expectEqual(Code.DUPLICATION_ERROR, db.set("k", "v3", false, null).code);
-    try testing.expect(db.get("k", &val).isOk());
+    try testing.expectEqual(Code.DUPLICATION_ERROR, db.set( std.testing.io,"k", "v3", false, null).code);
+    try testing.expect(db.get( std.testing.io,"k", &val).isOk());
     try testing.expectEqualStrings("v2", val.items);
 }
 
 test "TreeDBM: sequential insertion and forward scan" {
     const tmp = "/tmp/tkrzw_tree_seq.tkt";
     var db = try openTestDB(tmp, .{ .max_page_size = 512, .max_branches = 4 });
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const N = 200;
     var key_buf: [32]u8 = undefined;
@@ -3352,24 +3364,24 @@ test "TreeDBM: sequential insertion and forward scan" {
     for (0..N) |i| {
         const k = std.fmt.bufPrint(&key_buf, "key{d:04}", .{i}) catch unreachable;
         const v = std.fmt.bufPrint(&val_buf, "val{d:04}", .{i}) catch unreachable;
-        try testing.expect(db.set(k, v, true, null).isOk());
+        try testing.expect(db.set( std.testing.io,k, v, true, null).isOk());
     }
     try testing.expectEqual(@as(i64, N), db.countSimple());
 
-    var it = try db.makeCursor();
-    defer it.deinit();
-    try testing.expect(it.first().isOk());
+    var it = try db.makeCursor(std.testing.io);
+    defer it.deinit(std.testing.io);
+    try testing.expect(it.first(std.testing.io).isOk());
     var seen: usize = 0;
     while (true) {
         var k = ArrayList(u8).empty;
         defer k.deinit(testing.allocator);
         var v = ArrayList(u8).empty;
         defer v.deinit(testing.allocator);
-        const st = it.get(&k, &v);
+        const st = it.get( std.testing.io,&k, &v);
         if (st.code == .NOT_FOUND_ERROR) break;
         try testing.expect(st.isOk());
         seen += 1;
-        try testing.expect(it.next().isOk() or seen == N);
+        try testing.expect(it.next(std.testing.io).isOk() or seen == N);
         if (seen == N) break;
     }
     try testing.expectEqual(N, seen);
@@ -3378,7 +3390,7 @@ test "TreeDBM: sequential insertion and forward scan" {
 test "TreeDBM: reverse scan" {
     const tmp = "/tmp/tkrzw_tree_rev.tkt";
     var db = try openTestDB(tmp, .{ .max_page_size = 512, .max_branches = 4 });
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const N = 50;
     var key_buf: [32]u8 = undefined;
@@ -3386,21 +3398,21 @@ test "TreeDBM: reverse scan" {
     for (0..N) |i| {
         const k = std.fmt.bufPrint(&key_buf, "key{d:04}", .{i}) catch unreachable;
         const v = std.fmt.bufPrint(&val_buf, "val{d:04}", .{i}) catch unreachable;
-        try testing.expect(db.set(k, v, true, null).isOk());
+        try testing.expect(db.set( std.testing.io,k, v, true, null).isOk());
     }
 
-    var it = try db.makeCursor();
-    defer it.deinit();
-    try testing.expect(it.last().isOk());
+    var it = try db.makeCursor(std.testing.io);
+    defer it.deinit(std.testing.io);
+    try testing.expect(it.last(std.testing.io).isOk());
     var count: usize = 0;
     while (true) {
         var k = ArrayList(u8).empty;
         defer k.deinit(testing.allocator);
-        const st = it.get(&k, null);
+        const st = it.get( std.testing.io,&k, null);
         if (st.code == .NOT_FOUND_ERROR) break;
         try testing.expect(st.isOk());
         count += 1;
-        if (it.previous().code == .NOT_FOUND_ERROR) break;
+        if (it.previous(std.testing.io).code == .NOT_FOUND_ERROR) break;
     }
     try testing.expectEqual(@as(usize, N), count);
 }
@@ -3408,74 +3420,74 @@ test "TreeDBM: reverse scan" {
 test "TreeDBM: jump iterator" {
     const tmp = "/tmp/tkrzw_tree_jump.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    try testing.expect(db.set("a", "1", true, null).isOk());
-    try testing.expect(db.set("c", "3", true, null).isOk());
-    try testing.expect(db.set("e", "5", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"a", "1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"c", "3", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"e", "5", true, null).isOk());
 
-    var it = try db.makeCursor();
-    defer it.deinit();
+    var it = try db.makeCursor(std.testing.io);
+    defer it.deinit(std.testing.io);
 
-    try testing.expect(it.jump("c").isOk());
+    try testing.expect(it.jump( std.testing.io,"c").isOk());
     var key = ArrayList(u8).empty;
     defer key.deinit(testing.allocator);
-    try testing.expect(it.get(&key, null).isOk());
+    try testing.expect(it.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("c", key.items);
 
     // Jump to key between existing records.
-    try testing.expect(it.jump("b").isOk());
+    try testing.expect(it.jump( std.testing.io,"b").isOk());
     key.clearRetainingCapacity();
-    try testing.expect(it.get(&key, null).isOk());
+    try testing.expect(it.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("c", key.items);
 }
 
 test "TreeDBM: jumpLower / jumpUpper" {
     const tmp = "/tmp/tkrzw_tree_bound.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     for ([_][]const u8{ "a", "c", "e", "g" }) |k| {
-        try testing.expect(db.set(k, k, true, null).isOk());
+        try testing.expect(db.set( std.testing.io,k, k, true, null).isOk());
     }
 
-    var it = try db.makeCursor();
-    defer it.deinit();
+    var it = try db.makeCursor(std.testing.io);
+    defer it.deinit(std.testing.io);
     var key = ArrayList(u8).empty;
     defer key.deinit(testing.allocator);
 
     // jumpLower inclusive of "c" → "c"
-    try testing.expect(it.jumpLower("c", true).isOk());
+    try testing.expect(it.jumpLower( std.testing.io,"c", true).isOk());
     key.clearRetainingCapacity();
-    try testing.expect(it.get(&key, null).isOk());
+    try testing.expect(it.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("c", key.items);
 
     // jumpLower exclusive of "c" → "a"
-    try testing.expect(it.jumpLower("c", false).isOk());
+    try testing.expect(it.jumpLower( std.testing.io,"c", false).isOk());
     key.clearRetainingCapacity();
-    try testing.expect(it.get(&key, null).isOk());
+    try testing.expect(it.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("a", key.items);
 
     // jumpUpper inclusive of "c" → "c"
-    try testing.expect(it.jumpUpper("c", true).isOk());
+    try testing.expect(it.jumpUpper( std.testing.io,"c", true).isOk());
     key.clearRetainingCapacity();
-    try testing.expect(it.get(&key, null).isOk());
+    try testing.expect(it.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("c", key.items);
 
     // jumpUpper exclusive of "c" → "e"
-    try testing.expect(it.jumpUpper("c", false).isOk());
+    try testing.expect(it.jumpUpper( std.testing.io,"c", false).isOk());
     key.clearRetainingCapacity();
-    try testing.expect(it.get(&key, null).isOk());
+    try testing.expect(it.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("e", key.items);
 }
 
 test "TreeDBM: processFirst and processEach" {
     const tmp = "/tmp/tkrzw_tree_process.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    try testing.expect(db.set("k1", "v1", true, null).isOk());
-    try testing.expect(db.set("k2", "v2", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"k1", "v1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"k2", "v2", true, null).isOk());
 
     const GetFirst = struct {
         key: ArrayList(u8),
@@ -3488,7 +3500,7 @@ test "TreeDBM: processFirst and processEach" {
     };
     var gf = GetFirst{ .key = ArrayList(u8).empty };
     defer gf.key.deinit(testing.allocator);
-    try testing.expect(db.processFirst(&gf, false).isOk());
+    try testing.expect(db.processFirst( std.testing.io,&gf, false).isOk());
     try testing.expectEqualStrings("k1", gf.key.items);
 
     var record_count: usize = 0;
@@ -3501,18 +3513,18 @@ test "TreeDBM: processFirst and processEach" {
         pub fn processEmpty(_: *@This(), _: []const u8) RecordAction { return .noop; }
     };
     var counter = Counter{ .count = &record_count };
-    try testing.expect(db.processEach(&counter, false).isOk());
+    try testing.expect(db.processEach( std.testing.io,&counter, false).isOk());
     try testing.expectEqual(@as(usize, 2), record_count);
 }
 
 test "TreeDBM: clear" {
     const tmp = "/tmp/tkrzw_tree_clear.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
-    try testing.expect(db.set("x", "y", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"x", "y", true, null).isOk());
     try testing.expectEqual(@as(i64, 1), db.countSimple());
-    try testing.expect(db.clear().isOk());
+    try testing.expect(db.clear(std.testing.io).isOk());
     try testing.expectEqual(@as(i64, 0), db.countSimple());
 }
 
@@ -3520,18 +3532,18 @@ test "TreeDBM: synchronize and reopen" {
     const tmp = "/tmp/tkrzw_tree_sync.tkt";
     {
         var db = try openTestDB(tmp, .{});
-        defer db.deinit();
-        try testing.expect(db.set("persist", "yes", true, null).isOk());
-        try testing.expect(db.synchronize(false, std.testing.io).isOk());
+        defer db.deinit(std.testing.io);
+        try testing.expect(db.set( std.testing.io,"persist", "yes", true, null).isOk());
+        try testing.expect(db.synchronize( std.testing.io,false).isOk());
     }
     {
         const sf2 = try file_mod.StdFile.create(testing.allocator);
         var db = try TreeDBM.init(sf2.asFile(), testing.allocator);
-        defer db.deinit();
-        try testing.expect(db.open(tmp, false, .{}, std.testing.io).isOk());
+        defer db.deinit(std.testing.io);
+        try testing.expect(db.open( std.testing.io,tmp, false, .{}).isOk());
         var val = ArrayList(u8).empty;
         defer val.deinit(testing.allocator);
-        try testing.expect(db.get("persist", &val).isOk());
+        try testing.expect(db.get( std.testing.io,"persist", &val).isOk());
         try testing.expectEqualStrings("yes", val.items);
     }
 }
@@ -3539,12 +3551,12 @@ test "TreeDBM: synchronize and reopen" {
 test "TreeDBM: rebuild" {
     const tmp = "/tmp/tkrzw_tree_rebuild.tkt";
     var db = try openTestDB(tmp, .{});
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     for (0..50) |i| {
         var k: [8]u8 = undefined;
         const ks = std.fmt.bufPrint(&k, "k{d:04}", .{i}) catch unreachable;
-        try testing.expect(db.set(ks, "v", true, null).isOk());
+        try testing.expect(db.set( std.testing.io,ks, "v", true, null).isOk());
     }
     try testing.expect(db.rebuild(std.testing.io).isOk());
     try testing.expectEqual(@as(i64, 50), db.countSimple());
@@ -3553,13 +3565,13 @@ test "TreeDBM: rebuild" {
 test "TreeDBM: large values trigger splits" {
     const tmp = "/tmp/tkrzw_tree_split.tkt";
     var db = try openTestDB(tmp, .{ .max_page_size = 256, .max_branches = 4 });
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     const long_val = "x" ** 64;
     var key_buf: [16]u8 = undefined;
     for (0..30) |i| {
         const k = std.fmt.bufPrint(&key_buf, "key{d:03}", .{i}) catch unreachable;
-        try testing.expect(db.set(k, long_val, true, null).isOk());
+        try testing.expect(db.set( std.testing.io,k, long_val, true, null).isOk());
     }
     try testing.expectEqual(@as(i64, 30), db.countSimple());
     // Verify all keys are retrievable.
@@ -3567,7 +3579,7 @@ test "TreeDBM: large values trigger splits" {
     defer val.deinit(testing.allocator);
     for (0..30) |i| {
         const k = std.fmt.bufPrint(&key_buf, "key{d:03}", .{i}) catch unreachable;
-        try testing.expect(db.get(k, &val).isOk());
+        try testing.expect(db.get( std.testing.io,k, &val).isOk());
         try testing.expectEqualStrings(long_val, val.items);
     }
 }
@@ -3576,17 +3588,17 @@ test "TreeDBM: getDatabaseType and setDatabaseType" {
     const tmp = "/tmp/tkrzw_tree_dbtype.tkt";
     {
         var db = try openTestDB(tmp, .{});
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         try testing.expectEqual(@as(i32, 0), db.getDatabaseType());
         try testing.expect(db.setDatabaseType(99).isOk());
         try testing.expectEqual(@as(i32, 99), db.getDatabaseType());
-        try testing.expect(db.synchronize(false, std.testing.io).isOk());
+        try testing.expect(db.synchronize( std.testing.io,false).isOk());
     }
     {
         const sf2 = try file_mod.StdFile.create(testing.allocator);
         var db = try TreeDBM.init(sf2.asFile(), testing.allocator);
-        defer db.deinit();
-        try testing.expect(db.open(tmp, false, .{}, std.testing.io).isOk());
+        defer db.deinit(std.testing.io);
+        try testing.expect(db.open( std.testing.io,tmp, false, .{}).isOk());
         try testing.expectEqual(@as(i32, 99), db.getDatabaseType());
     }
 }
@@ -3595,16 +3607,16 @@ test "TreeDBM: opaque metadata" {
     const tmp = "/tmp/tkrzw_tree_opaque.tkt";
     {
         var db = try openTestDB(tmp, .{});
-        defer db.deinit();
+        defer db.deinit(std.testing.io);
         try testing.expect(db.setOpaqueMetadata("hello").isOk());
         try testing.expectEqualStrings("hello", db.getOpaqueMetadata());
-        try testing.expect(db.synchronize(false, std.testing.io).isOk());
+        try testing.expect(db.synchronize( std.testing.io,false).isOk());
     }
     {
         const sf2 = try file_mod.StdFile.create(testing.allocator);
         var db = try TreeDBM.init(sf2.asFile(), testing.allocator);
-        defer db.deinit();
-        try testing.expect(db.open(tmp, false, .{}, std.testing.io).isOk());
+        defer db.deinit(std.testing.io);
+        try testing.expect(db.open( std.testing.io,tmp, false, .{}).isOk());
         try testing.expectEqualStrings("hello", db.getOpaqueMetadata());
     }
 }
@@ -3624,10 +3636,10 @@ test "TreeDBM: open/close lifecycle and isOpen" {
 
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    defer db.deinit();
+    defer db.deinit(std.testing.io);
 
     try testing.expect(!db.isOpen());
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
     try testing.expect(db.isOpen());
     try testing.expect(db.close(std.testing.io).isOk());
     try testing.expect(!db.isOpen());
@@ -3644,22 +3656,22 @@ test "TreeDBM: set, get, remove, countSimple" {
 
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    defer db.deinit();
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
 
-    try testing.expect(db.set("alpha", "one", true, null).isOk());
-    try testing.expect(db.set("beta", "two", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"alpha", "one", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"beta", "two", true, null).isOk());
     try testing.expectEqual(@as(i64, 2), db.countSimple());
 
     var val = ArrayList(u8).empty;
     defer val.deinit(testing.allocator);
-    try testing.expect(db.get("alpha", &val).isOk());
+    try testing.expect(db.get( std.testing.io,"alpha", &val).isOk());
     try testing.expectEqualStrings("one", val.items);
 
-    try testing.expect(db.get("missing", null).code == .NOT_FOUND_ERROR);
+    try testing.expect(db.get( std.testing.io,"missing", null).code == .NOT_FOUND_ERROR);
 
-    try testing.expect(db.remove("alpha").isOk());
-    try testing.expect(db.get("alpha", null).code == .NOT_FOUND_ERROR);
+    try testing.expect(db.remove( std.testing.io,"alpha").isOk());
+    try testing.expect(db.get( std.testing.io,"alpha", null).code == .NOT_FOUND_ERROR);
     try testing.expectEqual(@as(i64, 1), db.countSimple());
 
     try testing.expect(db.close(std.testing.io).isOk());
@@ -3676,17 +3688,17 @@ test "TreeDBM: iterator forward traversal" {
 
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    defer db.deinit();
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
 
     // Insert keys in lexicographic order so TreeDBM preserves the sequence.
-    try testing.expect(db.set("aaa", "v1", true, null).isOk());
-    try testing.expect(db.set("bbb", "v2", true, null).isOk());
-    try testing.expect(db.set("ccc", "v3", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"aaa", "v1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"bbb", "v2", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"ccc", "v3", true, null).isOk());
 
-    var iter = try db.makeCursor();
-    defer iter.deinit();
-    try testing.expect(iter.first().isOk());
+    var iter = try db.makeCursor(std.testing.io);
+    defer iter.deinit(std.testing.io);
+    try testing.expect(iter.first(std.testing.io).isOk());
 
     var key = ArrayList(u8).empty;
     defer key.deinit(testing.allocator);
@@ -3694,26 +3706,26 @@ test "TreeDBM: iterator forward traversal" {
     defer value.deinit(testing.allocator);
 
     // First record.
-    try testing.expect(iter.get(&key, &value).isOk());
+    try testing.expect(iter.get( std.testing.io,&key, &value).isOk());
     try testing.expectEqualStrings("aaa", key.items);
     try testing.expectEqualStrings("v1", value.items);
 
     // Advance to second.
-    try testing.expect(iter.next().isOk());
+    try testing.expect(iter.next(std.testing.io).isOk());
     key.clearRetainingCapacity();
     value.clearRetainingCapacity();
-    try testing.expect(iter.get(&key, &value).isOk());
+    try testing.expect(iter.get( std.testing.io,&key, &value).isOk());
     try testing.expectEqualStrings("bbb", key.items);
 
     // Advance to third.
-    try testing.expect(iter.next().isOk());
+    try testing.expect(iter.next(std.testing.io).isOk());
     key.clearRetainingCapacity();
-    try testing.expect(iter.get(&key, null).isOk());
+    try testing.expect(iter.get( std.testing.io,&key, null).isOk());
     try testing.expectEqualStrings("ccc", key.items);
 
     // Past end.
-    _ = iter.next();
-    try testing.expect(iter.get(null, null).code == .NOT_FOUND_ERROR);
+    _ = iter.next(std.testing.io);
+    try testing.expect(iter.get( std.testing.io,null, null).code == .NOT_FOUND_ERROR);
 
     try testing.expect(db.close(std.testing.io).isOk());
 }
@@ -3754,8 +3766,8 @@ test "TreeDBM: UpdateLogger integration" {
 
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    defer db.deinit();
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
 
     var mock_ctx: TreeMockLoggerCtx = .{};
     var mock_logger: UpdateLogger = .{
@@ -3769,17 +3781,17 @@ test "TreeDBM: UpdateLogger integration" {
     db.setUpdateLogger(&mock_logger);
 
     // set fires writeSet
-    try testing.expect(db.set("key1", "val1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"key1", "val1", true, null).isOk());
     try testing.expect(mock_ctx.writeSet_count > 0);
 
     // remove fires writeRemove
-    try testing.expect(db.remove("key1").isOk());
+    try testing.expect(db.remove( std.testing.io,"key1").isOk());
     try testing.expect(mock_ctx.writeRemove_count > 0);
 
     // clear fires writeClear
-    try testing.expect(db.set("key2", "val2", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"key2", "val2", true, null).isOk());
     const pre_clear = mock_ctx.writeClear_count;
-    try testing.expect(db.clear().isOk());
+    try testing.expect(db.clear(std.testing.io).isOk());
     try testing.expect(mock_ctx.writeClear_count > pre_clear);
 
     try testing.expect(db.close(std.testing.io).isOk());
@@ -3797,8 +3809,8 @@ test "TreeDBM.*Multi: bulk set/get/remove/append" {
 
     const sf = try file_mod.StdFile.create(alloc);
     var db = try TreeDBM.init(sf.asFile(), alloc);
-    defer db.deinit();
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
 
     // setMulti: insert three records.
     const pairs = [_][2][]const u8{
@@ -3806,7 +3818,7 @@ test "TreeDBM.*Multi: bulk set/get/remove/append" {
         .{ "key2", "val2" },
         .{ "key3", "val3" },
     };
-    try testing.expect(db.setMulti(&pairs, true).isOk());
+    try testing.expect(db.setMulti( std.testing.io,&pairs, true).isOk());
     try testing.expectEqual(@as(i64, 3), db.countSimple());
 
     // getMulti: two found, one missing — status reflects the missing key.
@@ -3819,22 +3831,22 @@ test "TreeDBM.*Multi: bulk set/get/remove/append" {
         }
         records.deinit();
     }
-    const get_st = db.getMulti(&.{ "key1", "key2", "missing" }, &records);
+    const get_st = db.getMulti( std.testing.io,&.{ "key1", "key2", "missing" }, &records);
     try testing.expectEqual(lib_common.Code.NOT_FOUND_ERROR, get_st.code);
     try testing.expectEqual(@as(usize, 2), records.count());
 
     // removeMulti: removes key1 and key2.
-    try testing.expect(db.removeMulti(&.{ "key1", "key2" }).isOk());
+    try testing.expect(db.removeMulti( std.testing.io,&.{ "key1", "key2" }).isOk());
     try testing.expectEqual(@as(i64, 1), db.countSimple());
 
     // appendMulti: append to key3.
     const app = [_][2][]const u8{.{ "key3", "_appended" }};
-    try testing.expect(db.appendMulti(&app, "").isOk());
+    try testing.expect(db.appendMulti( std.testing.io,&app, "").isOk());
 
     // Verify the appended value.
     var val_buf: ArrayList(u8) = .empty;
     defer val_buf.deinit(alloc);
-    try testing.expect(db.get("key3", &val_buf).isOk());
+    try testing.expect(db.get( std.testing.io,"key3", &val_buf).isOk());
     try testing.expectEqualStrings("val3_appended", val_buf.items);
 
     try testing.expect(db.close(std.testing.io).isOk());
@@ -3851,18 +3863,18 @@ test "TreeDBM: Zig-style iterator iterate()" {
 
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    defer db.deinit();
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
 
-    try testing.expect(db.set("a", "1", true, null).isOk());
-    try testing.expect(db.set("b", "2", true, null).isOk());
-    try testing.expect(db.set("c", "3", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"a", "1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"b", "2", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"c", "3", true, null).isOk());
 
-    var iter = try db.iterate(testing.allocator);
-    defer iter.deinit();
+    var iter = try db.iterate(testing.allocator, testing.io);
+    defer iter.deinit(std.testing.io);
 
     var count: usize = 0;
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.testing.io)) |entry| {
         count += 1;
         if (count == 1) {
             try testing.expectEqualStrings("a", entry.key);
@@ -3878,7 +3890,7 @@ test "TreeDBM: Zig-style iterator iterate()" {
     try testing.expectEqual(@as(usize, 3), count);
 }
 
-test "TreeDBM: Zig-style iterator iterateFrom()" {
+test "TreeDBM: Zig-style iterator iterateFrom" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -3889,17 +3901,17 @@ test "TreeDBM: Zig-style iterator iterateFrom()" {
 
     const sf = try file_mod.StdFile.create(testing.allocator);
     var db = try TreeDBM.init(sf.asFile(), testing.allocator);
-    defer db.deinit();
-    try testing.expect(db.open(full_path, true, .{}, std.testing.io).isOk());
+    defer db.deinit(std.testing.io);
+    try testing.expect(db.open( std.testing.io,full_path, true, .{}).isOk());
 
-    try testing.expect(db.set("a", "1", true, null).isOk());
-    try testing.expect(db.set("b", "2", true, null).isOk());
-    try testing.expect(db.set("c", "3", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"a", "1", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"b", "2", true, null).isOk());
+    try testing.expect(db.set( std.testing.io,"c", "3", true, null).isOk());
 
-    var iter = try db.iterateFrom("b", testing.allocator);
-    defer iter.deinit();
+    var iter = try db.iterateFrom( testing.allocator, std.testing.io,"b");
+    defer iter.deinit(std.testing.io);
 
-    const first = try iter.next();
+    const first = try iter.next(std.testing.io);
     try testing.expect(first != null);
     try testing.expectEqualStrings("b", first.?.key);
     try testing.expectEqualStrings("2", first.?.value);
@@ -3908,13 +3920,13 @@ test "TreeDBM: Zig-style iterator iterateFrom()" {
     const key_copy = try testing.allocator.dupe(u8, first.?.key);
     defer testing.allocator.free(key_copy);
 
-    const second = try iter.next();
+    const second = try iter.next(std.testing.io);
     try testing.expect(second != null);
     try testing.expectEqualStrings("c", second.?.key);
 
     // first.?.key is now invalid, but key_copy is safe.
     try testing.expectEqualStrings("b", key_copy);
 
-    const third = try iter.next();
+    const third = try iter.next(std.testing.io);
     try testing.expect(third == null);
 }
