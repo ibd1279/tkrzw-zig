@@ -1,84 +1,122 @@
-// tkrzw-zig smoke test — mirrors the verification scenario from the port plan:
-//   1. Set 1000 keys
-//   2. Get and verify each
-//   3. Remove half (even-indexed keys)
-//   4. Iterate the remaining 500 and verify count
-
 const std = @import("std");
-const tkzrw = @import("tkrzw_zig");
+const tkrzw = @import("tkrzw_zig");
+const PolyDBM = tkrzw.PolyDBM;
+const BackendType = tkrzw.BackendType;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    const std_file = try tkzrw.StdFile.create(allocator);
-    var db = try tkzrw.TinyDBM.init(std_file.asFile(), 0, allocator);
+    // --- Arg parsing ---
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    _ = args.skip(); // skip argv[0]
+
+    var file_path: ?[]const u8 = null;
+    var type_str: ?[]const u8 = null;
+    var action: ?[]const u8 = null;
+    var key: ?[]const u8 = null;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
+            file_path = args.next() orelse {
+                std.log.err("--file requires a value", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--type") or std.mem.eql(u8, arg, "-t")) {
+            type_str = args.next() orelse {
+                std.log.err("--type requires a value", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--act") or std.mem.eql(u8, arg, "-a")) {
+            action = args.next() orelse {
+                std.log.err("--act requires a value", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
+            key = args.next() orelse {
+                std.log.err("--key requires a value", .{});
+                std.process.exit(1);
+            };
+        } else {
+            std.log.err("unknown flag: {s}", .{arg});
+            std.process.exit(1);
+        }
+    }
+
+    // --- Validate required flags ---
+    const path = file_path orelse {
+        std.log.err("--file is required", .{});
+        std.process.exit(1);
+    };
+    const act = action orelse {
+        std.log.err("--act is required", .{});
+        std.process.exit(1);
+    };
+
+    // --- Parse optional backend type override ---
+    const backend_override: ?BackendType = if (type_str) |t| blk: {
+        if (std.mem.eql(u8, t, "hash")) break :blk .hash;
+        if (std.mem.eql(u8, t, "tree")) break :blk .tree;
+        if (std.mem.eql(u8, t, "skip")) break :blk .skip;
+        if (std.mem.eql(u8, t, "tiny")) break :blk .tiny;
+        if (std.mem.eql(u8, t, "baby")) break :blk .baby;
+        if (std.mem.eql(u8, t, "cache")) break :blk .cache;
+        std.log.err("unknown backend type: {s}", .{t});
+        std.process.exit(1);
+    } else null;
+
+    // --- Open database ---
+    var db = PolyDBM.open(path, .{ .writable = false, .backend = backend_override }, io, allocator) catch |err| {
+        std.log.err("failed to open database: {}", .{err});
+        std.process.exit(1);
+    };
     defer db.deinit(io);
+    defer _ = db.close(io);
 
-    const N: usize = 1000;
-    var key_buf: [32]u8 = undefined;
-    var val_buf: [32]u8 = undefined;
-
-    // --- Phase 1: set 1000 keys ---
-    for (0..N) |i| {
-        const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
-        const v = try std.fmt.bufPrint(&val_buf, "val{d}", .{i});
-        const st = db.set(io, k, v, true, null);
-        if (!st.isOk()) {
-            std.debug.print("FAIL set key{d}: {s}\n", .{ i, @tagName(st.code) });
+    // --- Dispatch action ---
+    if (std.mem.eql(u8, act, "get")) {
+        const k = key orelse {
+            std.log.err("--key is required for action 'get'", .{});
             std.process.exit(1);
-        }
-    }
-    std.debug.print("set {d} keys, count={d}\n", .{ N, db.countSimple() });
+        };
 
-    // --- Phase 2: get and verify each ---
-    var mismatches: usize = 0;
-    for (0..N) |i| {
-        const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
-        const expected = try std.fmt.bufPrint(&val_buf, "val{d}", .{i});
-        var value_list: std.ArrayList(u8) = .empty;
-        defer value_list.deinit(allocator);
-        const st = db.get(io, k, &value_list);
-        if (!st.isOk() or !std.mem.eql(u8, value_list.items, expected)) {
-            mismatches += 1;
+        const value = db.get(allocator, io, k) catch |err| switch (err) {
+            error.NotFound => {
+                std.log.err("key not found: {s}", .{k});
+                std.process.exit(1);
+            },
+            else => {
+                std.log.err("get failed: {}", .{err});
+                std.process.exit(1);
+            },
+        };
+        defer allocator.free(value);
+
+        var buf: [4096]u8 = undefined;
+        var stdout_bw = std.Io.File.stdout().writer(io, &buf);
+        const stdout = &stdout_bw.interface;
+        defer stdout.flush() catch {};
+        try stdout.print("{s}\n", .{value});
+    } else if (std.mem.eql(u8, act, "keys")) {
+        var buf: [4096]u8 = undefined;
+        var stdout_bw = std.Io.File.stdout().writer(io, &buf);
+        const stdout = &stdout_bw.interface;
+        defer stdout.flush() catch {};
+
+        var iter = db.iterate(allocator, io) catch |err| {
+            std.log.err("failed to open iterator: {}", .{err});
+            std.process.exit(1);
+        };
+        defer iter.deinit(io);
+
+        while (iter.next(io) catch |err| {
+            std.log.err("iterator error: {}", .{err});
+            std.process.exit(1);
+        }) |entry| {
+            try stdout.print("{s}\n", .{entry.key});
         }
-    }
-    if (mismatches > 0) {
-        std.debug.print("FAIL: {d} get mismatches\n", .{mismatches});
+    } else {
+        std.log.err("unknown action: {s}", .{act});
         std.process.exit(1);
     }
-    std.debug.print("verified all {d} keys\n", .{N});
-
-    // --- Phase 3: remove even-indexed keys (500 removals) ---
-    for (0..N / 2) |i| {
-        const k = try std.fmt.bufPrint(&key_buf, "key{d}", .{i * 2});
-        _ = db.remove(io, k);
-    }
-    std.debug.print("removed {d} keys, count={d}\n", .{ N / 2, db.countSimple() });
-
-    // --- Phase 4: iterate remaining records ---
-    var iter = try db.makeCursor(io);
-    defer iter.deinit(io);
-    _ = iter.first(io);
-
-    var iterated: usize = 0;
-    var iter_key: std.ArrayList(u8) = .empty;
-    defer iter_key.deinit(allocator);
-    while (true) {
-        const get_st = iter.get(io, &iter_key, null);
-        if (get_st.code == .NOT_FOUND_ERROR) break;
-        if (!get_st.isOk()) {
-            std.debug.print("FAIL: iterator get returned {s}\n", .{@tagName(get_st.code)});
-            std.process.exit(1);
-        }
-        iterated += 1;
-        _ = iter.next(io);
-    }
-
-    if (iterated != N / 2) {
-        std.debug.print("FAIL: iterated {d}, expected {d}\n", .{ iterated, N / 2 });
-        std.process.exit(1);
-    }
-    std.debug.print("iterated {d} remaining keys\n", .{iterated});
-    std.debug.print("all smoke tests passed\n", .{});
 }
