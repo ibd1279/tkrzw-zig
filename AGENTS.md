@@ -39,6 +39,9 @@ The port focuses on functional correctness and maintaining the original API surf
 - **src/lib_common.zig** — Status types and result codes
 - **src/file.zig** — File I/O abstraction and implementations
 - **src/\*_util.zig** — Utility modules (hash, string, time, thread, varint)
+- **src/c_api.zig** — C ABI wrapper exposing PolyDBM to C callers; all `export fn tkrzw_*` symbols live here; uses `std.heap.c_allocator` for all malloc-backed outputs so callers can call plain `free()`
+- **src/c_api_test.zig** — In-process Zig tests for the C API surface (wired into `zig build test`)
+- **include/tkrzw.h** — Authoritative C header with all type definitions, opaque handles, enums, and function declarations for the C API
 
 ### Testing
 
@@ -91,7 +94,10 @@ The port focuses on functional correctness and maintaining the original API surf
 ## Build
 
 ```bash
-zig build                 # Default build
+zig build                 # Default build; also produces:
+                          #   zig-out/lib/libtkrzw.a        (static library)
+                          #   zig-out/lib/libtkrzw.dylib    (shared library, macOS)
+                          #   zig-out/include/tkrzw.h       (installed C header)
 zig build test            # Run tests
 zig build run             # Run demo
 ```
@@ -104,3 +110,8 @@ zig build run             # Run demo
 - Maintain mutex safety without introducing deadlocks
 - **Import deadlock pattern**: If holding `self.mutex` exclusively, use `processImplForImport()` instead of `processImpl()` to avoid recursive lock deadlock
 - File extension mapping for PolyDBM: `.tkh`, `.tkt`, `.tks`, `.tkmt`, `.tkmb`, `.tkmc`
+
+### C API history / fixed bugs
+
+- `PolyDBM.isOpen` and `PolyDBM.isWritable` require an `io: Io` argument (as of the current implementation). The C API wrappers in `src/c_api.zig` pass `g_io` accordingly.
+- `CompareExpectedEntry` and `CompareDesiredEntry` are now named types exported from `src/root.zig` (via `src/dbm.zig`). Earlier anonymous-struct usage caused cross-module type-identity failures in `tkrzw_compare_exchange_multi`; switching to these named types fixed the issue.

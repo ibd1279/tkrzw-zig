@@ -589,8 +589,8 @@ pub const PolyDBM = struct {
     pub fn compareExchangeMulti(
         self: *Self,
         io: Io,
-        expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
-        desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
+        expected: []const dbm_mod.CompareExpectedEntry,
+        desired: []const dbm_mod.CompareDesiredEntry,
     ) Status {
         return switch (self.backend) {
             BackendType.hash => |*db| db.compareExchangeMulti(io, expected, desired),
@@ -691,28 +691,28 @@ pub const PolyDBM = struct {
     /// Checks if the database is open.
     ///
     /// \return true if open, false otherwise
-    pub fn isOpen(self: *Self) bool {
+    pub fn isOpen(self: *Self, io: Io) bool {
         return switch (self.backend) {
             BackendType.hash => |*db| db.isOpen(),
             BackendType.tree => |*db| db.isOpen(),
             BackendType.skip => |*db| db.isOpen(),
             BackendType.tiny => |*db| db.isOpen(),
             BackendType.baby => |*db| db.isOpen(),
-            BackendType.cache => |*db| db.isOpen(),
+            BackendType.cache => |*db| db.isOpen(io),
         };
     }
 
     /// Checks if the database is writable.
     ///
     /// \return true if writable, false otherwise
-    pub fn isWritable(self: *Self) bool {
+    pub fn isWritable(self: *Self, io: Io) bool {
         return switch (self.backend) {
             BackendType.hash => |*db| db.isWritable(),
             BackendType.tree => |*db| db.isWritable(),
             BackendType.skip => |*db| db.isWritable(),
             BackendType.tiny => |*db| db.isWritable(),
             BackendType.baby => |*db| db.isWritable(),
-            BackendType.cache => |*db| db.isWritable(),
+            BackendType.cache => |*db| db.isWritable(io),
         };
     }
 

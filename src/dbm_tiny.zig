@@ -2469,8 +2469,8 @@ pub const TinyDBM = struct {
     pub fn compareExchangeMulti(
         self: *TinyDBM,
         io: std.Io,
-        expected: []const struct { key: []const u8, value: dbm_mod.CompareExpected },
-        desired: []const struct { key: []const u8, value: dbm_mod.CompareDesired },
+        expected: []const dbm_mod.CompareExpectedEntry,
+        desired: []const dbm_mod.CompareDesiredEntry,
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;

@@ -80,6 +80,8 @@ pub const RecordAction = dbm.RecordAction;
 pub const UpdateLogger = dbm.UpdateLogger;
 pub const CompareExpected = dbm.CompareExpected;
 pub const CompareDesired = dbm.CompareDesired;
+pub const CompareExpectedEntry = dbm.CompareExpectedEntry;
+pub const CompareDesiredEntry = dbm.CompareDesiredEntry;
 
 pub const File = file.File;
 pub const StdFile = file.StdFile;

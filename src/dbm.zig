@@ -48,3 +48,16 @@ pub const CompareDesired = union(enum) {
     noop,
     set: []const u8,
 };
+
+/// Named type for a single entry in a compareExchangeMulti expected slice.
+/// Defining this here ensures all backends use the same Zig type identity.
+pub const CompareExpectedEntry = struct {
+    key: []const u8,
+    value: CompareExpected,
+};
+
+/// Named type for a single entry in a compareExchangeMulti desired slice.
+pub const CompareDesiredEntry = struct {
+    key: []const u8,
+    value: CompareDesired,
+};

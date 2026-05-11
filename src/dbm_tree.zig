@@ -3000,8 +3000,8 @@ pub const TreeDBM = struct {
     pub fn compareExchangeMulti(
         self: *TreeDBM,
         io: std.Io,
-        expected: []const struct { key: []const u8, value: dbm.CompareExpected },
-        desired: []const struct { key: []const u8, value: dbm.CompareDesired },
+        expected: []const dbm.CompareExpectedEntry,
+        desired: []const dbm.CompareDesiredEntry,
     ) Status {
         for (expected) |cond| {
             var val_list: std.ArrayList(u8) = .empty;
