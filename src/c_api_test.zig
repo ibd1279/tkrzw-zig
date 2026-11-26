@@ -6,6 +6,14 @@
 const std = @import("std");
 const c_api = @import("c_api.zig");
 
+/// std.fmt.bufPrintZ replacement (removed in Zig 0.17): print into `buf`
+/// and append a NUL sentinel.
+fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+    const slice = try std.fmt.bufPrint(buf, fmt, args);
+    buf[slice.len] = 0;
+    return buf[0..slice.len :0];
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -54,7 +62,7 @@ test "open, set, get, close round-trip" {
 
     // Build a null-terminated database path inside the tmp directory.
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/test.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/test.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -93,7 +101,7 @@ test "get miss returns NOT_FOUND_ERROR and null out" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/miss.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/miss.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -124,7 +132,7 @@ test "set overwrite=false returns DUPLICATION_ERROR" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/dup.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/dup.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -244,7 +252,7 @@ test "tkrzw_process_each with no-op callback visits every record" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/proc_each.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/proc_each.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -277,7 +285,7 @@ test "tkrzw_process SET writes new value" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/proc_set.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/proc_set.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -311,7 +319,7 @@ test "tkrzw_process REMOVE deletes the record" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/proc_rm.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/proc_rm.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -356,7 +364,7 @@ test "tkrzw_cursor_free on a valid cursor before deinit" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/cur_free.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/cur_free.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -386,7 +394,7 @@ test "cursor iteration round-trip" {
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     // Use .tkmt (TinyDBM) which supports cursors.
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/cursor.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/cursor.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -471,7 +479,7 @@ test "compareExchange ABSENT to SET" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/cmpex.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/cmpex.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -521,7 +529,7 @@ test "processEach SET writes new value" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/each_set.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/each_set.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);
@@ -560,7 +568,7 @@ test "tkrzw_process with null callback returns INVALID_ARGUMENT_ERROR" {
     const dir_path = path_buf[0..dir_len];
 
     var db_path_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    const db_path = try std.fmt.bufPrintZ(&db_path_buf, "{s}/proc_null.tkmt", .{dir_path});
+    const db_path = try bufPrintZ(&db_path_buf, "{s}/proc_null.tkmt", .{dir_path});
 
     const opts = c_api.TkrzwOpenOptions{};
     const db = c_api.tkrzw_open(db_path.ptr, &opts);

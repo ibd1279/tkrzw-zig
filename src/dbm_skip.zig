@@ -414,7 +414,10 @@ const SkipRecord = struct {
             self.body_buf = buf_alloc;
         }
 
-        const read_status = self.file.read(io, self.body_offset, self.body_buf.?);
+        // Read only the needed bytes: the reused buffer may be larger than
+        // the current record's body (e.g. after a preceding large record),
+        // and over-reading past EOF surfaces as a spurious short read.
+        const read_status = self.file.read(io, self.body_offset, self.body_buf.?[0..needed_size]);
         if (!read_status.isOk()) {
             return read_status;
         }
@@ -695,7 +698,15 @@ const SkipRecord = struct {
                     if (cmp2 == .gt or cmp2 == .eq) {
                         offset = next_off;
                         cur_idx += powI64(@as(i64, self.step_unit), @as(u8, @intCast(lv_u + 1)));
+                        // Free the outgoing record's heap buffer before the
+                        // ownership transfer overwrites the pointer.
+                        if (self.body_buf) |old_buf| {
+                            self.allocator.free(old_buf);
+                        }
                         self.* = next_rec;
+                        // Ownership of next_rec's heap buffers moved into self;
+                        // clear them so the deferred deinit doesn't double-free.
+                        next_rec.body_buf = null;
                         jumped = true;
                         break;
                     } else {
@@ -918,9 +929,13 @@ const RecordSorter = struct {
     allocator: std.mem.Allocator,
 
     fn init(base_path: []const u8, max_mem_size: i64, allocator: std.mem.Allocator) !*RecordSorter {
+        // Callers pass a stack buffer (prepareStorageImpl's sorter_path_buf);
+        // own a copy so base_path stays valid for the sorter's lifetime.
+        const base_path_copy = try allocator.dupe(u8, base_path);
+        errdefer allocator.free(base_path_copy);
         const self = try allocator.create(RecordSorter);
         self.* = .{
-            .base_path = base_path,
+            .base_path = base_path_copy,
             .max_mem_size = max_mem_size,
             .current_mem_size = 0,
             .finished = false,
@@ -930,6 +945,7 @@ const RecordSorter = struct {
     }
 
     fn deinit(self: *RecordSorter, io: std.Io) void {
+        _ = io;
         const allocator = self.allocator;
 
         for (self.current_entries.items) |entry| {
@@ -953,7 +969,7 @@ const RecordSorter = struct {
         self.slots.deinit(allocator);
 
         for (self.tmp_file_owners.items) |file| {
-            _ = file.close(io);
+            file.deinit(allocator);
         }
         self.tmp_file_owners.deinit(allocator);
 
@@ -964,6 +980,7 @@ const RecordSorter = struct {
         self.tmp_paths.deinit(allocator);
 
         self.heap.deinit(self.allocator);
+        allocator.free(self.base_path);
         allocator.destroy(self);
     }
 
@@ -993,27 +1010,40 @@ const RecordSorter = struct {
 
         std.sort.heap(SortEntry, self.current_entries.items, {}, sortEntryCmp);
 
-        var tmp_path_buf: [256]u8 = undefined;
+        var tmp_path_buf: [512]u8 = undefined;
         const tmp_path = try std.fmt.bufPrint(&tmp_path_buf, "{s}.tmp.sorter.{d}", .{ self.base_path, self.tmp_file_counter });
         self.tmp_file_counter += 1;
 
         const tmp_path_owned = try self.allocator.dupe(u8, tmp_path);
-        errdefer self.allocator.free(tmp_path_owned);
-
         const std_file_ptr = try StdFile.create(self.allocator);
         const tmp_file = std_file_ptr.asFile();
-        errdefer _ = tmp_file.close(io);
+
+        // Ownership bookkeeping: the path, the open file, and the StdFile
+        // allocation are ours only until they are registered in tmp_paths /
+        // tmp_file_owners, which free/close them at deinit. The flags keep
+        // the errdefer from double-freeing or double-closing on error paths.
+        var path_ours = true;
+        var file_ours = false;
+        var std_file_ours = true;
+        errdefer {
+            if (path_ours) self.allocator.free(tmp_path_owned);
+            if (file_ours) _ = tmp_file.close(io);
+            if (std_file_ours) self.allocator.destroy(std_file_ptr);
+        }
 
         const open_status = tmp_file.open(io, tmp_path_owned, true, .{ .truncate = true, .no_lock = true }); // process-private temp file
         if (!open_status.isOk()) {
-            _ = tmp_file.close(io);
-            self.allocator.destroy(std_file_ptr);
-            self.allocator.free(tmp_path_owned);
-            return error.OutOfMemory;
+            // vtClose is a no-op on a file that never opened successfully.
+            return error.OpenFailed;
         }
+        file_ours = true;
 
         try self.tmp_paths.append(self.allocator, tmp_path_owned);
+        path_ours = false;
+
         try self.tmp_file_owners.append(self.allocator, tmp_file);
+        file_ours = false;
+        std_file_ours = false;
 
         for (self.current_entries.items) |entry| {
             var flat_key: FlatRecord = .{ .file = tmp_file, .allocator = self.allocator };
@@ -1104,7 +1134,7 @@ const RecordSorter = struct {
             read_status = reader.read(io, &first_value, null);
             if (!read_status.isOk()) {
                 reader.deinit();
-                self.allocator.free(first_key);
+                // first_key borrows the reader's buffer; nothing to free.
                 continue;
             }
 
@@ -1125,8 +1155,8 @@ const RecordSorter = struct {
             try self.heap.push(self.allocator, &self.slots.items[self.slots.items.len - 1]);
 
             id_counter += 1;
-            self.allocator.free(first_key);
-            self.allocator.free(first_value);
+            // first_key / first_value borrow the reader's internal buffer
+            // (and were copied into the slot above) — do not free them.
         }
 
         self.finished = true;
@@ -1810,6 +1840,15 @@ fn prepareStorageImpl(impl: *SkipDBMImpl, io: std.Io) Status {
         return Status.init(.SYSTEM_ERROR);
     };
 
+    // finishStorageImpl already rebuilds storage for the next write cycle
+    // before returning, and its callers (synchronizeAdvanced) invoke this
+    // function again afterwards; release the previous sorter instead of
+    // leaking it when the slot is overwritten.
+    if (impl.sorter) |old_sorter| {
+        old_sorter.deinit(io);
+        impl.sorter = null;
+    }
+
     impl.sorter = RecordSorter.init(sorter_path, impl.sort_mem_size, impl.allocator) catch {
         return Status.init(.SYSTEM_ERROR);
     };
@@ -2189,11 +2228,11 @@ fn restoreDatabaseImpl( allocator: std.mem.Allocator, io: std.Io,old_path: []con
             .file_size = 0,
             .timestamp = 0,
             .db_type = 0,
-            .opaque_metadata = [_]u8{0} ** OPAQUE_METADATA_SIZE,
+            .opaque_metadata = @splat(0),
             .file = file_mod.NullFile,
             .sorted_file = null,
             .sorter = null,
-            .past_offsets = [_]i64{0} ** MAX_MAX_LEVEL,
+            .past_offsets = @splat(0),
             .insert_in_order = false,
             .sort_mem_size = DEFAULT_SORT_MEM_SIZE,
             .max_cached_records = DEFAULT_MAX_CACHED_RECORDS,
@@ -2216,7 +2255,7 @@ fn restoreDatabaseImpl( allocator: std.mem.Allocator, io: std.Io,old_path: []con
     var record_index: i64 = 0;
     var record_count: i64 = 0;
     var eff_data_size: i64 = 0;
-    var past_offsets: [MAX_MAX_LEVEL]i64 = [_]i64{0} ** MAX_MAX_LEVEL;
+    var past_offsets: [MAX_MAX_LEVEL]i64 = @splat(0);
 
     while (offset < old_file.getSizeSimple()) {
         var rec = SkipRecord.init(old_file, scan_offset_width, scan_step_unit, scan_max_level, allocator);

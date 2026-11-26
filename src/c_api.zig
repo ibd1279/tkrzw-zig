@@ -193,8 +193,8 @@ pub export fn tkrzw_status_name(code: i32) [*:0]const u8 {
     // newly-added Code variants cause a compile-time exhaustiveness error.
     // Out-of-range integers return "UNKNOWN" at runtime.
     comptime var valid_values: []const i32 = &.{};
-    comptime for (@typeInfo(Code).@"enum".fields) |f| {
-        valid_values = valid_values ++ &[_]i32{f.value};
+    comptime for (@typeInfo(Code).@"enum".field_values) |v| {
+        valid_values = valid_values ++ &[_]i32{v};
     };
     const is_valid = for (valid_values) |v| {
         if (v == code) break true;

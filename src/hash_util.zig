@@ -397,24 +397,27 @@ pub fn getHashBucketSize(min_size: i64) i64 {
 pub fn secondaryHash(data: []const u8, num_shards: u64) u64 {
     var hash = hashFNV(data);
     if (num_shards <= std.math.maxInt(u32)) {
-        hash =
-            (((hash & 0xffff000000000000) >> 48) | ((hash & 0x0000ffff00000000) >> 16)) ^
-            (((hash & 0x000000000000ffff) << 16) | ((hash & 0x00000000ffff0000) >> 16));
+        // Official fold: (([32,47]<<16)|[48,63]) ^ (([0,15]<<16)|[16,31])
+        const upper: u64 = (((hash >> 32) & 0xFFFF) << 16) | (hash >> 48);
+        const lower: u64 = ((hash & 0xFFFF) << 16) | ((hash >> 16) & 0xFFFF);
+        hash = upper ^ lower;
     }
     return hash % num_shards;
 }
 
 /// MurmurHash with bucket folding, matching tkrzw::PrimaryHash.
 ///
-/// When num_buckets fits in a u32, the 64-bit hash is folded to improve
-/// distribution across the narrower bucket range.
+/// When num_buckets fits in a u32, the 64-bit hash is folded by XOR of the
+/// greater and lower 32 bits as (([32,47]<<16)|[48,63]) ^ (([0,15]<<16)|[16,31]),
+/// per the official HashDBM file-format specification.
 pub fn primaryHash(data: []const u8, num_buckets: u64) u64 {
     const seed: u64 = 19780211;
     var hash = hashMurmur(data, seed);
     if (num_buckets <= std.math.maxInt(u32)) {
-        hash =
-            (((hash & 0xffff000000000000) >> 48) | ((hash & 0x0000ffff00000000) >> 16)) ^
-            (((hash & 0x000000000000ffff) << 16) | ((hash & 0x00000000ffff0000) >> 16));
+        // Official fold: (([32,47]<<16)|[48,63]) ^ (([0,15]<<16)|[16,31])
+        const upper: u64 = (((hash >> 32) & 0xFFFF) << 16) | (hash >> 48);
+        const lower: u64 = ((hash & 0xFFFF) << 16) | ((hash >> 16) & 0xFFFF);
+        hash = upper ^ lower;
     }
     return hash % num_buckets;
 }

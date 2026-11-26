@@ -179,7 +179,11 @@ pub const PolyDBM = struct {
                     if (options.num_buckets > 0) options.num_buckets else dbm_hash_mod.DEFAULT_NUM_BUCKETS,
                     allocator,
                 );
-                _ = db.open(io, path, options.writable, options.file_options);
+                const st_open = db.open(io, path, options.writable, options.file_options);
+                if (!st_open.isOk()) {
+                    db.deinit(io);
+                    return codeToError(st_open.code);
+                }
                 break :blk Backend{ .hash = db };
             },
             BackendType.tree => blk: {
@@ -188,7 +192,11 @@ pub const PolyDBM = struct {
                     std_file.asFile(),
                     allocator,
                 );
-                _ = db.open(io, path, options.writable, options.file_options);
+                const st_open = db.open(io, path, options.writable, options.file_options);
+                if (!st_open.isOk()) {
+                    db.deinit(io);
+                    return codeToError(st_open.code);
+                }
                 break :blk Backend{ .tree = db };
             },
             BackendType.skip => blk: {
@@ -198,7 +206,11 @@ pub const PolyDBM = struct {
                     allocator,
                     .{},
                 );
-                _ = db.open(io, path, options.writable, options.file_options);
+                const st_open = db.open(io, path, options.writable, options.file_options);
+                if (!st_open.isOk()) {
+                    db.deinit(io);
+                    return codeToError(st_open.code);
+                }
                 break :blk Backend{ .skip = db };
             },
             BackendType.tiny => blk: {
@@ -208,7 +220,11 @@ pub const PolyDBM = struct {
                     if (options.num_buckets > 0) options.num_buckets else dbm_tiny_mod.DEFAULT_NUM_BUCKETS,
                     allocator,
                 );
-                _ = db.open(io, path, options.writable, options.file_options);
+                const st_open = db.open(io, path, options.writable, options.file_options);
+                if (!st_open.isOk()) {
+                    db.deinit(io);
+                    return codeToError(st_open.code);
+                }
                 break :blk Backend{ .tiny = db };
             },
             BackendType.baby => blk: {
@@ -219,17 +235,31 @@ pub const PolyDBM = struct {
                     comparator,
                     allocator,
                 );
-                _ = try db.open(io, path, options.writable, options.file_options);
+                // BabyDBM.open returns an error union; map both failure
+                // shapes (error and non-OK Status) like the other backends.
+                const st_open = db.open(io, path, options.writable, options.file_options) catch {
+                    db.deinit(io);
+                    return error.OpenFailed;
+                };
+                if (!st_open.isOk()) {
+                    db.deinit(io);
+                    return codeToError(st_open.code);
+                }
                 break :blk Backend{ .baby = db };
             },
             BackendType.cache => blk: {
                 const std_file = try file_mod.StdFile.create(allocator);
-                const db = try dbm_cache_mod.CacheDBM.init(
+                var db = try dbm_cache_mod.CacheDBM.init(
                     std_file.asFile(),
                     dbm_cache_mod.DEFAULT_CAP_REC_NUM,
                     std.math.maxInt(i64),
                     allocator,
                 );
+                const st_open = db.open(io, path, options.writable, options.file_options);
+                if (!st_open.isOk()) {
+                    db.deinit(io);
+                    return codeToError(st_open.code);
+                }
                 break :blk Backend{ .cache = db };
             },
         };

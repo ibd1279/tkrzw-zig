@@ -33,7 +33,9 @@ pub const OpenOptions = file_mod.OpenOptions;
 const METADATA_SIZE: i32 = 128;
 const FBP_SECTION_SIZE: i32 = 1008;
 const RECORD_BASE_ALIGN: i32 = 4096;
-const BUCKET_BASE_OFFSET: i64 = METADATA_SIZE + FBP_SECTION_SIZE; // 1136
+const RECORD_HEADER_SECTION_SIZE: i32 = 16;
+const RECORD_HEADER_MAGIC = "TkrzwREC\n";
+const BUCKET_BASE_OFFSET: i64 = METADATA_SIZE; // buckets directly follow the metadata
 pub const DEFAULT_OFFSET_WIDTH: i32 = 4;
 pub const DEFAULT_ALIGN_POW: i32 = 3;
 pub const DEFAULT_NUM_BUCKETS: i64 = 1_048_583;
@@ -62,20 +64,22 @@ fn alignUp(value: i64, align_size: i64) i64 {
 }
 
 fn readOffsetWidth(buf: []const u8, offset_width: i32) i64 {
+    // Offsets are stored big-endian (network order) in the tkrzw file format.
     var result: i64 = 0;
     const ow: usize = @intCast(offset_width);
     var i: usize = 0;
     while (i < ow) : (i += 1) {
-        result |= @as(i64, buf[i]) << @intCast(i * 8);
+        result = (result << 8) | buf[i];
     }
     return result;
 }
 
 fn writeOffsetWidth(buf: []u8, value: i64, offset_width: i32) void {
+    // Offsets are stored big-endian (network order) in the tkrzw file format.
     const ow: usize = @intCast(offset_width);
     var i: usize = 0;
     while (i < ow) : (i += 1) {
-        buf[i] = @intCast((value >> @intCast(i * 8)) & 0xFF);
+        buf[i] = @intCast((value >> @intCast((ow - 1 - i) * 8)) & 0xFF);
     }
 }
 
@@ -88,8 +92,12 @@ fn computeMagicChecksum(key: []const u8, value: []const u8) u8 {
 
 fn recordBaseOffset(num_buckets: i64, offset_width: i32, align_pow: i32) i64 {
     const bucket_region_size = num_buckets * @as(i64, offset_width);
+    // Official layout: [metadata 128][buckets][... reserved 1024 (FBP 1008 +
+    // record header 16) immediately before the record section]. The record
+    // section starts at or after 128 + M*W + 1024, aligned to 4096 and 2^P.
+    const min_offset = METADATA_SIZE + bucket_region_size + FBP_SECTION_SIZE + RECORD_HEADER_SECTION_SIZE;
     const align_size: i64 = @max(RECORD_BASE_ALIGN, @as(i64, 1) << @intCast(align_pow));
-    return alignUp(BUCKET_BASE_OFFSET + bucket_region_size, align_size);
+    return alignUp(min_offset, align_size);
 }
 
 fn bucketFileOffset(bucket_index: i64, offset_width: i32) i64 {
@@ -151,6 +159,36 @@ fn encodeOffset(offset: i64, align_pow: i32) i64 {
     return offset >> @intCast(align_pow);
 }
 
+// True when `list` contains a slice equal to `needle`.
+fn listContains(list: []const []u8, needle: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+// Sort a key list lexicographically and drop adjacent duplicates,
+// freeing the dropped slices — the semantics of std::set<std::string>.
+fn sortAndDedupeKeys(allocator: std.mem.Allocator, keys: *std.ArrayListUnmanaged([]u8)) !void {
+    std.mem.sort([]u8, keys.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    var write: usize = 0;
+    var read: usize = 0;
+    while (read < keys.items.len) {
+        if (write > 0 and std.mem.eql(u8, keys.items[write - 1], keys.items[read])) {
+            allocator.free(keys.items[read]);
+        } else {
+            keys.items[write] = keys.items[read];
+            write += 1;
+        }
+        read += 1;
+    }
+    keys.shrinkRetainingCapacity(write);
+}
+
 // ---------------------------------------------------------------------------
 // Header save/load
 // ---------------------------------------------------------------------------
@@ -173,7 +211,7 @@ fn saveMetadata(
 ) Status {
     cyclic_magic.* +%= 1;
 
-    var buf: [METADATA_SIZE]u8 = [_]u8{0} ** METADATA_SIZE;
+    var buf: [METADATA_SIZE]u8 = @splat(0);
     @memcpy(buf[0..9], META_MAGIC);
     buf[9] = cyclic_magic.*;
     buf[10] = 1; // pkg_major
@@ -184,17 +222,17 @@ fn saveMetadata(
     buf[15] = if (finish) CLOSURE_FLAG_CLOSE else 0;
 
     // num_buckets at offset 16 (8 bytes LE)
-    std.mem.writeInt(i64, buf[16..24], num_buckets, .little);
+    std.mem.writeInt(i64, buf[16..24], num_buckets, .big);
     // num_records at offset 24
-    std.mem.writeInt(i64, buf[24..32], num_records, .little);
+    std.mem.writeInt(i64, buf[24..32], num_records, .big);
     // eff_data_size at offset 32
-    std.mem.writeInt(i64, buf[32..40], eff_data_size, .little);
+    std.mem.writeInt(i64, buf[32..40], eff_data_size, .big);
     // file_size at offset 40
-    std.mem.writeInt(i64, buf[40..48], file_size, .little);
+    std.mem.writeInt(i64, buf[40..48], file_size, .big);
     // timestamp at offset 48
-    std.mem.writeInt(i64, buf[48..56], timestamp, .little);
+    std.mem.writeInt(i64, buf[48..56], timestamp, .big);
     // db_type at offset 56 (2 bytes LE)
-    std.mem.writeInt(i16, buf[56..58], @intCast(db_type), .little);
+    std.mem.writeInt(i16, buf[56..58], @intCast(db_type), .big);
     // opaque_metadata at offset 62 (64 bytes)
     const om_len = @min(opaque_metadata.len, OPAQUE_METADATA_SIZE);
     @memcpy(buf[62 .. 62 + om_len], opaque_metadata[0..om_len]);
@@ -237,12 +275,12 @@ fn loadMetadata(
     closure_flags.* = closure_flags_val;
     auto_restored.* = (closure_flags_val & CLOSURE_FLAG_CLOSE) == 0;
 
-    num_buckets.* = std.mem.readInt(i64, buf[16..24], .little);
-    num_records.* = std.mem.readInt(i64, buf[24..32], .little);
-    eff_data_size.* = std.mem.readInt(i64, buf[32..40], .little);
-    file_size_out.* = std.mem.readInt(i64, buf[40..48], .little);
-    timestamp.* = std.mem.readInt(i64, buf[48..56], .little);
-    db_type.* = std.mem.readInt(i16, buf[56..58], .little);
+    num_buckets.* = std.mem.readInt(i64, buf[16..24], .big);
+    num_records.* = std.mem.readInt(i64, buf[24..32], .big);
+    eff_data_size.* = std.mem.readInt(i64, buf[32..40], .big);
+    file_size_out.* = std.mem.readInt(i64, buf[40..48], .big);
+    timestamp.* = std.mem.readInt(i64, buf[48..56], .big);
+    db_type.* = std.mem.readInt(i16, buf[56..58], .big);
 
     const om_copy = @min(opaque_metadata.len, OPAQUE_METADATA_SIZE);
     @memcpy(opaque_metadata[0..om_copy], buf[62 .. 62 + om_copy]);
@@ -256,9 +294,19 @@ fn loadMetadata(
 
 const HashDBMIteratorImpl = struct {
     dbm: ?*HashDBMImpl,
-    bucket_index: i64, // -1 = before start
-    record_offset: i64, // 0 = need to scan from bucket
+    // Next bucket whose keys have not been loaded yet; -1 = exhausted.
+    bucket_index: i64,
+    // Keys of the current batch (one bucket's live records), sorted
+    // lexicographically and deduplicated — mirroring the official
+    // std::set<std::string> keys_. keys[0] is the record the iterator
+    // is positioned at.
+    keys: std.ArrayListUnmanaged([]u8) = .empty,
     allocator: std.mem.Allocator,
+
+    fn clearKeys(iter: *HashDBMIteratorImpl) void {
+        for (iter.keys.items) |k| iter.allocator.free(k);
+        iter.keys.clearRetainingCapacity();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -274,7 +322,10 @@ const HashDBMImpl = struct {
     auto_restored: bool = false,
     open_options: file_mod.OpenOptions = .{},
     path: std.ArrayListUnmanaged(u8) = .empty,
-    static_flags: u8 = 0,
+    // Default update mode is in-place, matching official tkrzw; its OpenImpl
+    // rejects a static_flags of 0 as "invalid static flags", so fresh files
+    // must be created with the in-place flag set.
+    static_flags: u8 = STATIC_FLAG_UPDATE_IN_PLACE,
     offset_width: i32 = DEFAULT_OFFSET_WIDTH,
     align_pow: i32 = DEFAULT_ALIGN_POW,
     num_buckets: i64 = DEFAULT_NUM_BUCKETS,
@@ -283,7 +334,7 @@ const HashDBMImpl = struct {
     file_size: i64 = 0,
     timestamp: i64 = 0,
     db_type: i32 = 0,
-    opaque_metadata: [OPAQUE_METADATA_SIZE]u8 = [_]u8{0} ** OPAQUE_METADATA_SIZE,
+    opaque_metadata: [OPAQUE_METADATA_SIZE]u8 = @splat(0),
     record_base: i64 = 0,
     update_logger: ?*dbm_mod.UpdateLogger = null,
     iterators: std.ArrayListUnmanaged(*HashDBMIteratorImpl) = .empty,
@@ -380,12 +431,26 @@ const HashDBMImpl = struct {
             }
             self.cyclic_magic = cm;
 
-            // Write FBP section (zeros).
-            var fbp_buf: [FBP_SECTION_SIZE]u8 = [_]u8{0} ** FBP_SECTION_SIZE;
-            const st_fbp = self.file.write(io, METADATA_SIZE, &fbp_buf);
+            // Write FBP section (zeros) — the 1008 bytes immediately before
+            // the record header section at the end of the reserved gap.
+            var fbp_buf: [FBP_SECTION_SIZE]u8 = @splat(0);
+            const st_fbp = self.file.write(io, rb - FBP_SECTION_SIZE - RECORD_HEADER_SECTION_SIZE, &fbp_buf);
             if (!st_fbp.isOk()) {
                 _ = self.file.close(io);
                 return st_fbp;
+            }
+
+            // Write the record header section ("TkrzwREC\n" + flags), used by
+            // official tkrzw to recover records if the main header is broken.
+            var rec_hdr: [RECORD_HEADER_SECTION_SIZE]u8 = @splat(0);
+            @memcpy(rec_hdr[0..9], RECORD_HEADER_MAGIC);
+            rec_hdr[9] = self.static_flags;
+            rec_hdr[10] = @intCast(self.offset_width);
+            rec_hdr[11] = @intCast(self.align_pow);
+            const st_rhdr = self.file.write(io, rb - RECORD_HEADER_SECTION_SIZE, &rec_hdr);
+            if (!st_rhdr.isOk()) {
+                _ = self.file.close(io);
+                return st_rhdr;
             }
 
             // Write bucket array (zeros) + padding to record_base.
@@ -521,7 +586,7 @@ const HashDBMImpl = struct {
     // Write a bucket value.
     fn writeBucket(self: *HashDBMImpl, io: std.Io, bucket_index: i64, raw_offset: i64) !void {
         const off = bucketFileOffset(bucket_index, self.offset_width);
-        var buf: [8]u8 = [_]u8{0} ** 8;
+        var buf: [8]u8 = @splat(0);
         writeOffsetWidth(buf[0..@intCast(self.offset_width)], raw_offset, self.offset_width);
         const st = self.file.write(io, off, buf[0..@intCast(self.offset_width)]);
         if (!st.isOk()) return error.IOError;
@@ -539,7 +604,7 @@ const HashDBMImpl = struct {
 
     // Write child offset field in an existing record.
     fn writeChildOffset(self: *HashDBMImpl, io: std.Io, record_offset: i64, child_offset: i64) !void {
-        var buf: [8]u8 = [_]u8{0} ** 8;
+        var buf: [8]u8 = @splat(0);
         const raw = encodeOffset(child_offset, self.align_pow);
         writeOffsetWidth(buf[0..@intCast(self.offset_width)], raw, self.offset_width);
         const st = self.file.write(io, record_offset + 1, buf[0..@intCast(self.offset_width)]);
@@ -917,47 +982,46 @@ const HashDBMImpl = struct {
         self.mutex.lockSharedUncancelable(io);
         defer self.mutex.unlockShared(io);
 
+        // Mirrors official HashDBMImpl::ProcessFirst: buckets ascending;
+        // within a bucket, the first live record in chain order.
+        var dead_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (dead_keys.items) |k| self.allocator.free(k);
+            dead_keys.deinit(self.allocator);
+        }
+
         var bucket_index: i64 = 0;
         while (bucket_index < self.num_buckets) : (bucket_index += 1) {
-            const first_raw = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
+            const first_raw = self.readBucket(io, bucket_index) catch
+                return Status.init(.SYSTEM_ERROR);
             if (first_raw == 0) continue;
-            var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
-            while (cur_offset != 0) {
-                var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                defer rec.deinit();
-                if (rec.header.op_type == RECORD_MAGIC_VOID) {
-                    cur_offset = rec.header.child_offset;
+            var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
+            while (cur != 0) {
+                const hdr = self.readRecordHeaderFromFile(io, cur) catch
+                    return Status.init(.SYSTEM_ERROR);
+                const child = decodeChildOffset(hdr.child_offset, self.align_pow);
+                const key = self.readRecordKey(self.allocator, io, cur) catch
+                    return Status.init(.SYSTEM_ERROR);
+                defer self.allocator.free(key);
+                if (listContains(dead_keys.items, key)) {
+                    cur = child;
                     continue;
                 }
-                // Found a live record.
-                if (!writable) {
-                    _ = proc.processFull(rec.key, rec.value);
-                    return Status.init(.SUCCESS);
-                }
-                const action = proc.processFull(rec.key, rec.value);
-                switch (action) {
-                    .noop => return Status.init(.SUCCESS),
-                    .remove => {
-                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                        const raw_child = if (rec.header.child_offset == 0) @as(i64, 0) else encodeOffset(rec.header.child_offset, self.align_pow);
-                        self.writeBucket(io, bucket_index, raw_child) catch return Status.init(.SYSTEM_ERROR);
-                        _ = self.num_records.fetchSub(1, .monotonic);
-                        _ = self.eff_data_size.fetchAdd(-@as(i64, @intCast(rec.key.len + rec.value.len)), .monotonic);
-                        if (self.update_logger) |ul| _ = ul.writeRemove(rec.key);
-                        return Status.init(.SUCCESS);
+                switch (hdr.op_type) {
+                    RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
+                        return self.processImpl(io, key, proc, writable, bucket_index);
                     },
-                    .set => |new_v| {
-                        const new_off = self.appendRecord(io, RECORD_MAGIC_SET, rec.header.child_offset, rec.key, new_v, 0) catch
+                    RECORD_MAGIC_REMOVE => {
+                        const key_copy = self.allocator.dupe(u8, key) catch
                             return Status.init(.SYSTEM_ERROR);
-                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                        const raw_new = encodeOffset(new_off, self.align_pow);
-                        self.writeBucket(io, bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
-                        const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.value.len));
-                        _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
-                        if (self.update_logger) |ul| _ = ul.writeSet(rec.key, new_v);
-                        return Status.init(.SUCCESS);
+                        dead_keys.append(self.allocator, key_copy) catch {
+                            self.allocator.free(key_copy);
+                            return Status.init(.SYSTEM_ERROR);
+                        };
                     },
+                    else => {},
                 }
+                cur = child;
             }
         }
         return Status.init(.NOT_FOUND_ERROR);
@@ -972,76 +1036,87 @@ const HashDBMImpl = struct {
 
         _ = proc.processEmpty("");
 
+        // Mirrors official HashDBMImpl::ProcessEach. The read-only in-place
+        // fast path scans records sequentially from the record base in file
+        // order; the other paths walk buckets with per-batch sorted keys.
+        if (!writable and (self.static_flags & STATIC_FLAG_UPDATE_IN_PLACE) != 0) {
+            const end_offset = self.file.getSizeSimple();
+            var offset: i64 = self.record_base;
+            while (offset < end_offset) {
+                const hdr = self.readRecordHeaderFromFile(io, offset) catch
+                    return Status.init(.SYSTEM_ERROR);
+                if (hdr.op_type == RECORD_MAGIC_SET or hdr.op_type == RECORD_MAGIC_ADD) {
+                    var rec = self.readFullRecord(self.allocator, io, offset) catch
+                        return Status.init(.SYSTEM_ERROR);
+                    defer rec.deinit();
+                    _ = proc.processFull(rec.key, rec.value);
+                }
+                offset += @intCast(hdr.header_size + hdr.key_size + hdr.value_size + hdr.padding_size);
+            }
+            _ = proc.processEmpty("");
+            return Status.init(.SUCCESS);
+        }
+
         var bucket_index: i64 = 0;
         while (bucket_index < self.num_buckets) : (bucket_index += 1) {
-            const first_raw = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
+            const first_raw = self.readBucket(io, bucket_index) catch
+                return Status.init(.SYSTEM_ERROR);
             if (first_raw == 0) continue;
-            var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
-            while (cur_offset != 0) {
-                var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                defer rec.deinit();
-                const next_offset = rec.header.child_offset;
-                if (rec.header.op_type == RECORD_MAGIC_VOID) {
-                    cur_offset = next_offset;
+
+            var dead_keys: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (dead_keys.items) |k| self.allocator.free(k);
+                dead_keys.deinit(self.allocator);
+            }
+            var keys: std.ArrayListUnmanaged([]u8) = .empty;
+            defer {
+                for (keys.items) |k| self.allocator.free(k);
+                keys.deinit(self.allocator);
+            }
+
+            var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
+            while (cur != 0) {
+                const hdr = self.readRecordHeaderFromFile(io, cur) catch
+                    return Status.init(.SYSTEM_ERROR);
+                const child = decodeChildOffset(hdr.child_offset, self.align_pow);
+                const key = self.readRecordKey(self.allocator, io, cur) catch
+                    return Status.init(.SYSTEM_ERROR);
+                if (listContains(keys.items, key) or listContains(dead_keys.items, key)) {
+                    self.allocator.free(key);
+                    cur = child;
                     continue;
                 }
-                if (!writable) {
-                    _ = proc.processFull(rec.key, rec.value);
-                    cur_offset = next_offset;
-                    continue;
-                }
-                const action = proc.processFull(rec.key, rec.value);
-                switch (action) {
-                    .noop => {},
-                    .remove => {
-                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                        // We need to unlink — scan chain for prev.
-                        const br = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
-                        const head_off: i64 = if (br == 0) 0 else decodeChildOffset(br, self.align_pow);
-                        var prev_off2: i64 = 0;
-                        var scan_off = head_off;
-                        while (scan_off != 0 and scan_off != cur_offset) {
-                            var scan_rec = self.readFullRecord(self.allocator, io, scan_off) catch break;
-                            defer scan_rec.deinit();
-                            prev_off2 = scan_off;
-                            scan_off = scan_rec.header.child_offset;
+                switch (hdr.op_type) {
+                    RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
+                        if (!writable) {
+                            var rec = self.readFullRecord(self.allocator, io, cur) catch
+                                return Status.init(.SYSTEM_ERROR);
+                            defer rec.deinit();
+                            _ = proc.processFull(rec.key, rec.value);
                         }
-                        if (prev_off2 == 0) {
-                            const raw_c = if (next_offset == 0) @as(i64, 0) else encodeOffset(next_offset, self.align_pow);
-                            self.writeBucket(io, bucket_index, raw_c) catch return Status.init(.SYSTEM_ERROR);
-                        } else {
-                            self.writeChildOffset(io, prev_off2, next_offset) catch return Status.init(.SYSTEM_ERROR);
-                        }
-                        _ = self.num_records.fetchSub(1, .monotonic);
-                        _ = self.eff_data_size.fetchAdd(-@as(i64, @intCast(rec.key.len + rec.value.len)), .monotonic);
-                        if (self.update_logger) |ul| _ = ul.writeRemove(rec.key);
-                    },
-                    .set => |new_v| {
-                        const new_off = self.appendRecord(io, RECORD_MAGIC_SET, next_offset, rec.key, new_v, 0) catch
+                        keys.append(self.allocator, key) catch {
+                            self.allocator.free(key);
                             return Status.init(.SYSTEM_ERROR);
-                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                        const br = self.readBucket(io, bucket_index) catch return Status.init(.SYSTEM_ERROR);
-                        const head_off: i64 = if (br == 0) 0 else decodeChildOffset(br, self.align_pow);
-                        var prev_off2: i64 = 0;
-                        var scan_off = head_off;
-                        while (scan_off != 0 and scan_off != cur_offset) {
-                            var scan_rec = self.readFullRecord(self.allocator, io, scan_off) catch break;
-                            defer scan_rec.deinit();
-                            prev_off2 = scan_off;
-                            scan_off = scan_rec.header.child_offset;
-                        }
-                        if (prev_off2 == 0) {
-                            const raw_new = encodeOffset(new_off, self.align_pow);
-                            self.writeBucket(io, bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
-                        } else {
-                            self.writeChildOffset(io, prev_off2, new_off) catch return Status.init(.SYSTEM_ERROR);
-                        }
-                        const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.value.len));
-                        _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
-                        if (self.update_logger) |ul| _ = ul.writeSet(rec.key, new_v);
+                        };
                     },
+                    RECORD_MAGIC_REMOVE => {
+                        dead_keys.append(self.allocator, key) catch {
+                            self.allocator.free(key);
+                            return Status.init(.SYSTEM_ERROR);
+                        };
+                    },
+                    else => self.allocator.free(key),
                 }
-                cur_offset = next_offset;
+                cur = child;
+            }
+
+            if (writable and keys.items.len > 0) {
+                sortAndDedupeKeys(self.allocator, &keys) catch
+                    return Status.init(.SYSTEM_ERROR);
+                for (keys.items) |k| {
+                    const st = self.processImpl(io, k, proc, true, bucket_index);
+                    if (!st.isOk()) return st;
+                }
             }
         }
 
@@ -1202,185 +1277,183 @@ const HashDBMImpl = struct {
         return Status.init(.SUCCESS);
     }
 
-    // ---------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
     // Iterator helpers
-    // ---------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
 
-    // Advance iterator to the next live record.
-    fn advanceToLiveRecord(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) void {
-        while (iter.bucket_index < self.num_buckets) {
-            if (iter.record_offset == 0) {
-                // Need to start from bucket head.
-                const first_raw = self.readBucket(io, iter.bucket_index) catch {
-                    iter.bucket_index += 1;
-                    continue;
-                };
-                if (first_raw == 0) {
-                    iter.bucket_index += 1;
-                    continue;
-                }
-                iter.record_offset = decodeChildOffset(first_raw, self.align_pow);
-            }
+    // Read just the key bytes of the record at `offset` (no value body).
+    fn readRecordKey(self: *HashDBMImpl, allocator: std.mem.Allocator, io: std.Io, offset: i64) ![]u8 {
+        const hdr = try self.readRecordHeaderFromFile(io, offset);
+        const key = try allocator.alloc(u8, @intCast(hdr.key_size));
+        errdefer allocator.free(key);
+        const st = self.file.read(io, offset + @as(i64, @intCast(hdr.header_size)), key);
+        if (!st.isOk()) return error.IOError;
+        return key;
+    }
 
-            // Scan from current record_offset for a live record.
-            while (iter.record_offset != 0) {
-                const hdr = self.readRecordHeaderFromFile(io, iter.record_offset) catch {
-                    iter.bucket_index = self.num_buckets; // invalidate
-                    return;
-                };
-                const child = decodeChildOffset(hdr.child_offset, self.align_pow);
-                if (hdr.op_type == RECORD_MAGIC_VOID) {
-                    iter.record_offset = child;
-                    continue;
-                }
-                // Live record found — stop here.
-                return;
-            }
-
-            // Exhausted this bucket.
-            iter.record_offset = 0;
-            iter.bucket_index += 1;
+    // Mirrors official HashDBMImpl::ReadNextBucketRecords: load the next
+    // non-empty bucket's live keys into a sorted, deduplicated batch.
+    // Records with the REMOVE operation suppress later same-key records,
+    // as in the official dead_keys set.
+    fn readNextBucketRecords(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
+        var dead_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (dead_keys.items) |k| self.allocator.free(k);
+            dead_keys.deinit(self.allocator);
         }
+
+        while (true) {
+            const b = iter.bucket_index;
+            if (b < 0 or b >= self.num_buckets) break;
+            iter.bucket_index = b + 1;
+
+            const first_raw = self.readBucket(io, b) catch return Status.init(.SYSTEM_ERROR);
+            if (first_raw == 0) continue;
+
+            var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
+            while (cur != 0) {
+                const hdr = self.readRecordHeaderFromFile(io, cur) catch
+                    return Status.init(.SYSTEM_ERROR);
+                const child = decodeChildOffset(hdr.child_offset, self.align_pow);
+                const key = self.readRecordKey(self.allocator, io, cur) catch
+                    return Status.init(.SYSTEM_ERROR);
+                if (listContains(dead_keys.items, key)) {
+                    self.allocator.free(key);
+                    cur = child;
+                    continue;
+                }
+                switch (hdr.op_type) {
+                    RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
+                        iter.keys.append(self.allocator, key) catch {
+                            self.allocator.free(key);
+                            return Status.init(.SYSTEM_ERROR);
+                        };
+                    },
+                    RECORD_MAGIC_REMOVE => {
+                        dead_keys.append(self.allocator, key) catch {
+                            self.allocator.free(key);
+                            return Status.init(.SYSTEM_ERROR);
+                        };
+                    },
+                    else => self.allocator.free(key),
+                }
+                cur = child;
+            }
+
+            if (iter.keys.items.len > 0) {
+                sortAndDedupeKeys(self.allocator, &iter.keys) catch
+                    return Status.init(.SYSTEM_ERROR);
+                return Status.init(.SUCCESS);
+            }
+        }
+
+        iter.bucket_index = -1;
+        return Status.init(.NOT_FOUND_ERROR);
+    }
+
+    // Mirrors official HashDBMIteratorImpl::ReadKeys: ensure the batch has
+    // a current key, loading the next bucket when the batch is empty.
+    fn readKeys(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
+        if (iter.bucket_index < 0) {
+            return Status.init(.NOT_FOUND_ERROR);
+        }
+        if (iter.keys.items.len == 0) {
+            const st = self.readNextBucketRecords(io, iter);
+            if (!st.isOk()) return st;
+            if (iter.keys.items.len == 0) {
+                return Status.init(.NOT_FOUND_ERROR);
+            }
+        }
+        return Status.init(.SUCCESS);
     }
 
     fn iterFirst(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
+        _ = io;
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
         iter.bucket_index = 0;
-        iter.record_offset = 0;
-        self.advanceToLiveRecord(io, iter);
+        iter.clearKeys();
         return Status.init(.SUCCESS);
     }
 
     fn iterJump(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl, key: []const u8) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
 
-        const bucket_idx: i64 = @intCast(hash_util.primaryHash(key, @intCast(self.num_buckets)));
-        const first_raw = self.readBucket(io, bucket_idx) catch return Status.init(.SYSTEM_ERROR);
-        if (first_raw == 0) {
-            iter.bucket_index = self.num_buckets; // not found
-            iter.record_offset = 0;
+        iter.bucket_index = -1;
+        iter.clearKeys();
+        iter.bucket_index = @intCast(hash_util.primaryHash(key, @intCast(self.num_buckets)));
+
+        const st = self.readNextBucketRecords(io, iter);
+        if (!st.isOk()) return st;
+
+        // The batch is sorted; drop everything before the found key.
+        var lo: usize = 0;
+        var hi: usize = iter.keys.items.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (std.mem.lessThan(u8, iter.keys.items[mid], key)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= iter.keys.items.len or !std.mem.eql(u8, iter.keys.items[lo], key)) {
+            iter.bucket_index = -1;
+            iter.clearKeys();
             return Status.init(.NOT_FOUND_ERROR);
         }
-
-        var cur_offset: i64 = decodeChildOffset(first_raw, self.align_pow);
-        while (cur_offset != 0) {
-            var rec = self.readFullRecord(self.allocator, io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-            defer rec.deinit();
-            const next_off = rec.header.child_offset;
-            if (rec.header.op_type != RECORD_MAGIC_VOID and std.mem.eql(u8, rec.key, key)) {
-                iter.bucket_index = bucket_idx;
-                iter.record_offset = cur_offset;
-                return Status.init(.SUCCESS);
-            }
-            cur_offset = next_off;
-        }
-
-        iter.bucket_index = self.num_buckets;
-        iter.record_offset = 0;
-        return Status.init(.NOT_FOUND_ERROR);
+        for (iter.keys.items[0..lo]) |k| iter.allocator.free(k);
+        std.mem.copyForwards([]u8, iter.keys.items[0 .. iter.keys.items.len - lo], iter.keys.items[lo..]);
+        iter.keys.shrinkRetainingCapacity(iter.keys.items.len - lo);
+        return Status.init(.SUCCESS);
     }
 
     fn iterNext(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        if (iter.bucket_index >= self.num_buckets) {
-            return Status.init(.NOT_FOUND_ERROR);
-        }
-
-        // Advance past current record.
-        if (iter.record_offset != 0) {
-            const hdr = self.readRecordHeaderFromFile(io, iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
-            const child = decodeChildOffset(hdr.child_offset, self.align_pow);
-            iter.record_offset = child;
-        }
-
-        if (iter.record_offset == 0) {
-            iter.bucket_index += 1;
-        }
-
-        self.advanceToLiveRecord(io, iter);
-        if (iter.bucket_index >= self.num_buckets) {
-            return Status.init(.NOT_FOUND_ERROR);
-        }
+        const st = self.readKeys(io, iter);
+        if (!st.isOk()) return st;
+        // Consume the current key; the next one becomes current.
+        iter.allocator.free(iter.keys.items[0]);
+        _ = iter.keys.orderedRemove(0);
         return Status.init(.SUCCESS);
     }
 
     fn iterProcess(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl, proc: anytype, writable: bool) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        if (iter.bucket_index >= self.num_buckets or iter.record_offset == 0) {
-            return Status.init(.NOT_FOUND_ERROR);
-        }
         if (writable and !self.writable) return Status.initMsg(.PRECONDITION_ERROR, "not writable");
 
-        var rec = self.readFullRecord(self.allocator, io, iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
-        defer rec.deinit();
+        const st = self.readKeys(io, iter);
+        if (!st.isOk()) return st;
+        const first_key = iter.keys.items[0];
+        const bucket_index: i64 = @intCast(hash_util.primaryHash(first_key, @intCast(self.num_buckets)));
 
-        if (!writable) {
-            _ = proc.processFull(rec.key, rec.value);
-            return Status.init(.SUCCESS);
-        }
+        // Wrap the user proc to observe whether the record was removed,
+        // mirroring the official ProcWrapper.
+        const Wrapper = struct {
+            inner: @TypeOf(proc),
+            removed: bool = false,
+            fn processFull(w: *@This(), key: []const u8, value: []const u8) RecordAction {
+                const action = w.inner.processFull(key, value);
+                if (action == .remove) w.removed = true;
+                return action;
+            }
+            fn processEmpty(w: *@This(), key: []const u8) RecordAction {
+                return w.inner.processEmpty(key);
+            }
+        };
+        var wrapper = Wrapper{ .inner = proc };
 
-        const cur_offset = iter.record_offset;
-        const action = proc.processFull(rec.key, rec.value);
-        switch (action) {
-            .noop => return Status.init(.SUCCESS),
-            .remove => {
-                self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                const child = rec.header.child_offset;
-                const first_raw = self.readBucket(io, iter.bucket_index) catch return Status.init(.SYSTEM_ERROR);
-                const head_off: i64 = if (first_raw == 0) 0 else decodeChildOffset(first_raw, self.align_pow);
-                var prev_off: i64 = 0;
-                var scan = head_off;
-                while (scan != 0 and scan != cur_offset) {
-                    var scan_rec = self.readFullRecord(self.allocator, io, scan) catch break;
-                    defer scan_rec.deinit();
-                    prev_off = scan;
-                    scan = scan_rec.header.child_offset;
-                }
-                if (prev_off == 0) {
-                    const raw_c = if (child == 0) @as(i64, 0) else encodeOffset(child, self.align_pow);
-                    self.writeBucket(io, iter.bucket_index, raw_c) catch return Status.init(.SYSTEM_ERROR);
-                } else {
-                    self.writeChildOffset(io, prev_off, child) catch return Status.init(.SYSTEM_ERROR);
-                }
-                _ = self.num_records.fetchSub(1, .monotonic);
-                _ = self.eff_data_size.fetchAdd(-@as(i64, @intCast(rec.key.len + rec.value.len)), .monotonic);
-                if (self.update_logger) |ul| _ = ul.writeRemove(rec.key);
-                // Advance iterator past deleted record.
-                iter.record_offset = child;
-                if (child == 0) {
-                    iter.bucket_index += 1;
-                    self.advanceToLiveRecord(io, iter);
-                }
-                return Status.init(.SUCCESS);
-            },
-            .set => |new_v| {
-                const child = rec.header.child_offset;
-                const new_off = self.appendRecord(io, RECORD_MAGIC_SET, child, rec.key, new_v, 0) catch
-                    return Status.init(.SYSTEM_ERROR);
-                self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
-                const first_raw2 = self.readBucket(io, iter.bucket_index) catch return Status.init(.SYSTEM_ERROR);
-                const head_off2: i64 = if (first_raw2 == 0) 0 else decodeChildOffset(first_raw2, self.align_pow);
-                var prev_off: i64 = 0;
-                var scan = head_off2;
-                while (scan != 0 and scan != cur_offset) {
-                    var scan_rec = self.readFullRecord(self.allocator, io, scan) catch break;
-                    defer scan_rec.deinit();
-                    prev_off = scan;
-                    scan = scan_rec.header.child_offset;
-                }
-                if (prev_off == 0) {
-                    const raw_new = encodeOffset(new_off, self.align_pow);
-                    self.writeBucket(io, iter.bucket_index, raw_new) catch return Status.init(.SYSTEM_ERROR);
-                } else {
-                    self.writeChildOffset(io, prev_off, new_off) catch return Status.init(.SYSTEM_ERROR);
-                }
-                const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.value.len));
-                _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
-                if (self.update_logger) |ul| _ = ul.writeSet(rec.key, new_v);
-                iter.record_offset = new_off;
-                return Status.init(.SUCCESS);
-            },
+        const pst = self.processImpl(io, first_key, &wrapper, writable, bucket_index);
+        if (!pst.isOk()) return pst;
+
+        if (wrapper.removed) {
+            // The current record was removed; drop its key from the batch
+            // so the next record becomes current.
+            if (iter.keys.items.len > 0 and std.mem.eql(u8, iter.keys.items[0], first_key)) {
+                iter.allocator.free(iter.keys.items[0]);
+                _ = iter.keys.orderedRemove(0);
+            }
         }
+        return Status.init(.SUCCESS);
     }
 
     fn iterGet(
@@ -1391,22 +1464,26 @@ const HashDBMImpl = struct {
         value_out: ?*std.ArrayList(u8),
     ) Status {
         if (!self.open) return Status.initMsg(.PRECONDITION_ERROR, "not opened");
-        if (iter.bucket_index >= self.num_buckets or iter.record_offset == 0) {
-            return Status.init(.NOT_FOUND_ERROR);
-        }
 
-        var rec = self.readFullRecord(self.allocator, io, iter.record_offset) catch return Status.init(.SYSTEM_ERROR);
-        defer rec.deinit();
+        const st = self.readKeys(io, iter);
+        if (!st.isOk()) return st;
+        const first_key = iter.keys.items[0];
 
         if (key_out) |ko| {
             ko.clearRetainingCapacity();
-            ko.appendSlice(self.allocator, rec.key) catch return Status.init(.SYSTEM_ERROR);
+            ko.appendSlice(self.allocator, first_key) catch return Status.init(.SYSTEM_ERROR);
         }
-        if (value_out) |vo| {
-            vo.clearRetainingCapacity();
-            vo.appendSlice(self.allocator, rec.value) catch return Status.init(.SYSTEM_ERROR);
-        }
-        return Status.init(.SUCCESS);
+
+        var status = Status.init(.SUCCESS);
+        var proc = ProcessorGet{
+            .status = &status,
+            .value = value_out,
+            .allocator = self.allocator,
+        };
+        const bucket_index: i64 = @intCast(hash_util.primaryHash(first_key, @intCast(self.num_buckets)));
+        const pst = self.processImpl(io, first_key, &proc, false, bucket_index);
+        if (!pst.isOk()) return pst;
+        return status;
     }
 };
 
@@ -1544,7 +1621,7 @@ const ProcessorIncrement = struct {
     delta: i64,
     current_out: ?*i64,
     initial: i64,
-    result_buf: [8]u8 = [_]u8{0} ** 8,
+    result_buf: [8]u8 = @splat(0),
     result_slice: []const u8 = &[_]u8{},
 
     pub fn processFull(self: *ProcessorIncrement, key: []const u8, value: []const u8) RecordAction {
@@ -1651,6 +1728,13 @@ pub const HashDBM = struct {
         if (params.num_buckets > 0) self.impl.num_buckets = params.num_buckets;
         if (params.align_pow >= 0) self.impl.align_pow = params.align_pow;
         if (params.offset_width > 0) self.impl.offset_width = params.offset_width;
+        // The update mode only shapes NEW files; opening an existing file
+        // reloads static_flags from its header. Official tkrzw defaults to
+        // in-place and rejects static_flags == 0 on open.
+        self.impl.static_flags = switch (params.update_mode) {
+            .appending => STATIC_FLAG_UPDATE_APPENDING,
+            .in_place, .default => STATIC_FLAG_UPDATE_IN_PLACE,
+        };
         return self.impl.openImpl(io, path, writable, options);
     }
 
@@ -2166,6 +2250,8 @@ pub const HashDBM = struct {
                     }
                 }
             }
+            self.impl.clearKeys();
+            self.impl.keys.deinit(self.impl.allocator);
             self.allocator.destroy(self.impl);
         }
 
@@ -2324,8 +2410,8 @@ pub const HashDBM = struct {
         const iter_impl = try self.allocator.create(HashDBMIteratorImpl);
         iter_impl.* = HashDBMIteratorImpl{
             .dbm = self.impl,
-            .bucket_index = self.impl.num_buckets, // exhausted until first(io) called
-            .record_offset = 0,
+            .bucket_index = -1, // exhausted until first(io) called
+            .keys = .empty,
             .allocator = self.allocator,
         };
         self.impl.mutex.lockUncancelable(io);
@@ -2594,12 +2680,12 @@ pub const HashDBM = struct {
         offset_width_out.* = buf[13];
         align_pow_out.* = buf[14];
         closure_flags_out.* = buf[15];
-        num_buckets_out.* = std.mem.readInt(i64, buf[16..24], .little);
-        num_records_out.* = std.mem.readInt(i64, buf[24..32], .little);
-        eff_data_size_out.* = std.mem.readInt(i64, buf[32..40], .little);
-        file_size_out.* = std.mem.readInt(i64, buf[40..48], .little);
-        timestamp_out.* = std.mem.readInt(i64, buf[48..56], .little);
-        db_type_out.* = std.mem.readInt(i16, buf[56..58], .little);
+        num_buckets_out.* = std.mem.readInt(i64, buf[16..24], .big);
+        num_records_out.* = std.mem.readInt(i64, buf[24..32], .big);
+        eff_data_size_out.* = std.mem.readInt(i64, buf[32..40], .big);
+        file_size_out.* = std.mem.readInt(i64, buf[40..48], .big);
+        timestamp_out.* = std.mem.readInt(i64, buf[48..56], .big);
+        db_type_out.* = std.mem.readInt(i16, buf[56..58], .big);
         const copy_len = @min(opaque_out.len, OPAQUE_METADATA_SIZE);
         @memcpy(opaque_out[0..copy_len], buf[62..62 + copy_len]);
         const cm_back: i32 = buf[127];
@@ -2627,8 +2713,8 @@ pub const HashDBM = struct {
         const sf: i32 = buf[12];
         const ow: i32 = buf[13];
         const ap: i32 = buf[14];
-        const nb = std.mem.readInt(i64, buf[16..24], .little);
-        const fsz = std.mem.readInt(i64, buf[40..48], .little);
+        const nb = std.mem.readInt(i64, buf[16..24], .big);
+        const fsz = std.mem.readInt(i64, buf[40..48], .big);
         static_flags_out.* = sf;
         offset_width_out.* = ow;
         align_pow_out.* = ap;
@@ -2986,7 +3072,7 @@ pub const HashDBM = struct {
         var fsz: i64 = 0;
         var ts: i64 = 0;
         var db_type: i32 = 0;
-        var opaque_buf: [OPAQUE_METADATA_SIZE]u8 = [_]u8{0} ** OPAQUE_METADATA_SIZE;
+        var opaque_buf: [OPAQUE_METADATA_SIZE]u8 = @splat(0);
         _ = HashDBM.readMetadata(io, old_file, &cm, &pmaj, &pmin, &src_sf_flags, &src_ow, &src_ap,
             &cf, &nb, &nr, &eds, &fsz, &ts, &db_type, &opaque_buf);
 

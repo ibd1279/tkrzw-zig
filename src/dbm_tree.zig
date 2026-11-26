@@ -599,7 +599,7 @@ const TreeDBMImpl = struct {
     }
 
     fn saveMetadata(self: *TreeDBMImpl) Status {
-        var meta: [64]u8 = [_]u8{0} ** 64;
+        var meta: [64]u8 = @splat(0);
         @memcpy(meta[0..3], META_MAGIC);
         meta[3] = 0;
         writeFixNum(meta[META_OFFSET_NUM_RECORDS..], self.num_records.load(.acquire), 6);
@@ -611,7 +611,12 @@ const TreeDBMImpl = struct {
         writeFixNum(meta[META_OFFSET_NUM_INNER_NODES..], self.num_inner_nodes, 6);
         writeFixNum(meta[META_OFFSET_MAX_PAGE_SIZE..], self.max_page_size, 3);
         writeFixNum(meta[META_OFFSET_MAX_BRANCHES..], self.max_branches, 3);
-        meta[META_OFFSET_TREE_LEVEL] = @intCast(self.tree_level);
+        // On-disk convention (official tkrzw): the tree level is the total
+        // height including the leaf level, and must be >= 1 — the official
+        // reader rejects 0 as "invalid tree level". Internally, tree_level
+        // counts inner-node layers above the leaves (0 = root-is-leaf), so
+        // translate +1 on the way out.
+        meta[META_OFFSET_TREE_LEVEL] = @intCast(@max(1, self.tree_level + 1));
         meta[META_OFFSET_KEY_COMPARATOR] = keyComparatorCode(self.key_comparator);
         const opaque_src = self.mini_opaque.items;
         const copy_len = @min(opaque_src.len, OPAQUE_METADATA_SIZE);
@@ -635,7 +640,10 @@ const TreeDBMImpl = struct {
             self.max_page_size = @intCast(readFixNum(meta[META_OFFSET_MAX_PAGE_SIZE..], 3));
         if (self.max_branches == 0)
             self.max_branches = @intCast(readFixNum(meta[META_OFFSET_MAX_BRANCHES..], 3));
-        self.tree_level = @intCast(meta[META_OFFSET_TREE_LEVEL]);
+        // Inverse of the +1 translation in saveMetadata: the on-disk level
+        // includes the leaf level, the internal one does not.
+        const on_disk_level = meta[META_OFFSET_TREE_LEVEL];
+        self.tree_level = if (on_disk_level > 1) @as(i32, on_disk_level) - 1 else 0;
         const kc_code = meta[META_OFFSET_KEY_COMPARATOR];
         if (kc_code != KC_CUSTOM) {
             if (keyComparatorFromCode(kc_code)) |kc| self.key_comparator = kc;
@@ -2490,7 +2498,7 @@ pub const TreeDBM = struct {
             delta: i64,
             current_out: ?*i64,
             initial: i64,
-            result_buf: [8]u8 = [_]u8{0} ** 8,
+            result_buf: [8]u8 = @splat(0),
             result_slice: []const u8 = &[_]u8{},
 
             pub fn processFull(p: *@This(), _: []const u8, value: []const u8) RecordAction {
@@ -2852,8 +2860,8 @@ pub const TreeDBM = struct {
         var max_branches: i32 = DEFAULT_MAX_BRANCHES;
         var tree_level: i32 = 0;
         var kc_type: i32 = 0;
-        var mini_op: [OPAQUE_METADATA_SIZE]u8 = [_]u8{0} ** OPAQUE_METADATA_SIZE;
-        var opaque_buf: [dbm_hash.OPAQUE_METADATA_SIZE]u8 = [_]u8{0} ** dbm_hash.OPAQUE_METADATA_SIZE;
+        var mini_op: [OPAQUE_METADATA_SIZE]u8 = @splat(0);
+        var opaque_buf: [dbm_hash.OPAQUE_METADATA_SIZE]u8 = @splat(0);
         @memcpy(opaque_buf[0..@min(src_opaque.len, dbm_hash.OPAQUE_METADATA_SIZE)], src_opaque[0..@min(src_opaque.len, dbm_hash.OPAQUE_METADATA_SIZE)]);
         _ = TreeDBM.parseMetadata(&opaque_buf, &nr, &eds, &root_id, &first_id, &last_id,
             &nleaf, &ninner, &max_page, &max_branches, &tree_level, &kc_type, &mini_op);
@@ -3567,7 +3575,7 @@ test "TreeDBM: large values trigger splits" {
     var db = try openTestDB(tmp, .{ .max_page_size = 256, .max_branches = 4 });
     defer db.deinit(std.testing.io);
 
-    const long_val = "x" ** 64;
+    const long_val: *const [64]u8 = &@as([64]u8, @splat('x'));
     var key_buf: [16]u8 = undefined;
     for (0..30) |i| {
         const k = std.fmt.bufPrint(&key_buf, "key{d:03}", .{i}) catch unreachable;

@@ -896,13 +896,24 @@ const CacheDBMIteratorImpl = struct {
     }
 
     fn first(self: *CacheDBMIteratorImpl, io: std.Io) !Status {
-        _ = io;
+        if (self.dbm == null) {
+            return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
+        }
+        const dbm = self.dbm.?;
         self.slot_index.store(-1, .release);
         for (self.keys.items) |key| {
             self.allocator.free(key);
         }
         self.keys.clearRetainingCapacity();
-        return Status.init(.SUCCESS);
+        // Load the first non-empty slot batch, like jump() does, so that a
+        // get() immediately after first() sees the first record. Matching
+        // C++ Iterator::First(), positioning on an empty database still
+        // reports SUCCESS; get() surfaces NOT_FOUND.
+        const st = try dbm.readNextBucketRecords(io, self);
+        if (st.code == .NOT_FOUND_ERROR) {
+            return Status.init(.SUCCESS);
+        }
+        return st;
     }
 
     fn jump(self: *CacheDBMIteratorImpl, io: std.Io, key: []const u8) !Status {
@@ -1737,6 +1748,15 @@ pub const CacheDBM = struct {
         }
 
         pub fn get(self: *Cursor, io: std.Io, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
+            // Load the current key batch lazily, exactly like process() does:
+            // when the previous batch was consumed, readKeys() fetches the
+            // next non-empty slot's records. Without this, get() reports
+            // NOT_FOUND as soon as the first batch runs out, even though
+            // more records remain in later slots.
+            const load_st = self.impl.readKeys(io) catch return Status.init(.SYSTEM_ERROR);
+            if (!load_st.isOk()) {
+                return load_st;
+            }
             if (self.impl.keys.items.len == 0) {
                 return Status.init(.NOT_FOUND_ERROR);
             }

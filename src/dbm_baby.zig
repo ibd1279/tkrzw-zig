@@ -752,7 +752,7 @@ const BabyDBMImpl = struct {
         leaf: *BabyLeafNode,
         node_key: []const u8,
     ) !void {
-        var hist: [MAX_TREE_DEPTH]?*BabyInnerNode = [_]?*BabyInnerNode{null} ** MAX_TREE_DEPTH;
+        var hist: [MAX_TREE_DEPTH]?*BabyInnerNode = @splat(null);
         const hist_size = self.buildHistory(node_key, &hist);
 
         // Create new leaf with records from midpoint onward.
@@ -876,7 +876,7 @@ const BabyDBMImpl = struct {
         leaf: *BabyLeafNode,
         node_key: []const u8,
     ) !void {
-        var hist: [MAX_TREE_DEPTH]?*BabyInnerNode = [_]?*BabyInnerNode{null} ** MAX_TREE_DEPTH;
+        var hist: [MAX_TREE_DEPTH]?*BabyInnerNode = @splat(null);
         var hist_size = self.buildHistory(node_key, &hist);
 
         if (hist_size == 0) {
@@ -2035,6 +2035,9 @@ const BabyDBMIteratorImpl = struct {
     key_buf: [ITER_BUFFER_SIZE]u8,
     key_heap: ?[]u8,
     key_size: usize,
+    /// True when the iterator is positioned on a record. Empty keys are
+    /// legal (key_size == 0), so key_size alone cannot mark "no position".
+    positioned: bool = false,
     allocator: std.mem.Allocator,
 };
 
@@ -2097,6 +2100,7 @@ fn clearPosition(self: *BabyDBMIteratorImpl) void {
     self.key_heap = null;
     self.leaf_node = null;
     self.key_size = 0;
+    self.positioned = false;
 }
 
 /// Set position with a given key, using stack buffer if <= 128 bytes, heap otherwise.
@@ -2114,11 +2118,12 @@ fn setPositionWithKey(self: *BabyDBMIteratorImpl, leaf: *BabyLeafNode, key: []co
     }
 
     self.leaf_node = leaf;
+    self.positioned = true;
 }
 
 /// Get current key as a slice.
 fn getCurrentKey(self: *const BabyDBMIteratorImpl) ?[]const u8 {
-    if (self.key_size == 0) return null;
+    if (!self.positioned) return null;
     if (self.key_heap) |heap_key| {
         return heap_key[0..self.key_size];
     } else {
@@ -2316,7 +2321,7 @@ fn iterJumpUpper(self: *BabyDBMIteratorImpl, io: std.Io, key: []const u8, inclus
 /// after current_key. If key was deleted, upper_bound still finds the correct successor.
 /// Returns SUCCESS in all cases (cleared position when no successor exists).
 fn iterNext(self: *BabyDBMIteratorImpl, io: std.Io) Status {
-    if (self.dbm == null or self.key_size == 0) {
+    if (self.dbm == null or !self.positioned) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
@@ -2384,7 +2389,7 @@ fn iterNext(self: *BabyDBMIteratorImpl, io: std.Io) Status {
 /// > current_key, and records[idx-1] is the correct predecessor regardless.
 /// Returns SUCCESS in all cases (cleared position when no predecessor exists).
 fn iterPrevious(self: *BabyDBMIteratorImpl, io: std.Io) Status {
-    if (self.dbm == null or self.key_size == 0) {
+    if (self.dbm == null or !self.positioned) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
@@ -2447,7 +2452,7 @@ fn iterGet(
     key_out: ?*std.ArrayList(u8),
     value_out: ?*std.ArrayList(u8),
 ) Status {
-    if (self.leaf_node == null or self.key_size == 0) {
+    if (self.leaf_node == null or !self.positioned) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 
@@ -2494,7 +2499,7 @@ fn iterProcess(
     proc: *P,
     writable: bool,
 ) Status {
-    if (self.leaf_node == null or self.key_size == 0) {
+    if (self.leaf_node == null or !self.positioned) {
         return Status.init(.NOT_FOUND_ERROR);
     }
 

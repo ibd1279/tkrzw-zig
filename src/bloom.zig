@@ -32,7 +32,7 @@ const hash_util = @import("hash_util.zig");
 // ---------------------------------------------------------------------------
 
 const Block = extern struct {
-    bits: [64]u8 align(64) = [_]u8{0} ** 64,
+    bits: [64]u8 align(64) = @splat(0),
 
     pub fn set(self: *Block, idx: u10) void {
         self.bits[idx >> 3] |= @as(u8, 1) << @intCast(idx & 7);
@@ -690,7 +690,7 @@ test "BloomFilter: serialize deserialize idempotent" {
 test "BloomFilter: deserialize error cases" {
     // Wrong magic.
     {
-        var bad: [60]u8 = [_]u8{0} ** 60;
+        var bad: [60]u8 = @splat(0);
         std.mem.writeInt(u32, bad[0..4], 0xDEADBEEF, .little);
         std.mem.writeInt(u32, bad[4..8], 1, .little);
         var r = std.Io.Reader.fixed(&bad);
@@ -698,7 +698,7 @@ test "BloomFilter: deserialize error cases" {
     }
     // Wrong version.
     {
-        var bad: [60]u8 = [_]u8{0} ** 60;
+        var bad: [60]u8 = @splat(0);
         std.mem.writeInt(u32, bad[0..4], 0x424C4F4D, .little);
         std.mem.writeInt(u32, bad[4..8], 0xFF, .little);
         var r = std.Io.Reader.fixed(&bad);
@@ -714,7 +714,7 @@ test "BloomFilter: deserialize error cases" {
     }
     // num_layers > MAX_LAYERS → error.TooManyLayers (guards against malicious input).
     {
-        var bad: [60]u8 = [_]u8{0} ** 60;
+        var bad: [60]u8 = @splat(0);
         std.mem.writeInt(u32, bad[0..4], BloomFilter.MAGIC, .little);
         std.mem.writeInt(u32, bad[4..8], BloomFilter.VERSION, .little);
         std.mem.writeInt(u64, bad[8..16], 1000, .little); // expected_items

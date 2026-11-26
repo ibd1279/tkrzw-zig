@@ -485,7 +485,7 @@ test "FlatRecord.read uses body_buf for records larger than READ_BUFFER_SIZE" {
     try std.testing.expect(st.isOk());
 
     // Build a payload that exceeds READ_BUFFER_SIZE (48 bytes).
-    const large_payload = "A" ** 128;
+    const large_payload: *const [128]u8 = &@as([128]u8, @splat('A'));
 
     var wr = FlatRecord{
         .file = f,

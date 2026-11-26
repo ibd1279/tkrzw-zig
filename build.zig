@@ -62,4 +62,15 @@ pub fn build(b: *std.Build) void {
     c_api_test_mod.addImport("tkrzw_zig", mod);
     const c_api_tests = b.addTest(.{ .root_module = c_api_test_mod });
     test_step.dependOn(&b.addRunArtifact(c_api_tests).step);
+
+    // Golden-dataset compatibility tests: read files created by the official
+    // tkrzw library (tests/golden/, see generate_golden.py).
+    const golden_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/golden_compat_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    golden_test_mod.addImport("tkrzw_zig", mod);
+    const golden_tests = b.addTest(.{ .root_module = golden_test_mod });
+    test_step.dependOn(&b.addRunArtifact(golden_tests).step);
 }

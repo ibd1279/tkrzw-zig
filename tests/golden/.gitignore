@@ -1,0 +1,9 @@
+# Golden fixtures are generated locally with the official tkrzw bindings
+# (python3 tests/golden/generate_golden.py) and are deliberately not
+# committed — the generator is the source of truth.
+*.tkh
+*.tkt
+*.tks
+*.tkmt
+*.tkmb
+*.tkmc

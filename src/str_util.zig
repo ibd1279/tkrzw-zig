@@ -94,7 +94,7 @@ pub fn strToIntBigEndian(str: []const u8) u64 {
     const sz = @min(str.len, 8);
     // C++ ReadFixNum: memcpy into low address of uint64, then NetToHost64 >> shift.
     // Equivalent in big-endian terms: place input bytes at buf[8-sz..8].
-    var buf: [8]u8 = .{0} ** 8;
+    var buf: [8]u8 = @splat(0);
     @memcpy(buf[8 - sz .. 8], str[0..sz]);
     return std.mem.readInt(u64, &buf, .big);
 }
