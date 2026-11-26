@@ -102,7 +102,7 @@ def main():
 
     # Cross-check: read back with the official library and verify.
     expected_count = len(records)
-    for name, _ in files:
+    for name in files:
         path = os.path.join(HERE, name)
         dbm = tkrzw.DBM()
         if not dbm.Open(path, False).IsOK():

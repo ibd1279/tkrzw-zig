@@ -703,10 +703,30 @@ const SkipRecord = struct {
                         if (self.body_buf) |old_buf| {
                             self.allocator.free(old_buf);
                         }
+                        // When readBody wasn't needed, key_ptr/value_ptr point
+                        // into next_rec's INLINE buf, which the struct copy
+                        // carries into self.buf — capture the offsets now so
+                        // the slices can be repointed and don't dangle once
+                        // next_rec goes out of scope.
+                        const inline_ptrs = next_rec.body_buf == null and next_rec.key_ptr.len != 0;
+                        const key_off = if (inline_ptrs)
+                            @intFromPtr(next_rec.key_ptr.ptr) - @intFromPtr(&next_rec.buf)
+                        else
+                            0;
+                        const val_off = if (inline_ptrs and next_rec.value_ptr != null)
+                            @intFromPtr(next_rec.value_ptr.?.ptr) - @intFromPtr(&next_rec.buf)
+                        else
+                            0;
                         self.* = next_rec;
                         // Ownership of next_rec's heap buffers moved into self;
                         // clear them so the deferred deinit doesn't double-free.
                         next_rec.body_buf = null;
+                        if (inline_ptrs) {
+                            self.key_ptr = self.buf[key_off .. key_off + self.key_size];
+                            if (self.value_ptr != null) {
+                                self.value_ptr = self.buf[val_off .. val_off + self.value_size];
+                            }
+                        }
                         jumped = true;
                         break;
                     } else {
@@ -1128,20 +1148,28 @@ const RecordSorter = struct {
                 reader.deinit();
                 continue;
             }
+            // first_key borrows the reader's internal buffer, which the next
+            // read may refill or reallocate — own a copy BEFORE the value read.
+            const first_key_owned = try self.allocator.dupe(u8, first_key);
 
             // Read first value record
             var first_value: []const u8 = undefined;
             read_status = reader.read(io, &first_value, null);
             if (!read_status.isOk()) {
+                self.allocator.free(first_key_owned);
                 reader.deinit();
-                // first_key borrows the reader's buffer; nothing to free.
                 continue;
             }
+            const first_value_owned = self.allocator.dupe(u8, first_value) catch |err| {
+                self.allocator.free(first_key_owned);
+                reader.deinit();
+                return err;
+            };
 
             const slot = SortSlot{
                 .id = id_counter,
-                .key = try self.allocator.dupe(u8, first_key),
-                .value = try self.allocator.dupe(u8, first_value),
+                .key = first_key_owned,
+                .value = first_value_owned,
                 .flat_reader = try self.allocator.create(FlatRecordReader),
                 .flat_file = null,
                 .skip_record = null,
@@ -1155,8 +1183,8 @@ const RecordSorter = struct {
             try self.heap.push(self.allocator, &self.slots.items[self.slots.items.len - 1]);
 
             id_counter += 1;
-            // first_key / first_value borrow the reader's internal buffer
-            // (and were copied into the slot above) — do not free them.
+            // first_key_owned / first_value_owned moved into the slot;
+            // nothing left to free here.
         }
 
         self.finished = true;

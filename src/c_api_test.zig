@@ -10,6 +10,8 @@ const c_api = @import("c_api.zig");
 /// and append a NUL sentinel.
 fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
     const slice = try std.fmt.bufPrint(buf, fmt, args);
+    // bufPrint may exactly fill buf, leaving no room for the sentinel.
+    if (slice.len >= buf.len) return error.NoSpaceLeft;
     buf[slice.len] = 0;
     return buf[0..slice.len :0];
 }

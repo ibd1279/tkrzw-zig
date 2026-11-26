@@ -1,8 +1,11 @@
 // Zig 0.15.2 port of tkrzw HashDBM — file-backed hash table database.
 //
-// Architecture notes:
-//   - Records are stored in a flat file after a 128-byte header and 1008-byte FBP section.
-//   - Hash buckets are stored as an array of file offsets >> align_pow (LE integers).
+// Architecture notes (matches the official tkrzw on-disk layout):
+//   - File layout: [128-byte metadata][bucket array][reserved gap with
+//     1008-byte FBP section and 16-byte record header][record section,
+//     aligned to max(4096, 2^align_pow)].
+//   - Hash buckets are stored as an array of file offsets >> align_pow,
+//     fixed-width big-endian integers.
 //   - Records use a chained hash (linked list per bucket via child_offset field).
 //   - On write, new records are always appended (FBP is skipped — always append).
 //   - Overwritten records are voided in place; the chain is repaired.
@@ -431,6 +434,22 @@ const HashDBMImpl = struct {
             }
             self.cyclic_magic = cm;
 
+            // Zero the bucket array and the reserved gap first — the FBP and
+            // record-header sections below live inside that range and must be
+            // written AFTER the fill (official InitializeBuckets order).
+            const total_zero: usize = @intCast(rb - BUCKET_BASE_OFFSET);
+            const zero_buf = self.allocator.alloc(u8, total_zero) catch {
+                _ = self.file.close(io);
+                return Status.init(.SYSTEM_ERROR);
+            };
+            defer self.allocator.free(zero_buf);
+            @memset(zero_buf, 0);
+            const st_zero = self.file.write(io, BUCKET_BASE_OFFSET, zero_buf);
+            if (!st_zero.isOk()) {
+                _ = self.file.close(io);
+                return st_zero;
+            }
+
             // Write FBP section (zeros) — the 1008 bytes immediately before
             // the record header section at the end of the reserved gap.
             var fbp_buf: [FBP_SECTION_SIZE]u8 = @splat(0);
@@ -453,21 +472,6 @@ const HashDBMImpl = struct {
                 return st_rhdr;
             }
 
-            // Write bucket array (zeros) + padding to record_base.
-            const bucket_bytes: i64 = self.num_buckets * @as(i64, self.offset_width);
-            const total_zero: usize = @intCast(rb - BUCKET_BASE_OFFSET);
-            const zero_buf = self.allocator.alloc(u8, total_zero) catch {
-                _ = self.file.close(io);
-                return Status.init(.SYSTEM_ERROR);
-            };
-            defer self.allocator.free(zero_buf);
-            @memset(zero_buf, 0);
-            const st_zero = self.file.write(io, BUCKET_BASE_OFFSET, zero_buf);
-            if (!st_zero.isOk()) {
-                _ = self.file.close(io);
-                return st_zero;
-            }
-            _ = bucket_bytes;
             // Truncate to record_base to set logical_size so appends start at the right offset.
             const st_trunc_init = self.file.truncate(io, rb);
             if (!st_trunc_init.isOk()) {
@@ -992,37 +996,65 @@ const HashDBMImpl = struct {
 
         var bucket_index: i64 = 0;
         while (bucket_index < self.num_buckets) : (bucket_index += 1) {
-            const first_raw = self.readBucket(io, bucket_index) catch
-                return Status.init(.SYSTEM_ERROR);
-            if (first_raw == 0) continue;
-            var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
-            while (cur != 0) {
-                const hdr = self.readRecordHeaderFromFile(io, cur) catch
-                    return Status.init(.SYSTEM_ERROR);
-                const child = decodeChildOffset(hdr.child_offset, self.align_pow);
-                const key = self.readRecordKey(self.allocator, io, cur) catch
-                    return Status.init(.SYSTEM_ERROR);
-                defer self.allocator.free(key);
-                if (listContains(dead_keys.items, key)) {
-                    cur = child;
-                    continue;
-                }
-                switch (hdr.op_type) {
-                    RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
-                        return self.processImpl(io, key, proc, writable, bucket_index);
-                    },
-                    RECORD_MAGIC_REMOVE => {
-                        const key_copy = self.allocator.dupe(u8, key) catch
-                            return Status.init(.SYSTEM_ERROR);
-                        dead_keys.append(self.allocator, key_copy) catch {
-                            self.allocator.free(key_copy);
-                            return Status.init(.SYSTEM_ERROR);
-                        };
-                    },
-                    else => {},
-                }
-                cur = child;
+            // Per-bucket record lock, mirroring the official ScopedHashLock:
+            // exclusive for writable processing, shared for read-only, held
+            // across the chain walk and the ProcessImpl call.
+            const locked = if (writable)
+                self.record_mutex.lockOneByIndex(bucket_index)
+            else
+                self.record_mutex.lockOneSharedByIndex(bucket_index);
+            if (!locked) return Status.init(.SYSTEM_ERROR);
+            const st = self.processFirstBucket(io, proc, writable, bucket_index, &dead_keys);
+            if (writable) {
+                self.record_mutex.unlockOne(bucket_index);
+            } else {
+                self.record_mutex.unlockOneShared(bucket_index);
             }
+            if (st.code != .NOT_FOUND_ERROR) return st;
+        }
+        return Status.init(.NOT_FOUND_ERROR);
+    }
+
+    // Walk one bucket's chain for processFirst with the bucket's record lock
+    // held. Returns NOT_FOUND when the bucket has no live record to process.
+    fn processFirstBucket(
+        self: *HashDBMImpl,
+        io: std.Io,
+        proc: anytype,
+        writable: bool,
+        bucket_index: i64,
+        dead_keys: *std.ArrayListUnmanaged([]u8),
+    ) Status {
+        const first_raw = self.readBucket(io, bucket_index) catch
+            return Status.init(.SYSTEM_ERROR);
+        if (first_raw == 0) return Status.init(.NOT_FOUND_ERROR);
+        var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
+        while (cur != 0) {
+            const hdr = self.readRecordHeaderFromFile(io, cur) catch
+                return Status.init(.SYSTEM_ERROR);
+            const child = decodeChildOffset(hdr.child_offset, self.align_pow);
+            const key = self.readRecordKey(self.allocator, io, cur) catch
+                return Status.init(.SYSTEM_ERROR);
+            defer self.allocator.free(key);
+            if (listContains(dead_keys.items, key)) {
+                cur = child;
+                continue;
+            }
+            switch (hdr.op_type) {
+                RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
+                    return self.processImpl(io, key, proc, writable, bucket_index);
+                },
+                RECORD_MAGIC_REMOVE => {
+                    const key_copy = self.allocator.dupe(u8, key) catch
+                        return Status.init(.SYSTEM_ERROR);
+                    dead_keys.append(self.allocator, key_copy) catch {
+                        self.allocator.free(key_copy);
+                        return Status.init(.SYSTEM_ERROR);
+                    };
+                },
+                else => {},
+            }
+            cur = child;
         }
         return Status.init(.NOT_FOUND_ERROR);
     }
@@ -1033,6 +1065,22 @@ const HashDBMImpl = struct {
 
         self.mutex.lockSharedUncancelable(io);
         defer self.mutex.unlockShared(io);
+
+        // Official ProcessEach holds a ScopedHashLock over all record slots
+        // for the entire scan (exclusive when writable), so concurrent
+        // single-key process() calls cannot interleave chain mutations.
+        if (writable) {
+            self.record_mutex.lockAll();
+        } else {
+            self.record_mutex.lockAllShared();
+        }
+        defer {
+            if (writable) {
+                self.record_mutex.unlockAll();
+            } else {
+                self.record_mutex.unlockAllShared();
+            }
+        }
 
         _ = proc.processEmpty("");
 
@@ -1296,58 +1344,71 @@ const HashDBMImpl = struct {
     // Records with the REMOVE operation suppress later same-key records,
     // as in the official dead_keys set.
     fn readNextBucketRecords(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl) Status {
+        while (true) {
+            const b = iter.bucket_index;
+            if (b < 0 or b >= self.num_buckets) break;
+            iter.bucket_index = b + 1;
+
+            // Shared record lock while walking the bucket chain, mirroring
+            // the official ScopedHashLock: a concurrent writable process()
+            // cannot mutate the chain mid-walk.
+            if (!self.record_mutex.lockOneSharedByIndex(b)) return Status.init(.SYSTEM_ERROR);
+            const st = self.readBucketRecordsLocked(io, iter, b);
+            self.record_mutex.unlockOneShared(b);
+            if (st.code != .NOT_FOUND_ERROR) return st;
+        }
+
+        iter.bucket_index = -1;
+        return Status.init(.NOT_FOUND_ERROR);
+    }
+
+    // Walk one bucket's chain with its shared record lock held, appending
+    // live keys to iter.keys. NOT_FOUND means the bucket yielded no keys.
+    fn readBucketRecordsLocked(self: *HashDBMImpl, io: std.Io, iter: *HashDBMIteratorImpl, b: i64) Status {
         var dead_keys: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
             for (dead_keys.items) |k| self.allocator.free(k);
             dead_keys.deinit(self.allocator);
         }
 
-        while (true) {
-            const b = iter.bucket_index;
-            if (b < 0 or b >= self.num_buckets) break;
-            iter.bucket_index = b + 1;
+        const first_raw = self.readBucket(io, b) catch return Status.init(.SYSTEM_ERROR);
+        if (first_raw == 0) return Status.init(.NOT_FOUND_ERROR);
 
-            const first_raw = self.readBucket(io, b) catch return Status.init(.SYSTEM_ERROR);
-            if (first_raw == 0) continue;
-
-            var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
-            while (cur != 0) {
-                const hdr = self.readRecordHeaderFromFile(io, cur) catch
-                    return Status.init(.SYSTEM_ERROR);
-                const child = decodeChildOffset(hdr.child_offset, self.align_pow);
-                const key = self.readRecordKey(self.allocator, io, cur) catch
-                    return Status.init(.SYSTEM_ERROR);
-                if (listContains(dead_keys.items, key)) {
-                    self.allocator.free(key);
-                    cur = child;
-                    continue;
-                }
-                switch (hdr.op_type) {
-                    RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
-                        iter.keys.append(self.allocator, key) catch {
-                            self.allocator.free(key);
-                            return Status.init(.SYSTEM_ERROR);
-                        };
-                    },
-                    RECORD_MAGIC_REMOVE => {
-                        dead_keys.append(self.allocator, key) catch {
-                            self.allocator.free(key);
-                            return Status.init(.SYSTEM_ERROR);
-                        };
-                    },
-                    else => self.allocator.free(key),
-                }
+        var cur: i64 = decodeChildOffset(first_raw, self.align_pow);
+        while (cur != 0) {
+            const hdr = self.readRecordHeaderFromFile(io, cur) catch
+                return Status.init(.SYSTEM_ERROR);
+            const child = decodeChildOffset(hdr.child_offset, self.align_pow);
+            const key = self.readRecordKey(self.allocator, io, cur) catch
+                return Status.init(.SYSTEM_ERROR);
+            if (listContains(dead_keys.items, key)) {
+                self.allocator.free(key);
                 cur = child;
+                continue;
             }
-
-            if (iter.keys.items.len > 0) {
-                sortAndDedupeKeys(self.allocator, &iter.keys) catch
-                    return Status.init(.SYSTEM_ERROR);
-                return Status.init(.SUCCESS);
+            switch (hdr.op_type) {
+                RECORD_MAGIC_SET, RECORD_MAGIC_ADD => {
+                    iter.keys.append(self.allocator, key) catch {
+                        self.allocator.free(key);
+                        return Status.init(.SYSTEM_ERROR);
+                    };
+                },
+                RECORD_MAGIC_REMOVE => {
+                    dead_keys.append(self.allocator, key) catch {
+                        self.allocator.free(key);
+                        return Status.init(.SYSTEM_ERROR);
+                    };
+                },
+                else => self.allocator.free(key),
             }
+            cur = child;
         }
 
-        iter.bucket_index = -1;
+        if (iter.keys.items.len > 0) {
+            sortAndDedupeKeys(self.allocator, &iter.keys) catch
+                return Status.init(.SYSTEM_ERROR);
+            return Status.init(.SUCCESS);
+        }
         return Status.init(.NOT_FOUND_ERROR);
     }
 
@@ -1442,7 +1503,19 @@ const HashDBMImpl = struct {
         };
         var wrapper = Wrapper{ .inner = proc };
 
+        // Per-key record lock around ProcessImpl, mirroring the official
+        // ScopedHashLock: exclusive when writable, shared otherwise.
+        const locked = if (writable)
+            self.record_mutex.lockOneByIndex(bucket_index)
+        else
+            self.record_mutex.lockOneSharedByIndex(bucket_index);
+        if (!locked) return Status.init(.SYSTEM_ERROR);
         const pst = self.processImpl(io, first_key, &wrapper, writable, bucket_index);
+        if (writable) {
+            self.record_mutex.unlockOne(bucket_index);
+        } else {
+            self.record_mutex.unlockOneShared(bucket_index);
+        }
         if (!pst.isOk()) return pst;
 
         if (wrapper.removed) {
@@ -1481,7 +1554,12 @@ const HashDBMImpl = struct {
             .allocator = self.allocator,
         };
         const bucket_index: i64 = @intCast(hash_util.primaryHash(first_key, @intCast(self.num_buckets)));
+        // Shared record lock around the read, as in iterProcess.
+        if (!self.record_mutex.lockOneSharedByIndex(bucket_index)) {
+            return Status.init(.SYSTEM_ERROR);
+        }
         const pst = self.processImpl(io, first_key, &proc, false, bucket_index);
+        self.record_mutex.unlockOneShared(bucket_index);
         if (!pst.isOk()) return pst;
         return status;
     }
