@@ -120,6 +120,7 @@ const RecordHeader = struct {
     value_size: u64,
     padding_size: u64,
     header_size: usize, // bytes consumed for header (1 + ow + varints)
+    whole_size: usize, // total on-disk record footprint (matches official HashRecord::GetWholeSize)
 };
 
 fn readRecordHeader(buf: []const u8, offset_width: i32) ?RecordHeader {
@@ -142,6 +143,14 @@ fn readRecordHeader(buf: []const u8, offset_width: i32) ?RecordHeader {
     const ps_bytes = varint.readVarNum(buf[rp..], &padding_size);
     if (ps_bytes == 0) return null;
     rp += ps_bytes;
+    // Official tkrzw HashRecord::ReadMetadataKey:
+    //   extra_padding_size = ps_bytes - 1;
+    //   whole_size = header_size + key_size + value_size + padding_size - extra_padding_size;
+    // padding_size counts from a 1-byte baseline varint, so extra varint bytes
+    // of padding_size are absorbed out of the trailing padding area.
+    const extra_padding_size: u64 = @intCast(ps_bytes - 1);
+    if (padding_size < extra_padding_size) return null;
+    const total_u64 = @as(u64, rp) + key_size + value_size + (padding_size - extra_padding_size);
     return RecordHeader{
         .magic = magic,
         .op_type = op_type,
@@ -150,6 +159,7 @@ fn readRecordHeader(buf: []const u8, offset_width: i32) ?RecordHeader {
         .value_size = value_size,
         .padding_size = padding_size,
         .header_size = rp,
+        .whole_size = @intCast(total_u64),
     };
 }
 
@@ -712,6 +722,10 @@ const HashDBMImpl = struct {
     }
 
     // Write a new record to file (appended). Returns the file offset of the new record.
+    // Follows official tkrzw HashRecord::SetData + HashRecord::Write exact padding encoding:
+    //   base_size = 1 + ow + sizeVarNum(key) + sizeVarNum(val) + 1 + key + val
+    //   padding_size = whole_size - base_size
+    //   trailing padding bytes = padding_size - sizeVarNum(padding_size) + 1
     fn appendRecord(
         self: *HashDBMImpl,
         io: std.Io,
@@ -732,13 +746,6 @@ const HashDBMImpl = struct {
         const whole_size: i64 = alignUp(min_size, align_size);
         const padding_size: u64 = @intCast(whole_size - base_size);
 
-        const pad_vsize = varint.sizeVarNum(padding_size);
-        const actual_base_size: i64 = @intCast(
-            1 + @as(usize, @intCast(self.offset_width)) +
-                key_vsize + val_vsize + pad_vsize + key.len + value.len,
-        );
-        const actual_padding: u64 = @intCast(whole_size - actual_base_size);
-
         // Allocate write buffer.
         const buf = try self.allocator.alloc(u8, @intCast(whole_size));
         defer self.allocator.free(buf);
@@ -756,14 +763,17 @@ const HashDBMImpl = struct {
         var wp: usize = @intCast(1 + self.offset_width);
         wp += varint.writeVarNum(buf[wp..], key.len);
         wp += varint.writeVarNum(buf[wp..], value.len);
-        wp += varint.writeVarNum(buf[wp..], actual_padding);
+        const pad_vsize = varint.writeVarNum(buf[wp..], padding_size);
+        wp += pad_vsize;
         @memcpy(buf[wp .. wp + key.len], key);
         wp += key.len;
         @memcpy(buf[wp .. wp + value.len], value);
         wp += value.len;
-        if (actual_padding > 0) {
+        const trailing_pad: usize = if (padding_size > 0) @intCast(padding_size - pad_vsize + 1) else 0;
+        if (trailing_pad > 0) {
             buf[wp] = PADDING_TOP_MAGIC;
         }
+        std.debug.assert(wp + trailing_pad == @as(usize, @intCast(whole_size)));
 
         // Append to file and get offset.
         var new_off: i64 = 0;
@@ -772,48 +782,45 @@ const HashDBMImpl = struct {
         return new_off;
     }
 
-    // Update a record's value in-place (only valid when value_size + varint width is same).
+    // Rewrite an existing record in-place inside its exact on-disk whole_size slot,
+    // matching official tkrzw HashRecord::SetData + HashRecord::Write encoding.
     fn updateRecordValueInPlace(
         self: *HashDBMImpl,
         io: std.Io,
         record_offset: i64,
         hdr: RecordHeader,
+        whole_size: usize,
+        new_padding: u64,
         key: []const u8,
         new_value: []const u8,
     ) !void {
-        // Update magic checksum.
+        const buf = try self.allocator.alloc(u8, whole_size);
+        defer self.allocator.free(buf);
+        @memset(buf, 0);
+
         const checksum = computeMagicChecksum(key, new_value);
-        const new_magic = (hdr.magic & 0xC0) | checksum;
+        buf[0] = RECORD_MAGIC_SET | checksum;
 
-        // Build the header portion + new value.
-        const new_val_vsize = varint.sizeVarNum(new_value.len);
-        const old_val_vsize = varint.sizeVarNum(hdr.value_size);
-        const pad_vsize = varint.sizeVarNum(hdr.padding_size);
+        const raw_child = encodeOffset(hdr.child_offset, self.align_pow);
+        writeOffsetWidth(buf[1..@intCast(1 + self.offset_width)], raw_child, self.offset_width);
 
-        // Total header bytes = 1 + ow + key_vsize + val_vsize + pad_vsize
-        const header_bytes: usize = 1 + @as(usize, @intCast(self.offset_width)) +
-            varint.sizeVarNum(hdr.key_size) + old_val_vsize + pad_vsize;
-
-        _ = new_val_vsize;
-
-        // Write magic byte.
-        const st1 = self.file.write(io, record_offset, &[_]u8{new_magic});
-        if (!st1.isOk()) return error.IOError;
-
-        // Write new value at key_data_end.
-        const value_start: i64 = record_offset + @as(i64, @intCast(header_bytes)) + @as(i64, @intCast(hdr.key_size));
-        const st2 = self.file.write(io, value_start, new_value);
-        if (!st2.isOk()) return error.IOError;
-
-        // If new_value is shorter, zero out the remainder (part of old value that's now padding).
-        if (new_value.len < @as(usize, @intCast(hdr.value_size))) {
-            const leftover: usize = @as(usize, @intCast(hdr.value_size)) - new_value.len;
-            const zero_buf = try self.allocator.alloc(u8, leftover);
-            defer self.allocator.free(zero_buf);
-            @memset(zero_buf, 0);
-            const st3 = self.file.write(io, value_start + @as(i64, @intCast(new_value.len)), zero_buf);
-            if (!st3.isOk()) return error.IOError;
+        var wp: usize = @intCast(1 + self.offset_width);
+        wp += varint.writeVarNum(buf[wp..], key.len);
+        wp += varint.writeVarNum(buf[wp..], new_value.len);
+        const pad_vsize = varint.writeVarNum(buf[wp..], new_padding);
+        wp += pad_vsize;
+        @memcpy(buf[wp .. wp + key.len], key);
+        wp += key.len;
+        @memcpy(buf[wp .. wp + new_value.len], new_value);
+        wp += new_value.len;
+        const trailing_pad: usize = if (new_padding > 0) @intCast(new_padding - pad_vsize + 1) else 0;
+        if (trailing_pad > 0) {
+            buf[wp] = PADDING_TOP_MAGIC;
         }
+        std.debug.assert(wp + trailing_pad == whole_size);
+
+        const st = self.file.write(io, record_offset, buf);
+        if (!st.isOk()) return error.IOError;
     }
 
     // Core process implementation — called with bucket mutex already held.
@@ -873,13 +880,14 @@ const HashDBMImpl = struct {
                     return Status.init(.SUCCESS);
                 },
                 .set => |new_v| {
-                    // Check if we can update in-place: same value_size varint width.
-                    const old_val_vsize = varint.sizeVarNum(rec.header.value_size);
-                    const new_val_vsize = varint.sizeVarNum(new_v.len);
-                    // In-place update: new value fits within old value size (no varint growth needed
-                    // if varint width is same and new value <= old value size).
-                    if (new_val_vsize == old_val_vsize and new_v.len <= @as(usize, @intCast(rec.header.value_size))) {
-                        self.updateRecordValueInPlace(io, cur_offset, rec.header, key, new_v) catch
+                    // Check if the updated record fits inside the existing on-disk slot.
+                    const old_whole_size: usize = rec.header.whole_size;
+                    const new_base_size: usize = 1 + @as(usize, @intCast(self.offset_width)) +
+                        varint.sizeVarNum(key.len) + varint.sizeVarNum(new_v.len) + 1 +
+                        key.len + new_v.len;
+                    if (new_base_size <= old_whole_size) {
+                        const new_padding: u64 = @intCast(old_whole_size - new_base_size);
+                        self.updateRecordValueInPlace(io, cur_offset, rec.header, old_whole_size, new_padding, key, new_v) catch
                             return Status.init(.SYSTEM_ERROR);
                         const eds_delta: i64 = @as(i64, @intCast(new_v.len)) - @as(i64, @intCast(rec.header.value_size));
                         _ = self.eff_data_size.fetchAdd(eds_delta, .monotonic);
@@ -1099,7 +1107,7 @@ const HashDBMImpl = struct {
                     defer rec.deinit();
                     _ = proc.processFull(rec.key, rec.value);
                 }
-                offset += @intCast(hdr.header_size + hdr.key_size + hdr.value_size + hdr.padding_size);
+                offset += @intCast(hdr.whole_size);
             }
             _ = proc.processEmpty("");
             return Status.init(.SUCCESS);
@@ -2131,12 +2139,7 @@ pub const HashDBM = struct {
             }
             const hdr = self.impl.readRecordHeaderFromFile(io, offset) catch
                 return Status.initMsg(.BROKEN_DATA_ERROR, "record header parse error");
-            const align_size: i64 = @as(i64, 1) << @intCast(self.impl.align_pow);
-            const raw_size: i64 = @as(i64, @intCast(hdr.header_size)) +
-                @as(i64, @intCast(hdr.key_size)) +
-                @as(i64, @intCast(hdr.value_size)) +
-                @as(i64, @intCast(hdr.padding_size));
-            const whole_size = alignUp(raw_size, align_size);
+            const whole_size: i64 = @intCast(hdr.whole_size);
             if (whole_size <= 0) return Status.initMsg(.BROKEN_DATA_ERROR, "record size zero");
             offset += whole_size;
         }
@@ -2864,11 +2867,7 @@ pub const HashDBM = struct {
                 return Status.initMsg(.BROKEN_DATA_ERROR, "bad record header in import");
             };
 
-            const raw_size: i64 = @as(i64, @intCast(hdr.header_size)) +
-                @as(i64, @intCast(hdr.key_size)) +
-                @as(i64, @intCast(hdr.value_size)) +
-                @as(i64, @intCast(hdr.padding_size));
-            const whole_size = alignUp(raw_size, align_size);
+            const whole_size: i64 = @intCast(hdr.whole_size);
             if (whole_size <= 0) {
                 if (skip_broken_records) { offset += align_size; continue; }
                 return Status.initMsg(.BROKEN_DATA_ERROR, "zero record size in import");
@@ -2990,11 +2989,7 @@ pub const HashDBM = struct {
                     if (skip_broken_records) { offset += align_size; continue; }
                     return Status.initMsg(.BROKEN_DATA_ERROR, "bad record header");
                 };
-                const raw_size: i64 = @as(i64, @intCast(hdr.header_size)) +
-                    @as(i64, @intCast(hdr.key_size)) +
-                    @as(i64, @intCast(hdr.value_size)) +
-                    @as(i64, @intCast(hdr.padding_size));
-                const whole_size = alignUp(raw_size, align_size);
+                const whole_size: i64 = @intCast(hdr.whole_size);
                 if (whole_size <= 0) {
                     if (skip_broken_records) { offset += align_size; continue; }
                     return Status.initMsg(.BROKEN_DATA_ERROR, "zero size record");
@@ -4171,4 +4166,76 @@ test "HashDBM.Iterator: iterateFrom(std.testing.io) with lifetime contract" {
     }
 
     try std.testing.expect(db.close(std.testing.io).isOk());
+}
+
+test "HashDBM in-place shrink updates value_size and preserves adjacent records (multi-byte padding)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = path_buf[0..try std.Io.Dir.realPathFile(tmp.dir, io, ".", &path_buf)];
+    var full_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}/shrink_align10.tkh", .{dir_path});
+
+    const std_file = try file_mod.StdFile.create(alloc);
+    var db = try HashDBM.init(std_file.asFile(), 128, alloc);
+    defer db.deinit(io);
+    try std.testing.expect(db.openAdvanced(io, full_path, true, .{}, .{ .align_pow = 10, .num_buckets = 128 }).isOk());
+
+    // Two adjacent records with align_pow=10 (multi-byte padding_size >= 128).
+    const big_v_arr: [300]u8 = @splat('A');
+    const shrunk_v_arr: [200]u8 = @splat('B'); // same 2-byte value_size varint width, smaller length
+    const tiny_v_arr: [5]u8 = @splat('C'); // 1-byte value_size varint width, still fits in-place
+    const neighbor_v_arr: [400]u8 = @splat('N');
+    const big_v: []const u8 = &big_v_arr;
+    const shrunk_v: []const u8 = &shrunk_v_arr;
+    const tiny_v: []const u8 = &tiny_v_arr;
+    const neighbor_v: []const u8 = &neighbor_v_arr;
+
+    try std.testing.expect(db.set(io, "k1", big_v, true, null).isOk());
+    try std.testing.expect(db.set(io, "k2", neighbor_v, true, null).isOk());
+
+    // Shrink k1 in-place (same varint width) — must not append NULs or clobber k2's magic byte.
+    try std.testing.expect(db.set(io, "k1", shrunk_v, true, null).isOk());
+    {
+        var got = std.ArrayList(u8).empty;
+        defer got.deinit(alloc);
+        try std.testing.expect(db.get(io, "k1", &got).isOk());
+        try std.testing.expectEqualStrings(shrunk_v, got.items);
+        got.clearRetainingCapacity();
+        try std.testing.expect(db.get(io, "k2", &got).isOk());
+        try std.testing.expectEqualStrings(neighbor_v, got.items);
+    }
+
+    // Shrink k1 further across varint width boundary (2-byte -> 1-byte value_size).
+    try std.testing.expect(db.set(io, "k1", tiny_v, true, null).isOk());
+    {
+        var got = std.ArrayList(u8).empty;
+        defer got.deinit(alloc);
+        try std.testing.expect(db.get(io, "k1", &got).isOk());
+        try std.testing.expectEqualStrings(tiny_v, got.items);
+        got.clearRetainingCapacity();
+        try std.testing.expect(db.get(io, "k2", &got).isOk());
+        try std.testing.expectEqualStrings(neighbor_v, got.items);
+    }
+
+    // Read-only processEach sequential scan must traverse multi-byte padded records accurately.
+    try std.testing.expect(db.close(io).isOk());
+    try std.testing.expect(db.open(io, full_path, false, .{}).isOk());
+    const Counter = struct {
+        seen: usize = 0,
+        pub fn processFull(self: *@This(), _: []const u8, _: []const u8) RecordAction {
+            self.seen += 1;
+            return .noop;
+        }
+        pub fn processEmpty(_: *@This(), _: []const u8) RecordAction {
+            return .noop;
+        }
+    };
+    var counter = Counter{};
+    try std.testing.expect(db.processEach(io, &counter, false).isOk());
+    try std.testing.expectEqual(@as(usize, 2), counter.seen);
+    try std.testing.expect(db.close(io).isOk());
 }
