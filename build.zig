@@ -73,4 +73,14 @@ pub fn build(b: *std.Build) void {
     golden_test_mod.addImport("tkrzw_zig", mod);
     const golden_tests = b.addTest(.{ .root_module = golden_test_mod });
     test_step.dependOn(&b.addRunArtifact(golden_tests).step);
+
+    // Exact KNN vector search test harness (oracle + 6-backend matrix).
+    const knn_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/knn_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    knn_test_mod.addImport("tkrzw_zig", mod);
+    const knn_tests = b.addTest(.{ .root_module = knn_test_mod });
+    test_step.dependOn(&b.addRunArtifact(knn_tests).step);
 }

@@ -38,7 +38,9 @@ The port focuses on functional correctness and maintaining the original API surf
 - **src/dbm_skip.zig** — SkipDBM implementation
 - **src/lib_common.zig** — Status types and result codes
 - **src/file.zig** — File I/O abstraction and implementations
-- **src/\*_util.zig** — Utility modules (hash, string, time, thread, varint)
+- **src/\*_util.zig** — Utility modules (hash, string, time, thread, varint, vector)
+- **src/dbm_vector.zig** — Exact brute-force KNN search (`searchSimilar`) and byte-exact lookup (`findByVector`, `findByVectorBytes`) over `PolyDBM`
+- **src/knn_test.zig** / **src/knn_test_util.zig** — Oracle-based KNN test harness across all six backends (wired into `zig build test`; `knn_test_util.zig` is test-only and not imported by `src/root.zig`)
 - **src/c_api.zig** — C ABI wrapper exposing PolyDBM to C callers; all `export fn tkrzw_*` symbols live here; uses `std.heap.c_allocator` for all malloc-backed outputs so callers can call plain `free()`
 - **src/c_api_test.zig** — In-process Zig tests for the C API surface (wired into `zig build test`)
 - **include/tkrzw.h** — Authoritative C header with all type definitions, opaque handles, enums, and function declarations for the C API
@@ -110,6 +112,8 @@ zig build run             # Run demo
 - Maintain mutex safety without introducing deadlocks
 - **Import deadlock pattern**: If holding `self.mutex` exclusively, use `processImplForImport()` instead of `processImpl()` to avoid recursive lock deadlock
 - File extension mapping for PolyDBM: `.tkh`, `.tkt`, `.tks`, `.tkmt`, `.tkmb`, `.tkmc`
+- **Vector storage convention**: vectors are packed IEEE-754 little-endian `float32` blobs with no header or padding (`dim = bytes.len / 4`); `SkipDBM` only scans synchronized records.
+- **HashDBM legacy stride compatibility**: `resolveRecordWholeSize` in `src/dbm_hash.zig` supports official tkrzw / `fe528af` files plus legacy files written by commit `8db376c` only (multi-byte padding and varint-width-drop boundaries such as `128 -> 127`); keep it off the keyed `get` hot path.
 
 ### C API history / fixed bugs
 
