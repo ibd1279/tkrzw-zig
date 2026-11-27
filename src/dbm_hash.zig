@@ -125,8 +125,22 @@ const RecordHeader = struct {
 };
 
 fn readRecordHeader(buf: []const u8, offset_width: i32) ?RecordHeader {
+    return readRecordHeaderCore(buf, offset_width, false);
+}
+
+/// Scanner-only variant for import/restore repair of legacy v0.1.0-zig0.17.1 files
+/// that wrote voided records with bare 0xC0 (checksum 0). Header fields after byte 0
+/// are intact, so callers can advance by `whole_size` and omit the voided record.
+fn readRecordHeaderAllowLegacyVoid(buf: []const u8, offset_width: i32) ?RecordHeader {
+    return readRecordHeaderCore(buf, offset_width, true);
+}
+
+fn readRecordHeaderCore(buf: []const u8, offset_width: i32, allow_legacy_void: bool) ?RecordHeader {
     if (buf.len < 1) return null;
     const magic = buf[0];
+    if ((magic & 0x3F) < 3) {
+        if (!(allow_legacy_void and magic == RECORD_MAGIC_VOID)) return null;
+    }
     const op_type: u8 = magic & 0xC0;
     const ow: usize = @intCast(offset_width);
     if (buf.len < 1 + ow) return null;
@@ -3055,7 +3069,7 @@ pub const HashDBM = struct {
 
             const op = magic & 0xC0;
 
-            const hdr = readRecordHeader(hdr_buf[0..read_n], src_ow) orelse {
+            const hdr = readRecordHeaderAllowLegacyVoid(hdr_buf[0..read_n], src_ow) orelse {
                 if (skip_broken_records) { offset += align_size; continue; }
                 return Status.initMsg(.BROKEN_DATA_ERROR, "bad record header in import");
             };
@@ -3178,7 +3192,7 @@ pub const HashDBM = struct {
                     offset += align_size;
                     continue;
                 }
-                const hdr = readRecordHeader(hdr_buf[0..read_n], src_ow) orelse {
+                const hdr = readRecordHeaderAllowLegacyVoid(hdr_buf[0..read_n], src_ow) orelse {
                     if (skip_broken_records) { offset += align_size; continue; }
                     return Status.initMsg(.BROKEN_DATA_ERROR, "bad record header");
                 };
@@ -4918,4 +4932,66 @@ test "resolveRecordWholeSize performs zero file reads for official align_pow=10 
     };
     try std.testing.expectEqual(@as(usize, 1024), resolveRecordWholeSize(f, io, 4096, 8192, 4, 10, drop_hdr));
     try std.testing.expectEqual(@as(usize, 0), cf.reads);
+}
+
+test "HashDBM repairs legacy v0.1.0 bare 0xC0 void records via rebuild and importFromFileForward" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const src_path = try std.fmt.allocPrint(alloc, "{s}/legacy_c0.tkh", .{path_buf[0..tmp_len]});
+    defer alloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(alloc, "{s}/imported.tkh", .{path_buf[0..tmp_len]});
+    defer alloc.free(dst_path);
+
+    const std_file = try file_mod.StdFile.create(alloc);
+    var db = try HashDBM.init(std_file.asFile(), 128, alloc);
+    defer db.deinit(io);
+    try std.testing.expect(db.openAdvanced(io, src_path, true, .{ .truncate = true }, .{ .align_pow = 4, .num_buckets = 128 }).isOk());
+    try std.testing.expect(db.set(io, "victim", "val", true, null).isOk());
+    try std.testing.expect(db.set(io, "keep1", "one", true, null).isOk());
+    try std.testing.expect(db.set(io, "keep2", "two", true, null).isOk());
+    try std.testing.expect(db.remove(io, "victim").isOk());
+    const rec_base = db.impl.record_base;
+    try std.testing.expect(db.close(io).isOk());
+
+    // Patch the first record's magic byte (victim's VOID record) to legacy bare 0xC0.
+    const raw_f = try file_mod.StdFile.create(alloc);
+    var rf = raw_f.asFile();
+    defer rf.deinit(alloc);
+    try std.testing.expect(rf.open(io, src_path, true, .{}).isOk());
+    try std.testing.expect(rf.write(io, rec_base, &[_]u8{RECORD_MAGIC_VOID}).isOk());
+    try std.testing.expect(rf.close(io).isOk());
+
+    // Strict validateRecords must reject the un-repaired bare 0xC0 file.
+    try std.testing.expect(db.open(io, src_path, true, .{}).isOk());
+    try std.testing.expect(!db.validateRecords(io, 0, 0).isOk());
+
+    // importFromFileForward must accept bare 0xC0 legacy void and recover all live keys.
+    const imp_file = try file_mod.StdFile.create(alloc);
+    var imp_db = try HashDBM.init(imp_file.asFile(), 128, alloc);
+    defer imp_db.deinit(io);
+    try std.testing.expect(imp_db.openAdvanced(io, dst_path, true, .{ .truncate = true }, .{ .align_pow = 4, .num_buckets = 128 }).isOk());
+    try std.testing.expect(imp_db.importFromFileForward(io, src_path, false, -1, -1).isOk());
+    try std.testing.expect(imp_db.validateRecords(io, 0, 0).isOk());
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(alloc);
+    try std.testing.expect(imp_db.get(io, "keep1", &got).isOk());
+    try std.testing.expectEqualStrings("one", got.items);
+    got.clearRetainingCapacity();
+    try std.testing.expect(imp_db.get(io, "keep2", &got).isOk());
+    try std.testing.expectEqualStrings("two", got.items);
+    try std.testing.expect(!imp_db.get(io, "victim", &got).isOk());
+    try std.testing.expect(imp_db.close(io).isOk());
+
+    // Zig rebuild() repairs src_path in-place so strict validateRecords now passes!
+    try std.testing.expect(db.rebuild(io).isOk());
+    try std.testing.expect(db.validateRecords(io, 0, 0).isOk());
+    got.clearRetainingCapacity();
+    try std.testing.expect(db.get(io, "keep1", &got).isOk());
+    try std.testing.expectEqualStrings("one", got.items);
+    try std.testing.expect(db.close(io).isOk());
 }
