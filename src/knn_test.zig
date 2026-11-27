@@ -208,7 +208,7 @@ test "KNN mixed corpus: skip+count default and separately pinned strict error co
             );
         }
 
-        // 4. Strict mode with ONLY dimension-mismatched valid vector -> must return InvalidArgument.
+        // 4. Strict mode with ONLY dimension-mismatched valid vector -> must return BrokenData.
         {
             const name = try std.fmt.allocPrint(alloc, "strict_dim_{s}", .{@tagName(backend)});
             defer alloc.free(name);
@@ -225,7 +225,7 @@ test "KNN mixed corpus: skip+count default and separately pinned strict error co
             try testing.expectEqual(tkrzw.Code.SUCCESS, db.synchronize(io, false).code);
 
             try testing.expectError(
-                tkrzw.dbm_poly.PolyError.InvalidArgument,
+                tkrzw.dbm_poly.PolyError.BrokenData,
                 tkrzw.searchSimilar(&db, io, alloc, query, 4, .l2, .{ .strict = true }),
             );
         }
@@ -1170,9 +1170,7 @@ test "KNN performance smoke: 10k x 64-dim cosine top-10 completes cleanly" {
     var query: [dim]f32 = undefined;
     for (&query) |*x| x.* = rng.float(f32) * 2.0 - 1.0;
 
-    const t0 = tkrzw.time_util.getWallTime(io);
     var res = try tkrzw.searchSimilar(&db, io, alloc, &query, k, .cosine, .{});
-    const elapsed_ms = (tkrzw.time_util.getWallTime(io) - t0) * 1000.0;
     defer res.deinit(alloc);
 
     try testing.expectEqual(n, res.scanned);
@@ -1181,7 +1179,6 @@ test "KNN performance smoke: 10k x 64-dim cosine top-10 completes cleanly" {
     for (1..res.hits.len) |i| {
         try testing.expect(res.hits[i - 1].score >= res.hits[i].score);
     }
-    try testing.expect(elapsed_ms >= 0.0);
 }
 
 test "README KNN quick-start example compiles and runs" {

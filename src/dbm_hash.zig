@@ -260,6 +260,12 @@ fn rangeIsAllZero(file: File, io: std.Io, start_off: i64, len: usize) bool {
 /// Always prefers the official stride whenever it is aligned and lands on a
 /// validated record boundary (or EOF) so valid official records (including ADD
 /// records whose top two magic bits are 0x00) are never skipped.
+///
+/// Fast path: before performing any file I/O, checks whether any legacy delta
+/// can even produce an aligned in-bounds slot. For official files with
+/// `align_pow >= 1`, `official` is already aligned while `official + delta`
+/// (with `1 <= delta < align_size`) is never aligned, so official scans pay
+/// zero extra preads.
 fn resolveRecordWholeSize(
     file: File,
     io: std.Io,
@@ -278,6 +284,29 @@ fn resolveRecordWholeSize(
     const shift: u6 = @intCast(@max(0, align_pow));
     const align_size: usize = @as(usize, 1) << shift;
 
+    // Collect aligned, in-bounds legacy candidates before doing any file I/O.
+    // On official files with align_pow >= 4 (and all realistic align_pow >= 1
+    // records), `official % align_size == 0` while `delta < align_size`, so no
+    // candidate is aligned and we return immediately with zero extra preads.
+    const raw_deltas = [_]?usize{
+        if (has_multi_legacy) hdr.extra_padding_size else null,
+        if (has_drop_legacy) ps_bytes else null,
+    };
+    const Candidate = struct { delta: usize, cand_whole: usize, next_cand: i64 };
+    var candidates: [2]?Candidate = .{ null, null };
+    var has_candidate = false;
+    for (raw_deltas, 0..) |maybe_delta, idx| {
+        const delta = maybe_delta orelse continue;
+        const cand_whole = std.math.add(usize, official, delta) catch continue;
+        if ((cand_whole % align_size) != 0) continue;
+        const cand_i64 = std.math.cast(i64, cand_whole) orelse continue;
+        const next_cand = std.math.add(i64, record_offset, cand_i64) catch continue;
+        if (next_cand > end_offset) continue;
+        candidates[idx] = .{ .delta = delta, .cand_whole = cand_whole, .next_cand = next_cand };
+        has_candidate = true;
+    }
+    if (!has_candidate) return official;
+
     const official_i64 = std.math.cast(i64, official) orelse return official;
     const next_official = std.math.add(i64, record_offset, official_i64) catch return official;
 
@@ -288,22 +317,13 @@ fn resolveRecordWholeSize(
         return official;
     }
 
-    // Check legacy candidates: multi-byte padding (+ extra_padding_size) and
-    // varint-width-drop (+ ps_bytes, e.g. 128 -> 127).
-    const deltas = [_]?usize{
-        if (has_multi_legacy) hdr.extra_padding_size else null,
-        if (has_drop_legacy) ps_bytes else null,
-    };
-    for (deltas) |maybe_delta| {
-        const delta = maybe_delta orelse continue;
-        const cand_whole = std.math.add(usize, official, delta) catch continue;
-        if ((cand_whole % align_size) != 0) continue;
-        const cand_i64 = std.math.cast(i64, cand_whole) orelse continue;
-        const next_cand = std.math.add(i64, record_offset, cand_i64) catch continue;
-        if (next_cand > end_offset) continue;
-        if (!rangeIsAllZero(file, io, next_official, delta)) continue;
-        if (isValidNextBoundary(file, io, next_cand, end_offset, offset_width, align_pow)) {
-            return cand_whole;
+    // Check aligned legacy candidates: multi-byte padding (+ extra_padding_size)
+    // and varint-width-drop (+ ps_bytes, e.g. 128 -> 127).
+    for (candidates) |maybe_cand| {
+        const cand = maybe_cand orelse continue;
+        if (!rangeIsAllZero(file, io, next_official, cand.delta)) continue;
+        if (isValidNextBoundary(file, io, cand.next_cand, end_offset, offset_width, align_pow)) {
+            return cand.cand_whole;
         }
     }
 
@@ -4812,4 +4832,90 @@ test "HashDBM legacy 8db376c 128->127 padding-varint transition scans, imports, 
         try std.testing.expectEqual(@as(i64, 2), db.countSimple());
         try std.testing.expect(db.close(io).isOk());
     }
+}
+
+test "resolveRecordWholeSize performs zero file reads for official align_pow=10 multi-byte padded records" {
+    const io = std.testing.io;
+
+    const CountingFile = struct {
+        reads: usize = 0,
+
+        fn open(_: *anyopaque, _: std.Io, _: []const u8, _: bool, _: file_mod.OpenOptions) Status {
+            return Status.init(.NOT_IMPLEMENTED_ERROR);
+        }
+        fn close(_: *anyopaque, _: std.Io) Status {
+            return Status.init(.SUCCESS);
+        }
+        fn read(ctx: *anyopaque, _: std.Io, _: i64, _: []u8) Status {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.reads += 1;
+            return Status.init(.SYSTEM_ERROR);
+        }
+        fn write(_: *anyopaque, _: std.Io, _: i64, _: []const u8) Status {
+            return Status.init(.NOT_IMPLEMENTED_ERROR);
+        }
+        fn append(_: *anyopaque, _: std.Io, _: []const u8, _: ?*i64) Status {
+            return Status.init(.NOT_IMPLEMENTED_ERROR);
+        }
+        fn truncate(_: *anyopaque, _: std.Io, _: i64) Status {
+            return Status.init(.NOT_IMPLEMENTED_ERROR);
+        }
+        fn synchronize(_: *anyopaque, _: std.Io, _: bool) Status {
+            return Status.init(.NOT_IMPLEMENTED_ERROR);
+        }
+        fn getSize(_: *anyopaque, out: *i64) Status {
+            out.* = 8192;
+            return Status.init(.SUCCESS);
+        }
+        fn makeFile(_: *anyopaque, _: std.mem.Allocator) std.mem.Allocator.Error!*File {
+            unreachable;
+        }
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+
+        const vtable = File.VTable{
+            .open = open,
+            .close = close,
+            .read = read,
+            .write = write,
+            .append = append,
+            .truncate = truncate,
+            .synchronize = synchronize,
+            .getSize = getSize,
+            .makeFile = makeFile,
+            .deinit = deinit,
+        };
+    };
+
+    var cf = CountingFile{};
+    const f = File{ .ctx = &cf, .vtable = &CountingFile.vtable };
+
+    // Official align_pow=10 record: multi-byte padding (extra_padding_size = 1), whole_size = 1024.
+    const multi_hdr = RecordHeader{
+        .magic = RECORD_MAGIC_SET | 14,
+        .op_type = RECORD_MAGIC_SET,
+        .child_offset = 0,
+        .key_size = 2,
+        .value_size = 9,
+        .padding_size = 1004,
+        .header_size = 10,
+        .extra_padding_size = 1,
+        .whole_size = 1024,
+    };
+    try std.testing.expectEqual(@as(usize, 1024), resolveRecordWholeSize(f, io, 4096, 8192, 4, 10, multi_hdr));
+    try std.testing.expectEqual(@as(usize, 0), cf.reads);
+
+    // Official align_pow=10 record with padding_size = 127 (sits in drop window, still aligned at 1024).
+    const drop_hdr = RecordHeader{
+        .magic = RECORD_MAGIC_SET | 14,
+        .op_type = RECORD_MAGIC_SET,
+        .child_offset = 0,
+        .key_size = 2,
+        .value_size = 886,
+        .padding_size = 127,
+        .header_size = 9,
+        .extra_padding_size = 0,
+        .whole_size = 1024,
+    };
+    try std.testing.expectEqual(@as(usize, 1024), resolveRecordWholeSize(f, io, 4096, 8192, 4, 10, drop_hdr));
+    try std.testing.expectEqual(@as(usize, 0), cf.reads);
 }

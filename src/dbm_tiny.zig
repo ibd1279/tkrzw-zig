@@ -1049,9 +1049,10 @@ const TinyDBMImpl = struct {
     // Read-only path: shared outer lock, calls proc.processFull directly (no mutation).
     // Returns NOT_FOUND_ERROR when the DB is empty.
     //
-    // Matches C++ TinyDBMImpl::ProcessFirst exactly, including the absence of
-    // record_mutex locking: the exclusive outer lock is sufficient for the
-    // writable path; the shared lock is sufficient for read-only.
+    // Writable path holds the exclusive outer mutex (blocking all concurrent
+    // access). Read-only path holds shared outer mutex + all record_mutex slots
+    // shared so concurrent single-key writers cannot mutate/free bucket nodes
+    // mid-read (stricter than C++ TinyDBMImpl::ProcessFirst, matching HashDBM).
     fn processFirst(
         self: *TinyDBMImpl,
         io: std.Io,

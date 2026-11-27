@@ -63,7 +63,7 @@ The port focuses on functional correctness and maintaining the original API surf
 ### API Design
 
 - Maintain compatibility with original tkrzw API surface
-- Return Status with Code enums for all operations (not exceptions)
+- Return Status with Code enums for core DBM operations (matching C++ tkrzw); allocating or owned-result high-level APIs (e.g., `PolyDBM.open`/`get`/`iterate`, `ShardDBM.get`, `BloomFilter`, `dbm_vector`) return Zig error unions
 - Support optional UpdateLogger for write-ahead logging
 - Allow custom File implementations for pluggable backends
 - Optional parameters use null for "not provided"

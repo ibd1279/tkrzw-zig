@@ -13,8 +13,9 @@
 //!   records are not visible to `searchSimilar` or `findByVector`.
 //! - Concurrency: scans are not universally point-in-time snapshots across
 //!   backends. TinyDBM, HashDBM, and SkipDBM hold shared/whole locks across
-//!   `processEach`, whereas BabyDBM and TreeDBM lock one leaf at a time and
-//!   CacheDBM locks per slot.
+//!   `processEach` (blocking concurrent writers for the duration of the scan),
+//!   whereas BabyDBM and TreeDBM lock one leaf at a time and CacheDBM locks
+//!   per slot.
 //! - Strict mode: stops scoring on the first invalid record and returns the
 //!   error once `PolyDBM.processEach` finishes traversing (because
 //!   `RecordAction` has no early-abort signal).
@@ -44,8 +45,8 @@ pub const SearchOptions = struct {
     /// When false (default), malformed and dimension-mismatched records are
     /// skipped and counted in `KnnResult.invalid_records`.
     /// When true, scoring stops on the first invalid record and returns
-    /// `PolyError.BrokenData` (malformed length or NaN/Inf) or
-    /// `PolyError.InvalidArgument` (dimension mismatch) after traversal.
+    /// `PolyError.BrokenData` (malformed length, NaN/Inf, or dimension
+    /// mismatch) after traversal.
     strict: bool = false,
 };
 
@@ -70,19 +71,12 @@ pub const KnnResult = struct {
 // Internal byte scorer and bounded top-k heap
 // ---------------------------------------------------------------------------
 
-const simd_lanes: usize = std.simd.suggestVectorLength(f32) orelse 1;
-const VecF32 = @Vector(simd_lanes, f32);
-const VecF64 = @Vector(simd_lanes, f64);
-
-inline fn readElementLE(bytes: []const u8, index: usize) f32 {
-    return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
-}
-
-inline fn foldAddF64(acc: *f64, chunk: VecF64) void {
-    inline for (0..simd_lanes) |lane| {
-        acc.* += chunk[lane];
-    }
-}
+const simd_lanes = vector_util.simd_lanes;
+const VecF32 = vector_util.VecF32;
+const VecF64 = vector_util.VecF64;
+const readElementLE = vector_util.readElementLE;
+const foldAddF64 = vector_util.foldAddF64;
+const negateDistance = vector_util.negateDistance;
 
 inline fn loadChunkLE(bytes: []const u8, elem_offset: usize) VecF32 {
     const byte_offset = elem_offset * 4;
@@ -102,11 +96,6 @@ inline fn loadChunkLE(bytes: []const u8, elem_offset: usize) VecF32 {
 inline fn chunkIsFinite(v: VecF32) bool {
     const max_f32: VecF32 = @splat(std.math.floatMax(f32));
     return @reduce(.And, @abs(v) <= max_f32);
-}
-
-inline fn negateDistance(d: f64) f64 {
-    if (d == 0.0) return 0.0;
-    return -d;
 }
 
 /// Validates and scores a packed little-endian float32 byte slice against a
@@ -211,11 +200,7 @@ fn scoreBytes(
                 }
                 return negateDistance(std.math.clamp(0.5 * diff_sq, 0.0, 1.0));
             }
-            const prod = query_norm_sq * nb_acc;
-            const denom = if (std.math.isInf(prod)) @sqrt(query_norm_sq) * @sqrt(nb_acc) else @sqrt(prod);
-            if (denom == 0.0) return -std.math.inf(f64);
-            const cos = std.math.clamp(dot_acc / denom, -1.0, 0.0);
-            return negateDistance(1.0 - cos);
+            return negateDistance(vector_util.obtuseCosineDistance(dot_acc, query_norm_sq, nb_acc));
         },
     }
 }
@@ -372,8 +357,10 @@ pub fn searchSimilar(
                 self.invalid_records += 1;
                 if (self.strict) {
                     self.first_error = switch (err) {
-                        VectorError.InvalidVectorLength, VectorError.NonFiniteElement => PolyError.BrokenData,
-                        VectorError.DimensionMismatch => PolyError.InvalidArgument,
+                        VectorError.InvalidVectorLength,
+                        VectorError.NonFiniteElement,
+                        VectorError.DimensionMismatch,
+                        => PolyError.BrokenData,
                     };
                 }
                 return .noop;
@@ -768,8 +755,8 @@ test "searchSimilar skip vs strict error policy for malformed and mismatched rec
         try testing.expectEqualStrings("good_1", res.hits[0].key);
     }
 
-    // Strict mode on dim-mismatch -> InvalidArgument.
-    try testing.expectError(PolyError.InvalidArgument, searchSimilar(&db, io, alloc, &query, 5, .l2, .{ .strict = true }));
+    // Strict mode on dim-mismatch -> BrokenData.
+    try testing.expectError(PolyError.BrokenData, searchSimilar(&db, io, alloc, &query, 5, .l2, .{ .strict = true }));
 
     // Add malformed garbage string (len % 4 != 0) + NaN vector.
     try testing.expectEqual(Code.SUCCESS, db.remove(io, "wrong_dim").code);

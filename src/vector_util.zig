@@ -9,13 +9,13 @@
 
 const std = @import("std");
 
-const simd_lanes: usize = std.simd.suggestVectorLength(f32) orelse 1;
-const VecF32 = @Vector(simd_lanes, f32);
-const VecF64 = @Vector(simd_lanes, f64);
+pub const simd_lanes: usize = std.simd.suggestVectorLength(f32) orelse 1;
+pub const VecF32 = @Vector(simd_lanes, f32);
+pub const VecF64 = @Vector(simd_lanes, f64);
 
 /// Folds a SIMD f64 chunk into `acc` in strict left-to-right index order so
 /// results are target-independent and bit-identical to the scalar oracle.
-inline fn foldAddF64(acc: *f64, chunk: VecF64) void {
+pub inline fn foldAddF64(acc: *f64, chunk: VecF64) void {
     inline for (0..simd_lanes) |lane| {
         acc.* += chunk[lane];
     }
@@ -74,7 +74,7 @@ pub fn decodeF32(
     return out;
 }
 
-inline fn readElementLE(bytes: []const u8, index: usize) f32 {
+pub inline fn readElementLE(bytes: []const u8, index: usize) f32 {
     return @bitCast(std.mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
 }
 
@@ -128,7 +128,7 @@ pub fn normSquared(v: []const f32) VectorError!f64 {
 }
 
 /// Computes cosine distance for `dot_acc < 0` with non-zero squared norms.
-inline fn obtuseCosineDistance(dot_acc: f64, na_sq: f64, nb_sq: f64) f64 {
+pub inline fn obtuseCosineDistance(dot_acc: f64, na_sq: f64, nb_sq: f64) f64 {
     const prod = na_sq * nb_sq;
     const denom = if (std.math.isInf(prod)) @sqrt(na_sq) * @sqrt(nb_sq) else @sqrt(prod);
     if (denom == 0.0) return std.math.inf(f64);
@@ -136,7 +136,7 @@ inline fn obtuseCosineDistance(dot_acc: f64, na_sq: f64, nb_sq: f64) f64 {
     return 1.0 - cos;
 }
 
-inline fn negateDistance(d: f64) f64 {
+pub inline fn negateDistance(d: f64) f64 {
     if (d == 0.0) return 0.0;
     return -d;
 }

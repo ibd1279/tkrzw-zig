@@ -1999,7 +1999,7 @@ fn iterGetCurrent( io: std.Io,it: *TreeDBMIteratorImpl, key_out: ?*std.ArrayList
 fn iterProcess( io: std.Io,it: *TreeDBMIteratorImpl, proc: anytype, writable: bool) Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
-    const leaf = impl.loadLeafNode( io,it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
+    const leaf = impl.loadLeafNode(io, it.leaf_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
     defer impl.releaseLeafNode( io,it.leaf_id);
     if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
     defer if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);
