@@ -864,9 +864,9 @@ const HashDBMImpl = struct {
 
         // Phase 2: read key + value at their exact offset.
         const data_start: i64 = record_offset + @as(i64, @intCast(hdr.header_size));
-        const key_size: usize = @intCast(hdr.key_size);
-        const value_size: usize = @intCast(hdr.value_size);
-        const total_data = key_size + value_size;
+        const key_size: usize = std.math.cast(usize, hdr.key_size) orelse return error.BrokenData;
+        const value_size: usize = std.math.cast(usize, hdr.value_size) orelse return error.BrokenData;
+        const total_data = std.math.add(usize, key_size, value_size) catch return error.BrokenData;
 
         const key = try allocator.alloc(u8, key_size);
         errdefer allocator.free(key);
@@ -1300,7 +1300,7 @@ const HashDBMImpl = struct {
                     defer rec.deinit();
                     _ = proc.processFull(rec.key, rec.value);
                 }
-                const stride = resolveRecordWholeSize(
+                const step: i64 = std.math.cast(i64, resolveRecordWholeSize(
                     self.file,
                     io,
                     offset,
@@ -1308,8 +1308,10 @@ const HashDBMImpl = struct {
                     self.offset_width,
                     self.align_pow,
                     hdr,
-                );
-                offset += @intCast(stride);
+                )) orelse return Status.init(.BROKEN_DATA_ERROR);
+                if (step <= 0) return Status.init(.BROKEN_DATA_ERROR);
+                offset = std.math.add(i64, offset, step) catch
+                    return Status.init(.BROKEN_DATA_ERROR);
             }
             _ = proc.processEmpty("");
             return Status.init(.SUCCESS);
@@ -2327,21 +2329,16 @@ pub const HashDBM = struct {
             const st_peek = self.impl.file.read(io, offset, &hdr_buf);
             if (!st_peek.isOk()) break;
             const magic = hdr_buf[0];
-            // Padding record — advance one alignment unit.
-            if (magic == PADDING_TOP_MAGIC) {
-                const align_size: i64 = @as(i64, 1) << @intCast(self.impl.align_pow);
-                offset += align_size;
-                continue;
-            }
-            const op = magic & 0xC0;
-            if (op != RECORD_MAGIC_VOID and op != RECORD_MAGIC_SET and
-                op != RECORD_MAGIC_REMOVE and op != RECORD_MAGIC_ADD)
-            {
-                return Status.initMsg(.BROKEN_DATA_ERROR, "invalid record magic");
+            // Official HashRecord::ReadMetadataKey rejects magic checksums < 3.
+            // Padding (0xDD) only ever appears INSIDE record slots, so a slot
+            // boundary byte is always a record to parse — including a VOID
+            // whose checksum is 29 (0xC0 | 29 == 0xDD == PADDING_TOP_MAGIC).
+            if ((magic & 0x3F) < 3) {
+                return Status.initMsg(.BROKEN_DATA_ERROR, "invalid record magic checksum");
             }
             const hdr = self.impl.readRecordHeaderFromFile(io, offset) catch
                 return Status.initMsg(.BROKEN_DATA_ERROR, "record header parse error");
-            const whole_size: i64 = @intCast(resolveRecordWholeSize(
+            const whole_size: i64 = std.math.cast(i64, resolveRecordWholeSize(
                 self.impl.file,
                 io,
                 offset,
@@ -2349,8 +2346,9 @@ pub const HashDBM = struct {
                 self.impl.offset_width,
                 self.impl.align_pow,
                 hdr,
-            ));
-            if (whole_size <= 0) return Status.initMsg(.BROKEN_DATA_ERROR, "record size zero");
+            )) orelse return Status.initMsg(.BROKEN_DATA_ERROR, "record size overflow");
+            if (whole_size <= 0 or whole_size > end - offset)
+                return Status.initMsg(.BROKEN_DATA_ERROR, "invalid record size");
             offset += whole_size;
         }
         return Status.init(.SUCCESS);
@@ -3064,12 +3062,6 @@ pub const HashDBM = struct {
             }
 
             const magic = hdr_buf[0];
-
-            if (magic == PADDING_TOP_MAGIC) {
-                offset += align_size;
-                continue;
-            }
-
             const op = magic & 0xC0;
 
             const hdr = readRecordHeaderAllowLegacyVoid(hdr_buf[0..read_n], src_ow) orelse {
@@ -3077,10 +3069,13 @@ pub const HashDBM = struct {
                 return Status.initMsg(.BROKEN_DATA_ERROR, "bad record header in import");
             };
 
-            const whole_size: i64 = @intCast(resolveRecordWholeSize(file, io, offset, eff_end, src_ow, src_ap, hdr));
-            if (whole_size <= 0) {
+            const whole_size: i64 = std.math.cast(i64, resolveRecordWholeSize(file, io, offset, eff_end, src_ow, src_ap, hdr)) orelse {
                 if (skip_broken_records) { offset += align_size; continue; }
-                return Status.initMsg(.BROKEN_DATA_ERROR, "zero record size in import");
+                return Status.initMsg(.BROKEN_DATA_ERROR, "record size overflow in import");
+            };
+            if (whole_size <= 0 or whole_size > eff_end - offset) {
+                if (skip_broken_records) { offset += align_size; continue; }
+                return Status.initMsg(.BROKEN_DATA_ERROR, "invalid record size in import");
             }
 
             if (op == RECORD_MAGIC_SET or op == RECORD_MAGIC_ADD) {
@@ -3191,18 +3186,17 @@ pub const HashDBM = struct {
                     return st_r;
                 }
                 const magic = hdr_buf[0];
-                if (magic == PADDING_TOP_MAGIC) {
-                    offset += align_size;
-                    continue;
-                }
                 const hdr = readRecordHeaderAllowLegacyVoid(hdr_buf[0..read_n], src_ow) orelse {
                     if (skip_broken_records) { offset += align_size; continue; }
                     return Status.initMsg(.BROKEN_DATA_ERROR, "bad record header");
                 };
-                const whole_size: i64 = @intCast(resolveRecordWholeSize(file, io, offset, eff_end, src_ow, src_ap, hdr));
-                if (whole_size <= 0) {
+                const whole_size: i64 = std.math.cast(i64, resolveRecordWholeSize(file, io, offset, eff_end, src_ow, src_ap, hdr)) orelse {
                     if (skip_broken_records) { offset += align_size; continue; }
-                    return Status.initMsg(.BROKEN_DATA_ERROR, "zero size record");
+                    return Status.initMsg(.BROKEN_DATA_ERROR, "record size overflow");
+                };
+                if (whole_size <= 0 or whole_size > eff_end - offset) {
+                    if (skip_broken_records) { offset += align_size; continue; }
+                    return Status.initMsg(.BROKEN_DATA_ERROR, "invalid record size");
                 }
                 const op = magic & 0xC0;
                 if (op != RECORD_MAGIC_VOID) {
@@ -5034,6 +5028,76 @@ test "HashDBM voidRecord preserves valid checksum (including 0xDD collision)" {
     try std.testing.expect(db.validateRecords(io, 0, 0).isOk());
     var got = std.ArrayList(u8).empty;
     defer got.deinit(alloc);
+    try std.testing.expect(db.get(io, "survivor", &got).isOk());
+    try std.testing.expectEqualStrings("ok", got.items);
+    try std.testing.expect(db.close(io).isOk());
+}
+
+test "HashDBM scanners advance past 0xDD void slots by whole_size, not align_size" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const src_path = try std.fmt.allocPrint(alloc, "{s}/dd_void.tkh", .{path_buf[0..tmp_len]});
+    defer alloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(alloc, "{s}/dd_import.tkh", .{path_buf[0..tmp_len]});
+    defer alloc.free(dst_path);
+
+    // 40-byte value at align_pow=4 -> whole_size 64 > align_size 16. Find a key
+    // whose magic checksum is 29, so the voided magic is 0xC0|29 == 0xDD ==
+    // PADDING_TOP_MAGIC at a slot boundary.
+    const long_v: [40]u8 = @splat('A');
+    var key_29: [4]u8 = .{ 'm', '0', '0', 'M' };
+    while (computeMagicChecksum(&key_29, &long_v) != 29) {
+        key_29[3] +%= 1;
+        if (key_29[3] == 0) key_29[2] +%= 1;
+    }
+
+    const std_file = try file_mod.StdFile.create(alloc);
+    var db = try HashDBM.init(std_file.asFile(), 128, alloc);
+    defer db.deinit(io);
+    try std.testing.expect(db.openAdvanced(io, src_path, true, .{ .truncate = true }, .{ .align_pow = 4, .num_buckets = 128 }).isOk());
+    try std.testing.expect(db.set(io, &key_29, &long_v, true, null).isOk());
+    try std.testing.expect(db.set(io, "survivor", "ok", true, null).isOk());
+    const rec_base = db.impl.record_base;
+    try std.testing.expect(db.remove(io, &key_29).isOk());
+    try std.testing.expect(db.close(io).isOk());
+
+    // The voided slot must start with the 0xDD collision byte. The writer holds
+    // an exclusive file lock, so read the byte only after closing the DB.
+    const raw_f = try file_mod.StdFile.create(alloc);
+    var rf = raw_f.asFile();
+    defer rf.deinit(alloc);
+    try std.testing.expect(rf.open(io, src_path, true, .{}).isOk());
+    var magic_buf: [1]u8 = undefined;
+    try std.testing.expect(rf.read(io, rec_base, &magic_buf).isOk());
+    try std.testing.expect(rf.close(io).isOk());
+    try std.testing.expectEqual(@as(u8, 0xDD), magic_buf[0]);
+
+    // Reopen and verify the scanners advance past the 0xDD void by whole_size.
+    try std.testing.expect(db.open(io, src_path, true, .{}).isOk());
+    try std.testing.expect(db.validateRecords(io, 0, 0).isOk());
+
+    // Forward import over the still-voided file must recover the survivor.
+    const imp_file = try file_mod.StdFile.create(alloc);
+    var imp_db = try HashDBM.init(imp_file.asFile(), 128, alloc);
+    defer imp_db.deinit(io);
+    try std.testing.expect(imp_db.openAdvanced(io, dst_path, true, .{ .truncate = true }, .{ .align_pow = 4, .num_buckets = 128 }).isOk());
+    try std.testing.expect(imp_db.importFromFileForward(io, src_path, false, -1, -1).isOk());
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(alloc);
+    try std.testing.expect(imp_db.get(io, "survivor", &got).isOk());
+    try std.testing.expectEqualStrings("ok", got.items);
+    try std.testing.expect(!imp_db.get(io, &key_29, &got).isOk());
+    try std.testing.expect(imp_db.close(io).isOk());
+
+    // In-place rebuild over the 0xDD void must also succeed.
+    try std.testing.expect(db.rebuild(io).isOk());
+    try std.testing.expect(db.validateRecords(io, 0, 0).isOk());
+    got.clearRetainingCapacity();
     try std.testing.expect(db.get(io, "survivor", &got).isOk());
     try std.testing.expectEqualStrings("ok", got.items);
     try std.testing.expect(db.close(io).isOk());
