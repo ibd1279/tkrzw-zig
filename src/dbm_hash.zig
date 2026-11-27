@@ -87,7 +87,7 @@ fn writeOffsetWidth(buf: []u8, value: i64, offset_width: i32) void {
 }
 
 fn computeMagicChecksum(key: []const u8, value: []const u8) u8 {
-    var sum: u32 = 11;
+    var sum: u64 = 11;
     for (key) |b| sum += b;
     for (value) |b| sum += b;
     return @intCast(sum % 61 + 3);
@@ -806,9 +806,12 @@ const HashDBMImpl = struct {
         if (!st.isOk()) return error.IOError;
     }
 
-    // Void a record in place (overwrite magic byte with RECORD_MAGIC_VOID).
-    fn voidRecord(self: *HashDBMImpl, io: std.Io, record_offset: i64) !void {
-        const st = self.file.write(io, record_offset, &[_]u8{RECORD_MAGIC_VOID});
+    // Void a record in place, preserving its valid 6-bit magic checksum so
+    // official tkrzw HashRecord::ReadMetadataKey accepts the voided record.
+    fn voidRecord(self: *HashDBMImpl, io: std.Io, record_offset: i64, orig_magic: u8) !void {
+        const chk: u8 = orig_magic & 0x3F;
+        const void_magic: u8 = RECORD_MAGIC_VOID | (if (chk >= 3) chk else 3);
+        const st = self.file.write(io, record_offset, &[_]u8{void_magic});
         if (!st.isOk()) return error.IOError;
     }
 
@@ -1042,7 +1045,7 @@ const HashDBMImpl = struct {
                 .noop => return Status.init(.SUCCESS),
                 .remove => {
                     // Void record and unlink from chain.
-                    self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                    self.voidRecord(io, cur_offset, rec.header.magic) catch return Status.init(.SYSTEM_ERROR);
                     // Unlink: point prev (or bucket) to child.
                     const child = rec.header.child_offset;
                     if (prev_offset == 0) {
@@ -1086,7 +1089,7 @@ const HashDBMImpl = struct {
                         const new_off = self.appendRecord(io, RECORD_MAGIC_SET, rec.header.child_offset, key, new_v, 0) catch
                             return Status.init(.SYSTEM_ERROR);
                         // Void the old record.
-                        self.voidRecord(io, cur_offset) catch return Status.init(.SYSTEM_ERROR);
+                        self.voidRecord(io, cur_offset, rec.header.magic) catch return Status.init(.SYSTEM_ERROR);
                         // Update chain link.
                         if (prev_offset == 0) {
                             const raw_new = encodeOffset(new_off, self.align_pow);
@@ -4993,5 +4996,45 @@ test "HashDBM repairs legacy v0.1.0 bare 0xC0 void records via rebuild and impor
     got.clearRetainingCapacity();
     try std.testing.expect(db.get(io, "keep1", &got).isOk());
     try std.testing.expectEqualStrings("one", got.items);
+    try std.testing.expect(db.close(io).isOk());
+}
+
+test "HashDBM voidRecord preserves valid checksum (including 0xDD collision)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Invalid magic checksum must return null, never panic.
+    const bad_magic = [_]u8{ RECORD_MAGIC_VOID, 0, 0, 0, 0, 1, 1, 0 }; // checksum 0 < 3
+    try std.testing.expect(readRecordHeader(&bad_magic, 4) == null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPathFile(io, ".", &path_buf);
+    const full_path = try std.fmt.allocPrint(alloc, "{s}/void_chk.tkh", .{path_buf[0..tmp_len]});
+    defer alloc.free(full_path);
+
+    // Find a key/value pair whose computeMagicChecksum == 29 so voided magic == 0xDD (PADDING_TOP_MAGIC).
+    var key_29: [4]u8 = .{ 'k', '0', '0', '0' };
+    while (computeMagicChecksum(&key_29, "val") != 29) {
+        key_29[3] +%= 1;
+        if (key_29[3] == 0) key_29[2] +%= 1;
+    }
+
+    const std_file = try file_mod.StdFile.create(alloc);
+    var db = try HashDBM.init(std_file.asFile(), 128, alloc);
+    defer db.deinit(io);
+    try std.testing.expect(db.openAdvanced(io, full_path, true, .{ .truncate = true }, .{ .align_pow = 4, .num_buckets = 128 }).isOk());
+    try std.testing.expect(db.set(io, &key_29, "val", true, null).isOk());
+    try std.testing.expect(db.set(io, "survivor", "ok", true, null).isOk());
+    // Delete key_29 -> writes VOID record with magic 0xC0 | 29 == 0xDD.
+    try std.testing.expect(db.remove(io, &key_29).isOk());
+    try std.testing.expect(db.validateRecords(io, 0, 0).isOk());
+    try std.testing.expect(db.rebuild(io).isOk());
+    try std.testing.expect(db.validateRecords(io, 0, 0).isOk());
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(alloc);
+    try std.testing.expect(db.get(io, "survivor", &got).isOk());
+    try std.testing.expectEqualStrings("ok", got.items);
     try std.testing.expect(db.close(io).isOk());
 }
