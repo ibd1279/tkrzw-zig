@@ -23,6 +23,9 @@
 //!   StdFile                — concrete std.fs-backed File implementation
 //!   OpenOptions            — flags controlling file open behaviour
 //!   BloomFilter            — scalable, blocked, thread-safe probabilistic membership filter
+//!   searchSimilar          — exact brute-force KNN vector search over PolyDBM
+//!   findByVector           — byte-exact vector lookup over PolyDBM
+//!   encodeF32 / decodeF32  — packed little-endian IEEE-754 float32 vector codec
 //!   pairLexicalKeyComparator — key comparator for pair-based indices
 
 const std = @import("std");
@@ -50,6 +53,8 @@ pub const dbm_poly = @import("dbm_poly.zig");
 pub const index = @import("index.zig");
 pub const dbm_shard = @import("dbm_shard.zig");
 pub const bloom = @import("bloom.zig");
+pub const vector_util = @import("vector_util.zig");
+pub const dbm_vector = @import("dbm_vector.zig");
 
 // ---------------------------------------------------------------------------
 // Flat re-exports — primary public API surface.
@@ -72,6 +77,22 @@ pub const ShardDBM = dbm_shard.ShardDBM;
 pub const ShardCursor = dbm_shard.ShardCursor;
 pub const ShardIterator = dbm_shard.ShardIterator;
 pub const ShardEntry = dbm_shard.Entry;
+
+// Vector codec and exact KNN search API.
+pub const VectorMetric = vector_util.VectorMetric;
+pub const VectorError = vector_util.VectorError;
+pub const KnnHit = vector_util.KnnHit;
+pub const encodeF32 = vector_util.encodeF32;
+pub const decodeF32 = vector_util.decodeF32;
+pub const validateF32 = vector_util.validateF32;
+pub const validateBytes = vector_util.validateBytes;
+pub const vectorDims = vector_util.dims;
+pub const SearchOptions = dbm_vector.SearchOptions;
+pub const KnnResult = dbm_vector.KnnResult;
+pub const FindResult = dbm_vector.FindResult;
+pub const searchSimilar = dbm_vector.searchSimilar;
+pub const findByVector = dbm_vector.findByVector;
+pub const findByVectorBytes = dbm_vector.findByVectorBytes;
 
 pub const Status = lib_common.Status;
 pub const Code = lib_common.Code;

@@ -903,11 +903,14 @@ const SkipRecordCache = struct {
 const SortEntry = struct {
     key: []u8,
     value: []u8,
+    seq: u64,
 };
 
 fn sortEntryCmp(_ctx: void, a: SortEntry, b: SortEntry) bool {
     _ = _ctx;
-    return std.mem.order(u8, a.key, b.key) == .lt;
+    const ord = std.mem.order(u8, a.key, b.key);
+    if (ord != .eq) return ord == .lt;
+    return a.seq < b.seq;
 }
 
 const SortSlot = struct {
@@ -946,6 +949,7 @@ const RecordSorter = struct {
     heap: std.PriorityQueue(*SortSlot, void, sortSlotLessThan) = .empty,
     finished: bool,
     tmp_file_counter: u32 = 0,
+    next_seq: u64 = 0,
     allocator: std.mem.Allocator,
 
     fn init(base_path: []const u8, max_mem_size: i64, allocator: std.mem.Allocator) !*RecordSorter {
@@ -1014,7 +1018,9 @@ const RecordSorter = struct {
         try self.current_entries.append(self.allocator, .{
             .key = key_dup,
             .value = value_dup,
+            .seq = self.next_seq,
         });
+        self.next_seq += 1;
 
         self.current_mem_size += @as(i64, @intCast(key.len + value.len + REC_MEM_FOOT));
 
@@ -1124,19 +1130,20 @@ const RecordSorter = struct {
     fn finish(self: *RecordSorter, io: std.Io) !void {
         try self.flush(io);
 
-        // Build the merge heap from all sources
+        // Assign monotonic source IDs so equal keys merge in chronological
+        // order: existing SkipRecord sources first, then flushed temp files
+        // in creation order. Populate all slots before pushing pointers into
+        // `self.heap` so `self.slots.append` cannot invalidate heap pointers.
         var id_counter: usize = 0;
 
-        // Add skip record sources to heap
         for (self.slots.items) |*slot| {
             if (slot.skip_record != null) {
                 slot.id = id_counter;
                 id_counter += 1;
-                try self.heap.push(self.allocator, slot);
             }
         }
 
-        // Add flat file sources to heap
+        // Add flat file sources to slots
         for (self.tmp_paths.items, 0..) |_, i| {
             const tmp_file = self.tmp_file_owners.items[i];
             var reader = try FlatRecordReader.init(tmp_file, self.allocator, 4096);
@@ -1180,11 +1187,11 @@ const RecordSorter = struct {
             slot.flat_reader.?.* = reader;
 
             try self.slots.append(self.allocator, slot);
-            try self.heap.push(self.allocator, &self.slots.items[self.slots.items.len - 1]);
-
             id_counter += 1;
-            // first_key_owned / first_value_owned moved into the slot;
-            // nothing left to free here.
+        }
+
+        for (self.slots.items) |*slot| {
+            try self.heap.push(self.allocator, slot);
         }
 
         self.finished = true;
@@ -2825,15 +2832,21 @@ pub const SkipDBM = struct {
     }
 
     pub fn get(self: *SkipDBM, io: std.Io, key: []const u8, value_out: ?*std.ArrayList(u8)) Status {
+        self.impl.mutex.lockSharedUncancelable(io);
+        defer self.impl.mutex.unlockShared(io);
         return getImpl(self.impl, io, key, value_out);
     }
 
     pub fn set(self: *SkipDBM, io: std.Io, key: []const u8, value: []const u8, overwrite: bool, old_value: ?*std.ArrayList(u8)) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         if (old_value != null) _ = getImpl(self.impl, io, key, old_value);
         return setImpl(self.impl, io, key, value, overwrite);
     }
 
     pub fn remove(self: *SkipDBM, io: std.Io, key: []const u8, old_value: ?*std.ArrayList(u8)) Status {
+        self.impl.mutex.lockUncancelable(io);
+        defer self.impl.mutex.unlock(io);
         if (old_value != null) _ = getImpl(self.impl, io, key, old_value);
         return removeImpl(self.impl, io, key);
     }

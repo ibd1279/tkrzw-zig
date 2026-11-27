@@ -483,7 +483,8 @@ const TreeDBMImpl = struct {
         }
     }
 
-    fn deserializeLeafNode(self: *TreeDBMImpl, id: i64, data: []const u8) !*TreeLeafNode {
+    fn deserializeLeafNode(self: *TreeDBMImpl, id: i64, data: []const u8) PageLoadError!*TreeLeafNode {
+        if (data.len < PAGE_ID_WIDTH * 2) return PageLoadError.BrokenData;
         const node = try self.allocator.create(TreeLeafNode);
         node.* = .{
             .id = id,
@@ -498,7 +499,6 @@ const TreeDBMImpl = struct {
             .allocator = self.allocator,
         };
         errdefer node.deinit();
-        if (data.len < PAGE_ID_WIDTH * 2) return node;
         node.prev_id = readFixNum(data[0..PAGE_ID_WIDTH], PAGE_ID_WIDTH);
         node.next_id = readFixNum(data[PAGE_ID_WIDTH .. PAGE_ID_WIDTH * 2], PAGE_ID_WIDTH);
         var pos: usize = PAGE_ID_WIDTH * 2;
@@ -506,22 +506,24 @@ const TreeDBMImpl = struct {
         while (pos < data.len) {
             var key_len: u64 = 0;
             const kl_bytes = varint.readVarNum(data[pos..], &key_len);
-            if (kl_bytes == 0) break;
+            if (kl_bytes == 0) return PageLoadError.BrokenData;
             pos += kl_bytes;
-            if (pos + key_len > data.len) break;
-            const key = data[pos .. pos + key_len];
-            pos += key_len;
+            if (key_len > data.len - pos) return PageLoadError.BrokenData;
+            const klen: usize = @intCast(key_len);
+            const key = data[pos .. pos + klen];
+            pos += klen;
             var val_len: u64 = 0;
             const vl_bytes = varint.readVarNum(data[pos..], &val_len);
-            if (vl_bytes == 0) break;
+            if (vl_bytes == 0) return PageLoadError.BrokenData;
             pos += vl_bytes;
-            if (pos + val_len > data.len) break;
-            const val = data[pos .. pos + val_len];
-            pos += val_len;
+            if (val_len > data.len - pos) return PageLoadError.BrokenData;
+            const vlen: usize = @intCast(val_len);
+            const val = data[pos .. pos + vlen];
+            pos += vlen;
             const rec = try TreeRecord.create(key, val, self.allocator);
             errdefer rec.deinit(self.allocator);
             try node.records.append(self.allocator, rec);
-            page_size += @intCast(varint.sizeVarNum(key_len) + key_len + varint.sizeVarNum(val_len) + val_len);
+            page_size += @intCast(varint.sizeVarNum(key_len) + klen + varint.sizeVarNum(val_len) + vlen);
         }
         node.page_size = page_size;
         return node;
@@ -542,7 +544,8 @@ const TreeDBMImpl = struct {
         }
     }
 
-    fn deserializeInnerNode(self: *TreeDBMImpl, id: i64, data: []const u8) !*TreeInnerNode {
+    fn deserializeInnerNode(self: *TreeDBMImpl, id: i64, data: []const u8) PageLoadError!*TreeInnerNode {
+        if (data.len < PAGE_ID_WIDTH) return PageLoadError.BrokenData;
         const node = try self.allocator.create(TreeInnerNode);
         node.* = .{
             .id = id,
@@ -554,17 +557,20 @@ const TreeDBMImpl = struct {
             .allocator = self.allocator,
         };
         errdefer node.deinit();
-        if (data.len < PAGE_ID_WIDTH) return node;
         node.heir_id = readFixNum(data[0..PAGE_ID_WIDTH], PAGE_ID_WIDTH);
         var pos: usize = PAGE_ID_WIDTH;
         while (pos < data.len) {
             var key_len: u64 = 0;
             const kl_bytes = varint.readVarNum(data[pos..], &key_len);
-            if (kl_bytes == 0) break;
+            if (kl_bytes == 0) return PageLoadError.BrokenData;
             pos += kl_bytes;
-            if (pos + key_len + PAGE_ID_WIDTH > data.len) break;
-            const key = data[pos .. pos + key_len];
-            pos += key_len;
+            const remaining = data.len - pos;
+            if (remaining < PAGE_ID_WIDTH or key_len > remaining - PAGE_ID_WIDTH) {
+                return PageLoadError.BrokenData;
+            }
+            const klen: usize = @intCast(key_len);
+            const key = data[pos .. pos + klen];
+            pos += klen;
             const child = readFixNum(data[pos .. pos + PAGE_ID_WIDTH], PAGE_ID_WIDTH);
             pos += PAGE_ID_WIDTH;
             const lnk = try TreeLink.create(key, child, self.allocator);
@@ -711,7 +717,20 @@ const TreeDBMImpl = struct {
         return node;
     }
 
-    fn loadLeafNode(self: *TreeDBMImpl, io: std.Io, id: i64, promote: bool) !*TreeLeafNode {
+    const PageLoadError = error{
+        OutOfMemory,
+        BrokenData,
+        SystemError,
+    };
+
+    fn pageLoadErrorToStatus(err: PageLoadError) Status {
+        return switch (err) {
+            error.BrokenData => Status.init(.BROKEN_DATA_ERROR),
+            error.SystemError, error.OutOfMemory => Status.init(.SYSTEM_ERROR),
+        };
+    }
+
+    fn loadLeafNode(self: *TreeDBMImpl, io: std.Io, id: i64, promote: bool) PageLoadError!*TreeLeafNode {
         const slot_idx = leafSlotIndex(id);
         const slot = &self.leaf_slots[slot_idx];
         slot.mutex.lockUncancelable(io);
@@ -725,24 +744,23 @@ const TreeDBMImpl = struct {
         writeFixNum(&id_buf, id, PAGE_ID_WIDTH);
         var loaded_data = ArrayList(u8).empty;
         defer loaded_data.deinit(self.allocator);
-        _ = self.hash_dbm.get( io,&id_buf, &loaded_data);
-        var node: *TreeLeafNode = undefined;
-        if (loaded_data.items.len > 0) {
-            node = self.deserializeLeafNode(id, loaded_data.items) catch {
-                slot.mutex.unlock(io);
-                return error.OutOfMemory;
-            };
-        } else {
-            node = self.newLeafNode(id) catch {
-                slot.mutex.unlock(io);
-                return error.OutOfMemory;
+        const get_st = self.hash_dbm.get(io, &id_buf, &loaded_data);
+        if (!get_st.isOk()) {
+            slot.mutex.unlock(io);
+            return switch (get_st.code) {
+                .NOT_FOUND_ERROR, .BROKEN_DATA_ERROR => PageLoadError.BrokenData,
+                else => PageLoadError.SystemError,
             };
         }
+        const node = self.deserializeLeafNode(id, loaded_data.items) catch |err| {
+            slot.mutex.unlock(io);
+            return err;
+        };
         _ = node.ref_count.fetchAdd(1, .acq_rel);
         slot.cache.add(id, node, self.allocator) catch {
             node.deinit();
             slot.mutex.unlock(io);
-            return error.OutOfMemory;
+            return PageLoadError.OutOfMemory;
         };
         slot.mutex.unlock(io);
         return node;
@@ -833,7 +851,7 @@ const TreeDBMImpl = struct {
         }
     }
 
-    fn loadInnerNode(self: *TreeDBMImpl, io: std.Io, id: i64, promote: bool) !*TreeInnerNode {
+    fn loadInnerNode(self: *TreeDBMImpl, io: std.Io, id: i64, promote: bool) PageLoadError!*TreeInnerNode {
         const slot_idx = innerSlotIndex(id);
         const slot = &self.inner_slots[slot_idx];
         slot.mutex.lockUncancelable(io);
@@ -846,24 +864,23 @@ const TreeDBMImpl = struct {
         writeFixNum(&id_buf, id, PAGE_ID_WIDTH);
         var loaded_data = ArrayList(u8).empty;
         defer loaded_data.deinit(self.allocator);
-        _ = self.hash_dbm.get( io,&id_buf, &loaded_data);
-        var node: *TreeInnerNode = undefined;
-        if (loaded_data.items.len > 0) {
-            node = self.deserializeInnerNode(id, loaded_data.items) catch {
-                slot.mutex.unlock(io);
-                return error.OutOfMemory;
-            };
-        } else {
-            node = self.newInnerNode(id) catch {
-                slot.mutex.unlock(io);
-                return error.OutOfMemory;
+        const get_st = self.hash_dbm.get(io, &id_buf, &loaded_data);
+        if (!get_st.isOk()) {
+            slot.mutex.unlock(io);
+            return switch (get_st.code) {
+                .NOT_FOUND_ERROR, .BROKEN_DATA_ERROR => PageLoadError.BrokenData,
+                else => PageLoadError.SystemError,
             };
         }
+        const node = self.deserializeInnerNode(id, loaded_data.items) catch |err| {
+            slot.mutex.unlock(io);
+            return err;
+        };
         _ = node.ref_count.fetchAdd(1, .acq_rel);
         slot.cache.add(id, node, self.allocator) catch {
             node.deinit();
             slot.mutex.unlock(io);
-            return error.OutOfMemory;
+            return PageLoadError.OutOfMemory;
         };
         slot.mutex.unlock(io);
         return node;
@@ -1495,9 +1512,9 @@ const TreeDBMImpl = struct {
             if (!reorg_st.isOk()) return reorg_st;
         }
         self.mutex.lockSharedUncancelable(io);
-        const leaf = self.searchTree( io,key) catch {
+        const leaf = self.searchTree(io, key) catch |err| {
             self.mutex.unlockShared(io);
-            return Status.init(.SYSTEM_ERROR);
+            return pageLoadErrorToStatus(err);
         };
         if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
         const st = self.processLeaf(leaf, key, proc, writable);
@@ -1514,7 +1531,7 @@ const TreeDBMImpl = struct {
         defer self.mutex.unlockShared(io);
         var node_id = self.first_id;
         while (node_id != 0) {
-            const leaf = self.loadLeafNode( io,node_id, true) catch return Status.init(.SYSTEM_ERROR);
+            const leaf = self.loadLeafNode(io, node_id, true) catch |err| return pageLoadErrorToStatus(err);
             if (leaf.records.items.len > 0) {
                 if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
                 const rec = leaf.records.items[0];
@@ -1563,7 +1580,7 @@ const TreeDBMImpl = struct {
         _ = proc.processEmpty("");
         var node_id = self.first_id;
         while (node_id != 0) {
-            const leaf = self.loadLeafNode( io,node_id, false) catch return Status.init(.SYSTEM_ERROR);
+            const leaf = self.loadLeafNode(io, node_id, false) catch |err| return pageLoadErrorToStatus(err);
             if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
             var i: usize = 0;
             while (i < leaf.records.items.len) {
@@ -1783,7 +1800,7 @@ fn iterSetPositionFirst( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     var node_id = impl.first_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         if (leaf.records.items.len > 0) {
             try it.setPosition(cur_id, leaf.records.items[0].key);
@@ -1800,7 +1817,7 @@ fn iterSetPositionLast( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     var node_id = impl.last_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         if (leaf.records.items.len > 0) {
             const last_rec = leaf.records.items[leaf.records.items.len - 1];
@@ -1819,7 +1836,7 @@ fn iterNext( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     var node_id = it.leaf_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
         // If we found the current key, advance past it.
@@ -1844,7 +1861,7 @@ fn iterPrevious( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
     var node_id = it.leaf_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         const idx = impl.lowerBoundRecords(leaf.records.items, cur_key);
         if (idx > 0) {
@@ -1859,7 +1876,7 @@ fn iterPrevious( io: std.Io,it: *TreeDBMIteratorImpl) !Status {
 
 fn iterJump( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-    const leaf = impl.searchTree( io,key) catch return Status.init(.SYSTEM_ERROR);
+    const leaf = impl.searchTree(io, key) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
     defer impl.releaseLeafNode( io,leaf.id);
     const idx = impl.lowerBoundRecords(leaf.records.items, key);
     if (idx < leaf.records.items.len) {
@@ -1870,7 +1887,7 @@ fn iterJump( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8) !Status {
     var node_id = leaf.next_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const next_leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const next_leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         if (next_leaf.records.items.len > 0) {
             try it.setPosition(cur_id, next_leaf.records.items[0].key);
@@ -1884,7 +1901,7 @@ fn iterJump( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8) !Status {
 
 fn iterJumpLower( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-    const leaf = impl.searchTree( io,key) catch return Status.init(.SYSTEM_ERROR);
+    const leaf = impl.searchTree(io, key) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
     defer impl.releaseLeafNode( io,leaf.id);
     const idx = impl.lowerBoundRecords(leaf.records.items, key);
     // Find the last record that is strictly less than (or equal to, if inclusive) key.
@@ -1910,7 +1927,7 @@ fn iterJumpLower( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusiv
     var node_id = leaf.prev_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const prev_leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const prev_leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         if (prev_leaf.records.items.len > 0) {
             const last_rec = prev_leaf.records.items[prev_leaf.records.items.len - 1];
@@ -1925,7 +1942,7 @@ fn iterJumpLower( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusiv
 
 fn iterJumpUpper( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusive: bool) !Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
-    const leaf = impl.searchTree( io,key) catch return Status.init(.SYSTEM_ERROR);
+    const leaf = impl.searchTree(io, key) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
     defer impl.releaseLeafNode( io,leaf.id);
     const idx = impl.lowerBoundRecords(leaf.records.items, key);
     var start: usize = idx;
@@ -1941,7 +1958,7 @@ fn iterJumpUpper( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusiv
     var node_id = leaf.next_id;
     while (node_id != 0) {
         const cur_id = node_id;
-        const next_leaf = impl.loadLeafNode( io,cur_id, true) catch return Status.init(.SYSTEM_ERROR);
+        const next_leaf = impl.loadLeafNode(io, cur_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
         defer impl.releaseLeafNode( io,cur_id);
         if (next_leaf.records.items.len > 0) {
             try it.setPosition(cur_id, next_leaf.records.items[0].key);
@@ -1956,7 +1973,7 @@ fn iterJumpUpper( io: std.Io,it: *TreeDBMIteratorImpl, key: []const u8, inclusiv
 fn iterGetCurrent( io: std.Io,it: *TreeDBMIteratorImpl, key_out: ?*std.ArrayList(u8), value_out: ?*std.ArrayList(u8)) Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
-    const leaf = impl.loadLeafNode( io,it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
+    const leaf = impl.loadLeafNode(io, it.leaf_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
     defer impl.releaseLeafNode( io,it.leaf_id);
     leaf.mutex.lockSharedUncancelable(io);
     defer leaf.mutex.unlockShared(io);
@@ -1982,7 +1999,7 @@ fn iterGetCurrent( io: std.Io,it: *TreeDBMIteratorImpl, key_out: ?*std.ArrayList
 fn iterProcess( io: std.Io,it: *TreeDBMIteratorImpl, proc: anytype, writable: bool) Status {
     const impl = it.dbm_impl orelse return Status.initMsg(.PRECONDITION_ERROR, "orphaned iterator");
     const cur_key = it.keySlice() orelse return Status.init(.NOT_FOUND_ERROR);
-    const leaf = impl.loadLeafNode( io,it.leaf_id, true) catch return Status.init(.SYSTEM_ERROR);
+    const leaf = impl.loadLeafNode(io, it.leaf_id, true) catch |err| return TreeDBMImpl.pageLoadErrorToStatus(err);
     defer impl.releaseLeafNode( io,it.leaf_id);
     if (writable) leaf.mutex.lockUncancelable(io) else leaf.mutex.lockSharedUncancelable(io);
     defer if (writable) leaf.mutex.unlock(io) else leaf.mutex.unlockShared(io);

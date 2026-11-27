@@ -36,6 +36,7 @@ This library provides **six database managers**, a **sharding wrapper**, and a *
 - **Record processing** — Iterator callbacks for bulk operations
 - **Type erasure** — PolyDBM provides unified API across all backends
 - **Sharding** — ShardDBM partitions data across multiple DBMs by key hash
+- **Exact vector search (KNN)** — `searchSimilar` and `findByVector` over packed little-endian `float32` values across all backends
 
 ## Quick Start
 
@@ -169,6 +170,46 @@ while (cursor.get(&key_buf, &val_buf).isOk()) {
     // use key_buf.items / val_buf.items
     if (!cursor.next().isOk()) break;
 }
+```
+
+### Exact Vector Search (KNN)
+
+Vectors are stored as regular DBM record values using packed IEEE-754 little-endian `float32` bytes with no header or padding (`dimension = byte_length / 4`, matching NumPy `astype(np.float32).tobytes()`, Redis FP32, and `sqlite-vec`). Zero-length vectors and non-finite elements (`NaN`/`Inf`) are rejected.
+
+`searchSimilar` performs an exact brute-force scan across any `PolyDBM` backend (all six backends supported) with target-independent `f64`-accumulated kernels (`.l2`, `.dot`, `.cosine`). All metrics return a uniform higher-is-more-similar `score` (`.dot` = dot product, `.l2` = `-l2Distance`, `.cosine` = `-cosineDistance`, with `-inf` for zero-norm vectors), with ties broken deterministically by ascending key bytes.
+
+Operational semantics and caveats:
+- **Invalid records**: By default, malformed or dimension-mismatched records are skipped and counted in `result.invalid_records`. With `.{ .strict = true }`, `searchSimilar` stops scoring on the first invalid record and returns `PolyError.BrokenData` (malformed length, `NaN`/`Inf`, or dimension mismatch); note that `PolyDBM.processEach` still finishes traversing remaining records because `RecordAction` has no early-abort signal.
+- **Headerless format**: Because stored vectors have no type header, any non-vector record whose byte length equals `query.len * 4` and whose bytes decode as finite `float32` values (for example, a 12-byte ASCII string for a 3-dim query) is indistinguishable from a vector. Store vectors in a dedicated DBM or keyspace when mixing arbitrary binary blobs.
+- **SkipDBM synchronization**: `SkipDBM` buffers writes until `synchronize()` or `close()`; unsynchronized records are not visible to `searchSimilar` or `findByVector`.
+- **Concurrency / snapshots**: Scans are not universally point-in-time snapshots across backends. `TinyDBM`, `HashDBM`, and `SkipDBM` hold shared/whole locks across the scan (blocking concurrent writers for the duration of the scan), while `BabyDBM` and `TreeDBM` lock one leaf at a time and `CacheDBM` locks per slot, so concurrent writes may be partially visible depending on backend.
+
+```zig
+const tkrzw = @import("tkrzw_zig");
+
+var db = try tkrzw.PolyDBM.open("embeddings.tkh", .{ .writable = true }, io, allocator);
+defer db.deinit(io);
+
+const v_cat = try tkrzw.encodeF32(allocator, &[_]f32{ 0.9, 0.1, 0.0 });
+defer allocator.free(v_cat);
+const v_dog = try tkrzw.encodeF32(allocator, &[_]f32{ 0.8, 0.2, 0.0 });
+defer allocator.free(v_dog);
+const v_car = try tkrzw.encodeF32(allocator, &[_]f32{ 0.0, 0.0, 1.0 });
+defer allocator.free(v_car);
+
+_ = db.set(io, "cat", v_cat, true);
+_ = db.set(io, "dog", v_dog, true);
+_ = db.set(io, "car", v_car, true);
+
+// Exact top-2 cosine KNN search
+var result = try tkrzw.searchSimilar(&db, io, allocator, &[_]f32{ 1.0, 0.0, 0.0 }, 2, .cosine, .{});
+defer result.deinit(allocator);
+// result.hits[0].key == "cat", result.hits[1].key == "dog"
+
+// Byte-exact lookup (returns all matching keys sorted ascending)
+var exact = try tkrzw.findByVector(&db, io, allocator, &[_]f32{ 0.0, 0.0, 1.0 });
+defer exact.deinit(allocator);
+// exact.keys[0] == "car"
 ```
 
 ## License
