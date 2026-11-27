@@ -154,15 +154,20 @@ pub fn writeVarNum(buf: []u8, num: u64) usize {
     return wp;
 }
 
-/// Decodes a variable-length integer from buf with bounds checking.
+/// Decodes a variable-length integer from buf with bounds and u64-overflow checking.
 ///
 /// Writes the decoded value into np. Returns the number of bytes consumed,
-/// or 0 if buf is too short to contain a complete encoding (np is set to 0).
+/// or 0 if buf is too short to contain a complete encoding, exceeds the 10-byte
+/// canonical u64 encoding limit, or overflows u64 (np is set to 0).
 pub fn readVarNum(buf: []const u8, np: *u64) usize {
     var num: u64 = 0;
     var rp: usize = 0;
     while (true) {
-        if (rp >= buf.len) {
+        if (rp >= buf.len or rp >= 10) {
+            np.* = 0;
+            return 0;
+        }
+        if ((num >> 57) != 0) {
             np.* = 0;
             return 0;
         }
@@ -242,4 +247,29 @@ test "readVarNum returns 0 on truncated input" {
     const read = readVarNum(buf[0..1], &decoded);
     try std.testing.expectEqual(@as(usize, 0), read);
     try std.testing.expectEqual(@as(u64, 0), decoded);
+}
+
+test "readVarNum rejects u64 overflow and overlong encodings" {
+    var val: u64 = 99;
+    // 2^64 -> overflows u64.
+    const pow2_64 = [_]u8{ 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 };
+    try std.testing.expectEqual(@as(usize, 0), readVarNum(&pow2_64, &val));
+    try std.testing.expectEqual(@as(u64, 0), val);
+
+    // 2^64 + 4 overflows u64 and must be rejected.
+    const pow2_64_plus_4 = [_]u8{ 0x82, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x04 };
+    try std.testing.expectEqual(@as(usize, 0), readVarNum(&pow2_64_plus_4, &val));
+    try std.testing.expectEqual(@as(u64, 0), val);
+
+    // 11-byte overlong leading-zero encoding of 4 -> rejected.
+    const overlong = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x04 };
+    try std.testing.expectEqual(@as(usize, 0), readVarNum(&overlong, &val));
+    try std.testing.expectEqual(@as(u64, 0), val);
+
+    // maxInt(u64) (canonical 10 bytes) still decodes cleanly.
+    var buf: [10]u8 = undefined;
+    const n = writeVarNum(&buf, std.math.maxInt(u64));
+    try std.testing.expectEqual(@as(usize, 10), n);
+    try std.testing.expectEqual(@as(usize, 10), readVarNum(buf[0..n], &val));
+    try std.testing.expectEqual(std.math.maxInt(u64), val);
 }

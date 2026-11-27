@@ -1077,6 +1077,8 @@ const TinyDBMImpl = struct {
         } else {
             self.mutex.lockSharedUncancelable(io);
             defer self.mutex.unlockShared(io);
+            self.record_mutex.lockAllShared();
+            defer self.record_mutex.unlockAllShared();
             for (self.buckets) |head| {
                 if (head) |p| {
                     const rv = deserializeRecord(p);
@@ -2089,6 +2091,8 @@ pub const TinyDBM = struct {
         } else {
             self.impl.mutex.lockSharedUncancelable(io);
             defer self.impl.mutex.unlockShared(io);
+            self.impl.record_mutex.lockAllShared();
+            defer self.impl.record_mutex.unlockAllShared();
 
             _ = proc.processEmpty("");
             for (self.impl.buckets) |head| {
