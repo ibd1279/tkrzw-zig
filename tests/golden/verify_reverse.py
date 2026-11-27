@@ -7,6 +7,8 @@ Companion to src/golden_reverse_writer.zig (run that first). Usage:
 """
 
 import os
+import shutil
+import subprocess
 import sys
 
 import tkrzw
@@ -121,7 +123,86 @@ def main():
                 name, count, " (sorted)" if ordered else ""))
         total_failures += file_failures
 
+    total_failures += verify_mutation_hash_files(os.path.abspath(HERE))
     sys.exit(1 if total_failures else 0)
+
+
+def _dump_str(path):
+    db = tkrzw.DBM()
+    st = db.Open(path, False)
+    if not st.IsOK():
+        return None, str(st)
+    recs = {}
+    it = db.MakeIterator()
+    st = it.First()
+    while st.IsOK():
+        rec = it.Get()
+        if rec is None:
+            break
+        recs[rec[0].decode("utf-8")] = rec[1].decode("utf-8")
+        st = it.Next()
+    db.Close()
+    return recs, None
+
+
+def verify_mutation_hash_files(base_dir):
+    expected = {f"keep{i}": "value-keep" for i in range(50) if i != 3}
+    expected.update({"survivor": "ok", "shrinkme": "short", "grow": "y" * 400})
+    fails = 0
+    for ap in (3, 4, 10):
+        name = f"rev_mut_ap{ap}.tkh"
+        path = os.path.join(base_dir, name)
+        file_fails = 0
+
+        recs, err = _dump_str(path)
+        if err is not None or recs != expected:
+            print(f"FAIL {name}: iterate mismatch (err={err}, count={len(recs or {})})")
+            file_fails += 1
+        elif "k00c" in recs or "keep3" in recs:
+            print(f"FAIL {name}: voided keys still present")
+            file_fails += 1
+
+        util_res = subprocess.run(
+            ["tkrzw_dbm_util", "inspect", "--validate", path],
+            capture_output=True, text=True,
+        )
+        if util_res.returncode != 0:
+            print(f"FAIL {name}: tkrzw_dbm_util inspect --validate rc={util_res.returncode}: {util_res.stderr.strip()}")
+            file_fails += 1
+
+        work = path + ".work.tkh"
+        shutil.copy(path, work)
+        db = tkrzw.DBM()
+        st_open = db.Open(work, True)
+        st_reb = db.Rebuild() if st_open.IsOK() else st_open
+        if st_open.IsOK():
+            db.Close()
+        if not st_reb.IsOK():
+            print(f"FAIL {name}: official Rebuild(): {st_reb}")
+            file_fails += 1
+        else:
+            reb_recs, rerr = _dump_str(work)
+            if rerr is not None or reb_recs != expected:
+                print(f"FAIL {name}: post-Rebuild contents mismatch (err={rerr})")
+                file_fails += 1
+
+        restored = path + ".restored.tkh"
+        if os.path.exists(restored):
+            os.unlink(restored)
+        st_res = tkrzw.DBM.RestoreDatabase(path, restored, "HashDBM", -1)
+        if not st_res.IsOK():
+            print(f"FAIL {name}: official RestoreDatabase(): {st_res}")
+            file_fails += 1
+        else:
+            res_recs, reserr = _dump_str(restored)
+            if reserr is not None or res_recs != expected:
+                print(f"FAIL {name}: post-RestoreDatabase contents mismatch (err={reserr})")
+                file_fails += 1
+
+        if file_fails == 0:
+            print(f"PASS {name:<16} iterate+validate+Rebuild+RestoreDatabase OK ({len(expected)} recs)")
+        fails += file_fails
+    return fails
 
 
 if __name__ == "__main__":

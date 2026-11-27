@@ -65,13 +65,16 @@ pub fn main(init: std.process.Init) !void {
     else
         try std.fmt.bufPrint(&out_dir_buf, "/tmp/tkrzw-revgolden", .{});
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
+    var abs_dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const abs_dir_len = try std.Io.Dir.cwd().realPathFile(io, out_dir, &abs_dir_buf);
+    const abs_dir = abs_dir_buf[0..abs_dir_len];
 
     const records = try goldenRecords(alloc);
 
     const names = [_][]const u8{ "rev.tkh", "rev.tkt", "rev.tks", "rev.tkmt", "rev.tkmb", "rev.tkmc" };
     for (names) |name| {
-        var path_buf: [512]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ out_dir, name });
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ abs_dir, name });
 
         var db = try PolyDBM.open(path, .{ .writable = true, .num_buckets = 256 }, io, alloc);
         defer db.deinit(io);
@@ -96,5 +99,42 @@ pub fn main(init: std.process.Init) !void {
         }
         std.debug.print("wrote {s}\n", .{path});
     }
+
+    // Mutation/delete HashDBM files across align_pow 3, 4, 10:
+    // 50 live keys, delete "k00c"->"val" (voided magic = 0xDD, checksum 29),
+    // delete normal key "keep3", in-place shrink (240B -> 5B), grow-relocate (1B -> 400B).
+    const align_pows = [_]i32{ 3, 4, 10 };
+    const long_v: [240]u8 = @splat('L');
+    const grow_v: [400]u8 = @splat('y');
+    for (align_pows) |ap| {
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/rev_mut_ap{d}.tkh", .{ abs_dir, ap });
+
+        const std_file = try tkrzw.file.StdFile.create(alloc);
+        var db = try tkrzw.HashDBM.init(std_file.asFile(), 1031, alloc);
+        defer db.deinit(io);
+        if (!db.openAdvanced(io, path, true, .{ .truncate = true }, .{ .align_pow = ap, .num_buckets = 1031 }).isOk()) {
+            std.debug.print("FAIL open {s}\n", .{path});
+            std.process.exit(1);
+        }
+        var i: usize = 0;
+        while (i < 50) : (i += 1) {
+            var kb: [16]u8 = undefined;
+            const kk = try std.fmt.bufPrint(&kb, "keep{d}", .{i});
+            if (!db.set(io, kk, "value-keep", true, null).isOk()) std.process.exit(1);
+        }
+        if (!db.set(io, "k00c", "val", true, null).isOk()) std.process.exit(1);
+        if (!db.set(io, "survivor", "ok", true, null).isOk()) std.process.exit(1);
+        if (!db.set(io, "shrinkme", &long_v, true, null).isOk()) std.process.exit(1);
+        if (!db.set(io, "shrinkme", "short", true, null).isOk()) std.process.exit(1);
+        if (!db.set(io, "grow", "x", true, null).isOk()) std.process.exit(1);
+        if (!db.set(io, "grow", &grow_v, true, null).isOk()) std.process.exit(1);
+        if (!db.remove(io, "k00c").isOk()) std.process.exit(1);
+        if (!db.remove(io, "keep3").isOk()) std.process.exit(1);
+        if (!db.synchronize(io, false).isOk()) std.process.exit(1);
+        if (!db.close(io).isOk()) std.process.exit(1);
+        std.debug.print("wrote {s}\n", .{path});
+    }
+
     std.debug.print("done\n", .{});
 }
